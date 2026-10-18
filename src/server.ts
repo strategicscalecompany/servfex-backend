@@ -2,6 +2,7 @@ import http from 'http';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
+import compression from 'compression';
 import cookieParser from 'cookie-parser';
 import rateLimit from 'express-rate-limit';
 import pinoHttp from 'pino-http';
@@ -87,6 +88,9 @@ io.on('connection', (socket) => {
 
 // Security HTTP Headers (Rule #12 in SECURITY_RULES.md)
 app.use(helmet());
+
+// Gzip / Deflate HTTP Response Compression for high-speed data transfer
+app.use(compression());
 
 // Cross-Origin Resource Sharing (Rule #11 in SECURITY_RULES.md)
 app.use(

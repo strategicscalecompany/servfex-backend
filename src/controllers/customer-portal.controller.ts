@@ -407,47 +407,43 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
     const userId = req.user!.userId;
     const { serviceId, packageId, addressId, scheduledDate, scheduledTimeSlot, paymentMethod, notes } = req.body;
 
-    let address = null;
-    if (addressId) {
-      address = await prisma.userAddress.findFirst({
-        where: { id: addressId, userId },
-      });
-    }
-    if (!address) {
-      address = await prisma.userAddress.findFirst({
+    // Concurrently fetch address, service, customer profile, and admins in 1 single network flight
+    const [existingAddress, service, customerProfile, admins] = await Promise.all([
+      addressId
+        ? prisma.userAddress.findFirst({ where: { id: addressId, userId } })
+        : prisma.userAddress.findFirst({ where: { userId }, orderBy: [{ isDefault: 'desc' }, { createdAt: 'desc' }] }),
+      prisma.service.findFirst({
+        where: { id: serviceId, isActive: true, deletedAt: null },
+        include: { packages: { where: { isActive: true } } },
+      }),
+      prisma.customerProfile.upsert({
         where: { userId },
-        orderBy: [{ isDefault: 'desc' }, { createdAt: 'desc' }],
-      });
-      if (!address) {
-        address = await prisma.userAddress.create({
-          data: {
-            userId,
-            label: 'Home',
-            addressLine1: 'Flat 402, Green Glen Layout',
-            city: 'Bengaluru',
-            state: 'KA',
-            postalCode: '560103',
-            isDefault: true,
-          },
-        });
-      }
-    }
+        create: { userId },
+        update: {},
+      }),
+      prisma.user.findMany({
+        where: { role: 'SUPER_ADMIN', status: 'ACTIVE', deletedAt: null },
+        select: { id: true },
+      }),
+    ]);
 
-    const service = await prisma.service.findFirst({
-      where: { id: serviceId, isActive: true, deletedAt: null },
-      include: { packages: true },
-    });
     if (!service) {
       sendError(res, 'BAD_REQUEST', 'Service not found or inactive', 400);
       return;
     }
 
-    let customerProfile = await prisma.customerProfile.findUnique({
-      where: { userId },
-    });
-    if (!customerProfile) {
-      customerProfile = await prisma.customerProfile.create({
-        data: { userId },
+    let address = existingAddress;
+    if (!address) {
+      address = await prisma.userAddress.create({
+        data: {
+          userId,
+          label: 'Home',
+          addressLine1: 'Flat 402, Green Glen Layout',
+          city: 'Bengaluru',
+          state: 'KA',
+          postalCode: '560103',
+          isDefault: true,
+        },
       });
     }
 
@@ -465,70 +461,67 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
     const totalAmount = basePrice.add(taxes);
     const bookingNumber = `SFX-${Date.now().toString().slice(-6)}-${Math.floor(100 + Math.random() * 900)}`;
 
-    // Dispatch is the Super Admin's decision: new bookings are created unassigned (vendorId = null).
-    // The vendor only sees the order once an admin assigns it (or auto-assign runs from the admin desk).
-    const admins = await prisma.user.findMany({
-      where: { role: 'SUPER_ADMIN', status: 'ACTIVE', deletedAt: null },
-      select: { id: true },
-    });
-
     const newBooking = await prisma.$transaction(async (tx) => {
-      const booking = await tx.booking.create({
-        data: {
-          bookingNumber,
-          customerId: customerProfile!.id,
-          vendorId: null,
-          serviceId,
-          packageId: actualPackageId,
-          addressId: address.id,
-          scheduledDate,
-          scheduledTimeSlot,
-          status: 'PENDING',
-          basePrice,
-          taxes,
-          totalAmount,
-          paymentMethod: paymentMethod || 'ONLINE',
-          paymentStatus: 'PENDING',
-          notes: notes || null,
-          statusHistory: {
-            create: {
-              newStatus: 'PENDING',
-              changedBy: userId,
-              changedByRole: 'CUSTOMER',
-              reason: 'Customer initiated new service booking',
+      const [booking] = await Promise.all([
+        tx.booking.create({
+          data: {
+            bookingNumber,
+            customerId: customerProfile.id,
+            vendorId: null,
+            serviceId,
+            packageId: actualPackageId,
+            addressId: address.id,
+            scheduledDate,
+            scheduledTimeSlot,
+            status: 'PENDING',
+            basePrice,
+            taxes,
+            totalAmount,
+            paymentMethod: paymentMethod || 'ONLINE',
+            paymentStatus: 'PENDING',
+            notes: notes || null,
+            statusHistory: {
+              create: {
+                newStatus: 'PENDING',
+                changedBy: userId,
+                changedByRole: 'CUSTOMER',
+                reason: 'Customer initiated new service booking',
+              },
             },
           },
-        },
-        include: {
-          service: true,
-          package: true,
-          address: true,
-          vendor: true,
-          statusHistory: true,
-        },
-      });
-
-      await tx.customerProfile.update({
-        where: { id: customerProfile!.id },
-        data: {
-          totalBookings: { increment: 1 },
-          totalSpent: { increment: totalAmount },
-        },
-      });
-
-      if (admins.length > 0) {
-        await tx.notification.createMany({
-          data: admins.map((admin) => ({
-            title: `New booking request #${bookingNumber}`,
-            message: `${service.name} on ${scheduledDate} (${scheduledTimeSlot}) in ${address.city || 'area'}. Total: ₹${totalAmount.toFixed(2)}. Assign a vendor.`,
-            target: 'SPECIFIC_USER' as const,
-            targetUserId: admin.id,
-          })),
-        });
-      }
+          include: {
+            service: {
+              select: { id: true, name: true, slug: true, startingPrice: true, durationText: true, iconUrl: true, imageUrl: true },
+            },
+            package: true,
+            address: true,
+            vendor: true,
+            statusHistory: true,
+          },
+        }),
+        tx.customerProfile.update({
+          where: { id: customerProfile.id },
+          data: {
+            totalBookings: { increment: 1 },
+            totalSpent: { increment: totalAmount },
+          },
+        }),
+      ]);
 
       return booking;
-    }, { maxWait: 10000, timeout: 20000 });
+    }, { maxWait: 8000, timeout: 15000 });
+
+    // Non-blocking notification creation & socket dispatch outside critical HTTP path
+    if (admins.length > 0) {
+      prisma.notification.createMany({
+        data: admins.map((admin) => ({
+          title: `New booking request #${bookingNumber}`,
+          message: `${service.name} on ${scheduledDate} (${scheduledTimeSlot}) in ${address.city || 'area'}. Total: ₹${totalAmount.toFixed(2)}. Assign a vendor.`,
+          target: 'SPECIFIC_USER' as const,
+          targetUserId: admin.id,
+        })),
+      }).catch((e) => console.error('Failed to create admin notifications:', e));
+    }
 
     emitBookingEvent('booking:new', {
       bookingId: newBooking.id,
@@ -551,19 +544,10 @@ export const getCustomerBookings = async (req: Request, res: Response): Promise<
     const limit = Math.min(Math.max(parseInt(String(req.query.limit || '10'), 10) || 10, 1), 50);
     const skip = (page - 1) * limit;
 
-    const customerProfile = await prisma.customerProfile.findUnique({
-      where: { userId },
-    });
-
-    if (!customerProfile) {
-      sendSuccess(res, { bookings: [] }, 200, { total: 0, page: 1, limit, totalPages: 0 });
-      return;
-    }
-
-    const where: any = { customerId: customerProfile.id };
-    if (statusQuery) {
-      where.status = statusQuery as BookingStatus;
-    }
+    const where: Prisma.BookingWhereInput = {
+      customer: { userId },
+      ...(statusQuery ? { status: statusQuery as BookingStatus } : {}),
+    };
 
     const [bookings, total] = await Promise.all([
       prisma.booking.findMany({
@@ -573,7 +557,7 @@ export const getCustomerBookings = async (req: Request, res: Response): Promise<
         orderBy: { createdAt: 'desc' },
         include: {
           service: {
-            select: { id: true, name: true, slug: true, imageUrl: true, durationText: true },
+            select: { id: true, name: true, slug: true, imageUrl: true, durationText: true, iconUrl: true },
           },
           package: true,
           address: true,
@@ -610,19 +594,10 @@ export const getCustomerBookingById = async (req: Request, res: Response): Promi
     const userId = req.user!.userId;
     const id = req.params.id as string;
 
-    const customerProfile = await prisma.customerProfile.findUnique({
-      where: { userId },
-    });
-
-    if (!customerProfile) {
-      sendError(res, 'NOT_FOUND', 'Customer profile not found', 404);
-      return;
-    }
-
     const booking = await prisma.booking.findFirst({
       where: {
         id,
-        customerId: customerProfile.id,
+        customer: { userId },
       },
       include: {
         service: true,

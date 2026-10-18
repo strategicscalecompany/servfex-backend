@@ -28,6 +28,7 @@
     "agora-token": "^2.0.7",
     "argon2": "^0.41.1",
     "cloudinary": "^2.11.0",
+    "compression": "^1.8.2",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
     "decimal.js": "^10.5.0",
@@ -44,6 +45,7 @@
     "zod": "^3.24.2"
   },
   "devDependencies": {
+    "@types/compression": "^1.8.1",
     "@types/cookie-parser": "^1.4.8",
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.0",

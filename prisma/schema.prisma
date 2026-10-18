@@ -235,6 +235,7 @@ model UserAddress {
   bookings     Booking[]
 
   @@index([userId])
+  @@index([userId, isDefault, createdAt(sort: Desc)])
 }
 
 // ==========================================
@@ -313,6 +314,8 @@ model Service {
   @@index([slug])
   @@index([isActive])
   @@index([deletedAt])
+  @@index([isActive, deletedAt, isPopular, rating(sort: Desc)])
+  @@index([categoryId, isActive, deletedAt])
 }
 
 model ServicePackage {
@@ -364,6 +367,7 @@ model ServicePackage {
 
   @@index([serviceId])
   @@index([isActive])
+  @@index([serviceId, isActive, displayOrder])
 }
 
 model VendorService {
@@ -448,6 +452,10 @@ model Booking {
   @@index([status])
   @@index([scheduledDate])
   @@index([createdAt])
+  @@index([customerId, createdAt(sort: Desc)])
+  @@index([customerId, status, createdAt(sort: Desc)])
+  @@index([vendorId, status, createdAt(sort: Desc)])
+  @@index([status, createdAt(sort: Desc)])
 }
 
 model BookingStatusHistory {
@@ -585,6 +593,7 @@ model Notification {
 
   @@index([targetUserId])
   @@index([sentAt])
+  @@index([targetUserId, isRead, sentAt(sort: Desc)])
 }
 
 // ==========================================
