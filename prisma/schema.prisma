@@ -1,0 +1,636 @@
+// ServFex Master Prisma Schema
+// Single source of truth for PostgreSQL (Supabase)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ==========================================
+// ENUMS
+// ==========================================
+
+enum UserRole {
+  SUPER_ADMIN
+  CUSTOMER
+  VENDOR
+  EMPLOYEE
+}
+
+enum UserStatus {
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+  PENDING_APPROVAL
+}
+
+enum KycStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum BookingStatus {
+  PENDING
+  ACCEPTED
+  ASSIGNED
+  ON_THE_WAY
+  ARRIVED
+  IN_PROGRESS
+  AWAITING_CUSTOMER_CONFIRMATION
+  AWAITING_PAYMENT
+  COMPLETED
+  CANCELLED
+  DECLINED
+  DISPUTED
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+enum PaymentMethod {
+  ONLINE
+  CASH
+  UPI
+  CARD
+  WALLET
+}
+
+enum RefundStatus {
+  PENDING
+  COMPLETED
+  FAILED
+}
+
+enum DocumentType {
+  GOVERNMENT_ID
+  TRADE_LICENSE
+  TAX_DOCUMENT
+  CERTIFICATE
+  OTHER
+}
+
+enum NotificationTarget {
+  ALL
+  CUSTOMERS
+  VENDORS
+  EMPLOYEES
+  SPECIFIC_USER
+}
+
+// ==========================================
+// IDENTITY & USERS
+// ==========================================
+
+model User {
+  id              String      @id @default(uuid())
+  firebaseUid     String?     @unique
+  email           String      @unique
+  phone           String?     @unique
+  passwordHash    String?
+  name            String
+  role            UserRole    @default(CUSTOMER)
+  status          UserStatus  @default(ACTIVE)
+  profilePhotoUrl String?
+  isVerified      Boolean     @default(false)
+  lastLoginAt     DateTime?
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+  deletedAt       DateTime?
+
+  // Profile relations
+  customerProfile CustomerProfile?
+  vendorProfile   VendorProfile?
+  employeeProfile EmployeeProfile?
+
+  // General relations
+  addresses       UserAddress[]
+  documents       Document[]
+  sessions        Session[]
+  auditLogs       AuditLog[]        @relation("AdminAuditLogs")
+  reviewsWritten  Review[]          @relation("CustomerReviews")
+  feedbackGiven   EmployeeFeedback[] @relation("FeedbackGiven")
+
+  @@index([firebaseUid])
+  @@index([email])
+  @@index([phone])
+  @@index([role])
+  @@index([status])
+  @@index([deletedAt])
+}
+
+model Session {
+  id          String   @id @default(uuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash   String   @unique
+  ipAddress   String?
+  userAgent   String?
+  isValid     Boolean  @default(true)
+  expiresAt   DateTime
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([userId])
+  @@index([tokenHash])
+  @@index([expiresAt])
+}
+
+model CustomerProfile {
+  id               String   @id @default(uuid())
+  userId           String   @unique
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  totalBookings    Int      @default(0)
+  totalSpent       Decimal  @default(0.00) @db.Decimal(10, 2)
+  emergencyContact String?
+  notes            String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  bookings         Booking[] @relation("CustomerBookings")
+}
+
+model VendorProfile {
+  id                 String          @id @default(uuid())
+  userId             String          @unique
+  user               User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  companyName        String
+  businessLicense    String?
+  taxId              String?
+  kycStatus          KycStatus       @default(PENDING)
+  kycRejectionReason String?
+  location           String
+  latitude           Float?
+  longitude          Float?
+  bio                String?
+  rating             Float           @default(5.0)
+  reviewCount        Int             @default(0)
+  commissionRate     Decimal         @default(15.00) @db.Decimal(5, 2)
+  isActive           Boolean         @default(true)
+  warehouseName      String?
+  warehouseLocation  String?
+  warehousePhone     String?
+  warehouseImageUrl  String?
+  createdAt          DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt
+
+  employees          EmployeeProfile[]
+  vendorServices     VendorService[]
+  bookings           Booking[]       @relation("VendorBookings")
+  reviews            Review[]        @relation("VendorReviews")
+
+  @@index([kycStatus])
+  @@index([isActive])
+}
+
+model EmployeeProfile {
+  id             String          @id @default(uuid())
+  userId         String          @unique
+  user           User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  vendorId       String
+  vendor         VendorProfile   @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  specialization String
+  rating         Float           @default(5.0)
+  completedJobs  Int             @default(0)
+  phone          String
+  isAvailable    Boolean         @default(true)
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  bookings       Booking[]       @relation("EmployeeBookings")
+  reviews        Review[]        @relation("EmployeeReviews")
+  feedback       EmployeeFeedback[]
+
+  @@index([vendorId])
+  @@index([isAvailable])
+}
+
+model UserAddress {
+  id           String    @id @default(uuid())
+  userId       String
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  label        String    @default("Home")
+  addressLine1 String
+  addressLine2 String?
+  landmark     String?
+  city         String
+  state        String
+  postalCode   String
+  latitude     Float?
+  longitude    Float?
+  isDefault    Boolean   @default(false)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  bookings     Booking[]
+
+  @@index([userId])
+}
+
+// ==========================================
+// SERVICES & PACKAGES
+// ==========================================
+
+model ServiceCategory {
+  id            String               @id @default(uuid())
+  name          String
+  slug          String               @unique
+  iconUrl       String?              // PNG/JPG Cloudinary URL for category tile
+  icon          String?              // DEPRECATED — Lucide icon name, kept for backwards compat
+  description   String?
+  displayOrder  Int                  @default(0)
+  isActive      Boolean              @default(true)
+  deletedAt     DateTime?
+  createdAt     DateTime             @default(now())
+  updatedAt     DateTime             @updatedAt
+
+  services      Service[]
+  subCategories ServiceSubCategory[]
+
+  @@index([slug])
+  @@index([isActive])
+  @@index([deletedAt])
+}
+
+model ServiceSubCategory {
+  id           String          @id @default(uuid())
+  categoryId   String
+  category     ServiceCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  name         String
+  displayOrder Int             @default(0)
+  isActive     Boolean         @default(true)
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  services     Service[]
+
+  @@index([categoryId])
+  @@index([isActive])
+}
+
+model Service {
+  id             String              @id @default(uuid())
+  categoryId     String
+  category       ServiceCategory     @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  subCategoryId  String?
+  subCategory    ServiceSubCategory? @relation(fields: [subCategoryId], references: [id], onDelete: SetNull)
+  name           String
+  slug           String              @unique
+  description    String
+  iconUrl        String?
+  imageUrl       String?             // DEPRECATED — kept for backwards compat
+  bannerImages   String[]
+  bannerVideo    String?
+  startingPrice  Decimal             @db.Decimal(10, 2)
+  priceUnit      String              @default("per service")
+  durationText   String              @default("60 mins")
+  rating         Float               @default(5.0)
+  reviewCount    Int                 @default(0)
+  iconName       String?             // DEPRECATED — Lucide icon name
+  isPopular      Boolean             @default(false)
+  isActive       Boolean             @default(true)
+  deletedAt      DateTime?
+  createdAt      DateTime            @default(now())
+  updatedAt      DateTime            @updatedAt
+
+  packages       ServicePackage[]
+  vendorServices VendorService[]
+  bookings       Booking[]
+  reviews        Review[]
+
+  @@index([categoryId])
+  @@index([subCategoryId])
+  @@index([slug])
+  @@index([isActive])
+  @@index([deletedAt])
+}
+
+model ServicePackage {
+  id                 String   @id @default(uuid())
+  serviceId          String
+  service            Service  @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  // Identity & listing
+  name               String?
+  shortDescription   String?
+  badgeText          String?
+
+  // Pricing
+  originalPrice      Decimal? @db.Decimal(10, 2)
+  discountedPrice    Decimal? @db.Decimal(10, 2)
+  savingsLabel       String?
+  pricePerUnitLabel  String?
+  duration           String   @default("60 mins")
+
+  // Listing card media
+  cardImage          String?
+
+  // Detail page banner (up to 4 images)
+  detailBannerImages String[]
+
+  // Detail page content
+  highlights         String[]
+  processSteps       Json     @default("[]")
+  whatsIncluded      String[]
+  requirements       Json     @default("[]")
+  pleaseNote         String[]
+  faqs               Json     @default("[]")
+
+  // Meta
+  displayOrder       Int      @default(0)
+  isPopular          Boolean  @default(false)
+  isActive           Boolean  @default(true)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  // Legacy fields — kept for backwards compat
+  title              String?
+  description        String?
+  price              Decimal? @db.Decimal(10, 2)
+  durationMinutes    Int?     @default(60)
+  features           Json?    @default("[]")
+
+  bookings           Booking[]
+
+  @@index([serviceId])
+  @@index([isActive])
+}
+
+model VendorService {
+  id           String        @id @default(uuid())
+  vendorId     String
+  vendor       VendorProfile @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  serviceId    String
+  service      Service       @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  customPrice  Decimal?      @db.Decimal(10, 2)
+  isActive     Boolean       @default(true)
+  availability String        @default("Mon-Sat: 09:00 - 18:00")
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  @@unique([vendorId, serviceId])
+  @@index([vendorId])
+  @@index([serviceId])
+}
+
+// ==========================================
+// BOOKINGS & WORKFLOW
+// ==========================================
+
+model Booking {
+  id                 String               @id @default(uuid())
+  bookingNumber      String               @unique
+  customerId         String
+  customer           CustomerProfile      @relation("CustomerBookings", fields: [customerId], references: [id], onDelete: Restrict)
+  serviceId          String
+  service            Service              @relation(fields: [serviceId], references: [id], onDelete: Restrict)
+  packageId          String?
+  package            ServicePackage?      @relation(fields: [packageId], references: [id], onDelete: SetNull)
+  addressId          String
+  address            UserAddress          @relation(fields: [addressId], references: [id], onDelete: Restrict)
+  vendorId           String?
+  vendor             VendorProfile?       @relation("VendorBookings", fields: [vendorId], references: [id], onDelete: SetNull)
+  employeeId         String?
+  employee           EmployeeProfile?     @relation("EmployeeBookings", fields: [employeeId], references: [id], onDelete: SetNull)
+
+  scheduledDate      String               // YYYY-MM-DD
+  scheduledTimeSlot  String               // e.g. 10:00 AM - 12:00 PM
+
+  status             BookingStatus        @default(PENDING)
+
+  basePrice          Decimal              @db.Decimal(10, 2)
+  taxes              Decimal              @default(0.00) @db.Decimal(10, 2)
+  discountAmount     Decimal              @default(0.00) @db.Decimal(10, 2)
+  extraCharges       Decimal              @default(0.00) @db.Decimal(10, 2)
+  totalAmount        Decimal              @db.Decimal(10, 2)
+  expertPayout       Decimal?             @db.Decimal(10, 2)
+
+  paymentStatus      PaymentStatus        @default(PENDING)
+  paymentMethod      PaymentMethod        @default(ONLINE)
+
+  notes              String?
+  cancellationReason String?
+  adminNotes         String?
+
+  // Verification, Completion & Dispute Tracking
+  qrChallengeToken       String?
+  qrChallengeExpiresAt   DateTime?
+  qrVerifiedAt           DateTime?
+  completionRequestedAt  DateTime?
+  customerConfirmedAt    DateTime?
+  disputeReason          String?
+  disputeReportedAt      DateTime?
+  cashCollectedAmount    Decimal?             @db.Decimal(10, 2)
+  cashCollectedAt        DateTime?
+
+  createdAt          DateTime             @default(now())
+  updatedAt          DateTime             @updatedAt
+
+  statusHistory      BookingStatusHistory[]
+  payments           Payment[]
+  refunds            Refund[]
+  review             Review?
+
+  @@index([bookingNumber])
+  @@index([customerId])
+  @@index([vendorId])
+  @@index([employeeId])
+  @@index([status])
+  @@index([scheduledDate])
+  @@index([createdAt])
+}
+
+model BookingStatusHistory {
+  id            String        @id @default(uuid())
+  bookingId     String
+  booking       Booking       @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  oldStatus     BookingStatus?
+  newStatus     BookingStatus
+  changedBy     String        // userId or system
+  changedByRole UserRole
+  reason        String?
+  createdAt     DateTime      @default(now())
+
+  @@index([bookingId])
+  @@index([createdAt])
+}
+
+// ==========================================
+// PAYMENTS & FINANCIALS
+// ==========================================
+
+model Payment {
+  id              String        @id @default(uuid())
+  bookingId       String
+  booking         Booking       @relation(fields: [bookingId], references: [id], onDelete: Restrict)
+  transactionRef  String        @unique
+  idempotencyKey  String?       @unique
+  amount          Decimal       @db.Decimal(10, 2)
+  currency        String        @default("INR")
+  status          PaymentStatus @default(PENDING)
+  method          PaymentMethod @default(ONLINE)
+  gatewayResponse Json?
+  createdAt       DateTime      @default(now())
+
+  refunds         Refund[]
+
+  @@index([transactionRef])
+  @@index([bookingId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model Refund {
+  id             String       @id @default(uuid())
+  paymentId      String
+  payment        Payment      @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  bookingId      String
+  booking        Booking      @relation(fields: [bookingId], references: [id], onDelete: Restrict)
+  idempotencyKey String?      @unique
+  amount         Decimal      @db.Decimal(10, 2)
+  reason         String
+  status         RefundStatus @default(PENDING)
+  processedBy    String       // SUPER_ADMIN userId
+  createdAt      DateTime     @default(now())
+
+  @@index([paymentId])
+  @@index([bookingId])
+  @@index([status])
+}
+
+// ==========================================
+// REVIEWS & MODERATION
+// ==========================================
+
+model Review {
+  id          String           @id @default(uuid())
+  bookingId   String?          @unique
+  booking     Booking?         @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+  customerId  String
+  customer    User             @relation("CustomerReviews", fields: [customerId], references: [id], onDelete: Cascade)
+  serviceId   String
+  service     Service          @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  vendorId    String?
+  vendor      VendorProfile?   @relation("VendorReviews", fields: [vendorId], references: [id], onDelete: SetNull)
+  employeeId  String?
+  employee    EmployeeProfile? @relation("EmployeeReviews", fields: [employeeId], references: [id], onDelete: SetNull)
+  rating      Int
+  comment     String?
+  isHidden    Boolean          @default(false)
+  reportCount Int              @default(0)
+  createdAt   DateTime         @default(now())
+
+  @@index([serviceId])
+  @@index([vendorId])
+  @@index([employeeId])
+  @@index([isHidden])
+}
+
+model EmployeeFeedback {
+  id           String          @id @default(uuid())
+  employeeId   String
+  employee     EmployeeProfile @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  userId       String
+  user         User            @relation("FeedbackGiven", fields: [userId], references: [id], onDelete: Cascade)
+  feedbackType String          @default("General Experience")
+  rating       Int             @default(5)
+  comment      String?
+  createdAt    DateTime        @default(now())
+
+  @@index([employeeId])
+}
+
+// ==========================================
+// DOCUMENTS & KYC
+// ==========================================
+
+model Document {
+  id                 String       @id @default(uuid())
+  userId             String
+  user               User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type               DocumentType
+  title              String
+  fileUrl            String
+  verificationStatus KycStatus    @default(PENDING)
+  rejectionReason    String?
+  verifiedAt         DateTime?
+  createdAt          DateTime     @default(now())
+
+  @@index([userId])
+  @@index([verificationStatus])
+}
+
+// ==========================================
+// NOTIFICATIONS
+// ==========================================
+
+model Notification {
+  id           String             @id @default(uuid())
+  title        String
+  message      String
+  target       NotificationTarget @default(ALL)
+  targetUserId String?
+  isRead       Boolean            @default(false)
+  sentAt       DateTime           @default(now())
+
+  @@index([targetUserId])
+  @@index([sentAt])
+}
+
+// ==========================================
+// PLATFORM & APP CONFIGURATION
+// ==========================================
+
+model PlatformSetting {
+  id          String   @id @default(uuid())
+  key         String   @unique
+  value       Json
+  description String?
+  updatedAt   DateTime @updatedAt
+
+  @@index([key])
+}
+
+model AppConfiguration {
+  id          String   @id @default(uuid())
+  key         String   @unique
+  value       Json
+  description String?
+  updatedAt   DateTime @updatedAt
+
+  @@index([key])
+}
+
+// ==========================================
+// AUDIT LOGGING (IMMUTABLE)
+// ==========================================
+
+model AuditLog {
+  id           String   @id @default(uuid())
+  superAdminId String
+  superAdmin   User     @relation("AdminAuditLogs", fields: [superAdminId], references: [id], onDelete: Restrict)
+  action       String   // e.g., CUSTOMER_SUSPENDED, VENDOR_APPROVED, BOOKING_PRICE_OVERRIDDEN
+  entityType   String   // e.g., User, Booking, VendorProfile, Service
+  entityId     String
+  before       Json?
+  after        Json?
+  changes      Json?
+  reason       String?
+  ipAddress    String?
+  userAgent    String?
+  createdAt    DateTime @default(now())
+
+  @@index([superAdminId])
+  @@index([entityType, entityId])
+  @@index([createdAt])
+}
