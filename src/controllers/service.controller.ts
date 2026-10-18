@@ -5,6 +5,7 @@ import { sendError, sendSuccess } from '../utils/response';
 import { logAuditEvent } from '../utils/audit';
 import { Prisma } from '@prisma/client';
 import { uploadToCloudinary } from '../utils/cloudinary';
+import { invalidateCatalogCache } from './catalog.controller';
 
 export const listServicesQuerySchema = z.object({
   query: z.object({
@@ -253,6 +254,7 @@ export const createService = async (req: Request, res: Response, next: NextFunct
       return s;
     });
 
+    invalidateCatalogCache();
     sendSuccess(res, service, 201);
   } catch (error) {
     next(error);
@@ -359,6 +361,7 @@ export const updateService = async (req: Request, res: Response, next: NextFunct
       return s;
     });
 
+    invalidateCatalogCache();
     sendSuccess(res, updated);
 
   } catch (error) {
@@ -445,6 +448,7 @@ export const softDeleteService = async (req: Request, res: Response, next: NextF
       });
     });
 
+    invalidateCatalogCache();
     sendSuccess(res, { message: 'Service successfully archived' });
   } catch (error) {
     next(error);

@@ -2,12 +2,33 @@ import { Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { sendSuccess, sendError } from '../utils/response';
 
+interface CacheEntry<T> {
+  data: T;
+  meta?: any;
+  expiresAt: number;
+}
+
+const catalogMemoryCache = new Map<string, CacheEntry<any>>();
+const CACHE_TTL_MS = 2 * 60 * 1000; // 2 minutes in-memory cache
+
+export const invalidateCatalogCache = (): void => {
+  catalogMemoryCache.clear();
+};
+
 /**
  * List all active service categories.
  * Public - no authentication required.
  */
 export const getCatalogCategories = async (_req: Request, res: Response): Promise<void> => {
   try {
+    const cacheKey = 'categories:all';
+    const cached = catalogMemoryCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      res.setHeader('Cache-Control', 'public, max-age=60');
+      sendSuccess(res, cached.data, 200);
+      return;
+    }
+
     const categories = await prisma.serviceCategory.findMany({
       where: {
         isActive: true,
@@ -50,7 +71,11 @@ export const getCatalogCategories = async (_req: Request, res: Response): Promis
       iconUrl: cat.iconUrl && cat.iconUrl.startsWith('data:') && cat.iconUrl.length > 2000 ? null : cat.iconUrl,
     }));
 
-    sendSuccess(res, { categories: sanitizedCategories }, 200);
+    const resultData = { categories: sanitizedCategories };
+    catalogMemoryCache.set(cacheKey, { data: resultData, expiresAt: Date.now() + CACHE_TTL_MS });
+
+    res.setHeader('Cache-Control', 'public, max-age=60');
+    sendSuccess(res, resultData, 200);
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
   }
@@ -70,6 +95,14 @@ export const getCatalogServices = async (req: Request, res: Response): Promise<v
     const page = parseInt(String(req.query.page || '1'), 10) || 1;
     const limit = Math.min(Math.max(parseInt(String(req.query.limit || '20'), 10) || 20, 1), 100);
     const skip = (page - 1) * limit;
+
+    const cacheKey = `services:${categoryId || ''}:${subCategoryId || ''}:${categorySlug || ''}:${search || ''}:${isPopular}:${page}:${limit}`;
+    const cached = catalogMemoryCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      res.setHeader('Cache-Control', 'public, max-age=60');
+      sendSuccess(res, cached.data, 200, cached.meta);
+      return;
+    }
 
     const where: any = {
       isActive: true,
@@ -134,17 +167,18 @@ export const getCatalogServices = async (req: Request, res: Response): Promise<v
         : null,
     }));
 
-    sendSuccess(
-      res,
-      { services: sanitizedServices },
-      200,
-      {
-        total,
-        page,
-        limit,
-        totalPages: Math.ceil(total / limit),
-      }
-    );
+    const resultData = { services: sanitizedServices };
+    const meta = {
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+    };
+
+    catalogMemoryCache.set(cacheKey, { data: resultData, meta, expiresAt: Date.now() + CACHE_TTL_MS });
+
+    res.setHeader('Cache-Control', 'public, max-age=60');
+    sendSuccess(res, resultData, 200, meta);
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
   }
@@ -157,6 +191,14 @@ export const getCatalogServices = async (req: Request, res: Response): Promise<v
 export const getCatalogServiceById = async (req: Request, res: Response): Promise<void> => {
   try {
     const id = req.params.id as string;
+
+    const cacheKey = `service:${id}`;
+    const cached = catalogMemoryCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      res.setHeader('Cache-Control', 'public, max-age=60');
+      sendSuccess(res, cached.data, 200);
+      return;
+    }
 
     const service = await prisma.service.findFirst({
       where: {
@@ -195,7 +237,71 @@ export const getCatalogServiceById = async (req: Request, res: Response): Promis
       return;
     }
 
-    sendSuccess(res, { service }, 200);
+    const resultData = { service };
+    catalogMemoryCache.set(cacheKey, { data: resultData, expiresAt: Date.now() + CACHE_TTL_MS });
+
+    res.setHeader('Cache-Control', 'public, max-age=60');
+    sendSuccess(res, resultData, 200);
+  } catch (err: any) {
+    sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
+  }
+};
+
+/**
+ * Get popular/trending services.
+ * Public - no authentication required.
+ */
+export const getPopularServices = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const limit = Math.min(Math.max(parseInt(String(req.query.limit || '10'), 10) || 10, 1), 50);
+
+    const cacheKey = `services:popular:${limit}`;
+    const cached = catalogMemoryCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      res.setHeader('Cache-Control', 'public, max-age=60');
+      sendSuccess(res, cached.data, 200);
+      return;
+    }
+
+    const services = await prisma.service.findMany({
+      where: {
+        isActive: true,
+        isPopular: true,
+        deletedAt: null,
+      },
+      take: limit,
+      orderBy: { rating: 'desc' },
+      include: {
+        category: {
+          select: { id: true, name: true, slug: true, icon: true, iconUrl: true },
+        },
+        packages: {
+          where: { isActive: true },
+          take: 1,
+          orderBy: { discountedPrice: 'asc' },
+        },
+      },
+    });
+
+    const sanitizedServices = services.map((s) => ({
+      ...s,
+      imageUrl: s.imageUrl && s.imageUrl.startsWith('data:') && s.imageUrl.length > 2000 ? (s.iconUrl || '') : s.imageUrl,
+      category: s.category
+        ? {
+            ...s.category,
+            icon:
+              s.category.icon && s.category.icon.startsWith('data:') && s.category.icon.length > 2000
+                ? s.category.iconUrl || ''
+                : s.category.icon,
+          }
+        : null,
+    }));
+
+    const resultData = { services: sanitizedServices };
+    catalogMemoryCache.set(cacheKey, { data: resultData, expiresAt: Date.now() + CACHE_TTL_MS });
+
+    res.setHeader('Cache-Control', 'public, max-age=60');
+    sendSuccess(res, resultData, 200);
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
   }
@@ -247,3 +353,4 @@ export const getCatalogServiceReviews = async (req: Request, res: Response): Pro
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
   }
 };
+

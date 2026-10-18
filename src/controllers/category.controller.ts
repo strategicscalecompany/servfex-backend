@@ -4,6 +4,7 @@ import { prisma } from '../config/prisma';
 import { sendError, sendSuccess } from '../utils/response';
 import { logAuditEvent } from '../utils/audit';
 import { uploadToCloudinary } from '../utils/cloudinary';
+import { invalidateCatalogCache } from './catalog.controller';
 
 export const createCategorySchema = z.object({
   body: z.object({
@@ -117,6 +118,7 @@ export const createCategory = async (req: Request, res: Response, next: NextFunc
       return cat;
     });
 
+    invalidateCatalogCache();
     sendSuccess(res, category, 201);
   } catch (error) {
     next(error);
@@ -173,6 +175,7 @@ export const updateCategory = async (req: Request, res: Response, next: NextFunc
       return cat;
     });
 
+    invalidateCatalogCache();
     sendSuccess(res, updated);
   } catch (error) {
     next(error);
@@ -204,6 +207,7 @@ export const reorderCategories = async (req: Request, res: Response, next: NextF
       });
     });
 
+    invalidateCatalogCache();
     sendSuccess(res, { message: 'Categories reordered successfully' });
   } catch (error) {
     next(error);
@@ -244,6 +248,7 @@ export const softDeleteCategory = async (req: Request, res: Response, next: Next
       });
     });
 
+    invalidateCatalogCache();
     sendSuccess(res, { message: 'Category archived successfully' });
   } catch (error) {
     next(error);
