@@ -29,6 +29,11 @@ import callRoutes from './routes/call.routes';
 const app = express();
 const server = http.createServer(app);
 
+// Trust the first hop from AWS/Nginx reverse proxy.
+// Required for express-rate-limit to correctly read X-Forwarded-For without throwing
+// ERR_ERL_UNEXPECTED_X_FORWARDED_FOR which crashes the request pipeline before CORS headers are sent.
+app.set('trust proxy', 1);
+
 // Initialize Socket.IO for real-time live admin booking updates
 export const io = new SocketIOServer(server, {
   cors: {
