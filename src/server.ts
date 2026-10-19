@@ -25,6 +25,7 @@ import vendorRoutes from './routes/vendor-portal.routes';
 import notificationRoutes from './routes/notification.routes';
 import geoRoutes from './routes/geo.routes';
 import callRoutes from './routes/call.routes';
+import { startDispatchWorker, stopDispatchWorker } from './services/dispatch.worker';
 
 const app = express();
 const server = http.createServer(app);
@@ -246,6 +247,28 @@ server.listen(env.PORT, '0.0.0.0', async () => {
   } catch (err: any) {
     logger.error({ err }, 'Failed to warm database connection on startup');
   }
+
+  try {
+    await startDispatchWorker();
+  } catch (err: any) {
+    logger.error({ err }, 'Failed to initialize dispatch worker on startup');
+  }
 });
+
+const handleShutdown = async (signal: string) => {
+  logger.info({ signal }, 'Received shutdown signal, shutting down gracefully...');
+  stopDispatchWorker();
+  server.close(async () => {
+    try {
+      await prisma.$disconnect();
+    } catch {
+      // Ignore
+    }
+    process.exit(0);
+  });
+};
+
+process.on('SIGTERM', () => handleShutdown('SIGTERM'));
+process.on('SIGINT', () => handleShutdown('SIGINT'));
 
 export { app, server };

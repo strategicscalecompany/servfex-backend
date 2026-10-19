@@ -8,6 +8,13 @@ import { hashPassword } from '../utils/password';
 import { generateAccessToken, generateRefreshToken } from '../utils/token';
 import { sendProviderWelcomeEmail, sendExpertWelcomeEmail } from '../services/email.service';
 import { getFirebaseAuth } from '../config/firebase';
+import {
+  acceptAssignment,
+  advanceTravelStatus,
+  assignExpertManually,
+  DispatchError,
+  rejectAssignment,
+} from '../services/dispatch.service';
 
 // -------------------------------------------------------------
 // Validation Schemas
@@ -743,6 +750,54 @@ export const updateOrderStatus = async (req: Request, res: Response): Promise<vo
       return;
     }
 
+    if (user?.employeeProfile) {
+      if (status === 'ACCEPTED') {
+        await acceptAssignment(userId, id);
+        const order = await prisma.booking.findUnique({
+          where: { id },
+          include: {
+            customer: { include: { user: true } },
+            service: true,
+            address: true,
+            employee: { include: { user: true } },
+            vendor: { include: { user: true } },
+          },
+        });
+        sendSuccess(res, { order }, 200);
+        return;
+      }
+      if (status === 'REJECTED' || status === 'DECLINED') {
+        await rejectAssignment(userId, id, note);
+        const order = await prisma.booking.findUnique({
+          where: { id },
+          include: {
+            customer: { include: { user: true } },
+            service: true,
+            address: true,
+            employee: { include: { user: true } },
+            vendor: { include: { user: true } },
+          },
+        });
+        sendSuccess(res, { order }, 200);
+        return;
+      }
+      if (status === 'ON_THE_WAY' || status === 'ARRIVED') {
+        await advanceTravelStatus(userId, id, status);
+        const order = await prisma.booking.findUnique({
+          where: { id },
+          include: {
+            customer: { include: { user: true } },
+            service: true,
+            address: true,
+            employee: { include: { user: true } },
+            vendor: { include: { user: true } },
+          },
+        });
+        sendSuccess(res, { order }, 200);
+        return;
+      }
+    }
+
     const updated = await prisma.$transaction(async (tx) => {
       const current = await tx.booking.findUnique({
         where: { id },
@@ -833,6 +888,10 @@ export const updateOrderStatus = async (req: Request, res: Response): Promise<vo
     void emitBookingRefresh(id);
     sendSuccess(res, { order: updated }, 200);
   } catch (err: any) {
+    if (err instanceof DispatchError) {
+      sendError(res, err.code, err.message, err.httpStatus);
+      return;
+    }
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
   }
 };
@@ -1146,10 +1205,23 @@ export const assignEmployeeToOrder = async (req: Request, res: Response): Promis
     const resolvedPayout = expertPayout || payout || null;
     const resolvedInstructions = (instructions || note || '').trim();
 
+    if (employeeId) {
+      const updated = await assignExpertManually({
+        bookingId: id,
+        vendorId: vendorProfile.id,
+        vendorUserId: userId,
+        employeeIdOrUserId: employeeId,
+        expertPayout: resolvedPayout ? Number(resolvedPayout) : null,
+        note: resolvedInstructions || null,
+      });
+      sendSuccess(res, { order: updated }, 200);
+      return;
+    }
+
     const updated = await prisma.$transaction(async (tx) => {
       const updateData: any = {
         vendorId: vendorProfile.id,
-        employeeId: employee?.id || null,
+        employeeId: null,
         status: 'ASSIGNED',
         statusHistory: {
           create: {
@@ -1157,7 +1229,7 @@ export const assignEmployeeToOrder = async (req: Request, res: Response): Promis
             newStatus: 'ASSIGNED',
             changedBy: userId,
             changedByRole: 'VENDOR',
-            reason: resolvedInstructions || (employee ? `Assigned technician ${employee.user.name} with payout ₹${resolvedPayout || 'standard'}` : `Dispatched to warehouse team with payout ₹${resolvedPayout || 'standard'}`),
+            reason: resolvedInstructions || `Dispatched to warehouse team with payout ₹${resolvedPayout || 'standard'}`,
           },
         },
       };
@@ -1187,40 +1259,18 @@ export const assignEmployeeToOrder = async (req: Request, res: Response): Promis
       const warehouseLabel = vendorProfile.warehouseName || vendorProfile.companyName;
       const payoutText = resolvedPayout ? ` ₹${Number(resolvedPayout).toFixed(2)}` : '';
 
-      if (employee) {
+      const warehouseExperts = await tx.employeeProfile.findMany({
+        where: { vendorId: vendorProfile.id, isAvailable: true },
+        include: { user: true },
+      });
+
+      for (const exp of warehouseExperts) {
         await tx.notification.create({
           data: {
-            title: `New Job Assignment #${b.bookingNumber}`,
-            message: `You have been assigned ${booking.service.name}. Expert Fare (Payout):${payoutText}. ${resolvedInstructions ? `Note: "${resolvedInstructions}"` : 'Please review and accept.'}`,
+            title: `New Warehouse Order Available #${b.bookingNumber}`,
+            message: `New booking for ${booking.service.name} at ${warehouseLabel}. Expert Fare:${payoutText}. Tap to review and accept!`,
             target: 'SPECIFIC_USER',
-            targetUserId: employee.userId,
-          },
-        });
-      } else {
-        const warehouseExperts = await tx.employeeProfile.findMany({
-          where: { vendorId: vendorProfile.id, isAvailable: true },
-          include: { user: true },
-        });
-
-        for (const exp of warehouseExperts) {
-          await tx.notification.create({
-            data: {
-              title: `New Warehouse Order Available #${b.bookingNumber}`,
-              message: `New booking for ${booking.service.name} at ${warehouseLabel}. Expert Fare:${payoutText}. Tap to review and accept!`,
-              target: 'SPECIFIC_USER',
-              targetUserId: exp.userId,
-            },
-          });
-        }
-      }
-
-      if (booking.customer?.user) {
-        await tx.notification.create({
-          data: {
-            title: `Technician Dispatched #${b.bookingNumber}`,
-            message: `${warehouseLabel} has assigned ${employee ? employee.user.name : 'a specialist technician'} for your ${booking.service.name} service.`,
-            target: 'SPECIFIC_USER',
-            targetUserId: booking.customer.userId,
+            targetUserId: exp.userId,
           },
         });
       }
@@ -1232,6 +1282,10 @@ export const assignEmployeeToOrder = async (req: Request, res: Response): Promis
 
     sendSuccess(res, { order: updated }, 200);
   } catch (err: any) {
+    if (err instanceof DispatchError) {
+      sendError(res, err.code, err.message, err.httpStatus);
+      return;
+    }
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
   }
 };

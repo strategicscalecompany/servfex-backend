@@ -80,6 +80,27 @@ enum DocumentType {
   OTHER
 }
 
+enum AssignmentMethod {
+  PROVIDER
+  AUTO
+}
+
+enum AssignmentStatus {
+  OFFERED
+  ACCEPTED
+  REJECTED
+  EXPIRED
+  CANCELLED
+}
+
+enum CallStatus {
+  RINGING
+  ACTIVE
+  ENDED
+  MISSED
+  DECLINED
+}
+
 enum NotificationTarget {
   ALL
   CUSTOMERS
@@ -181,6 +202,7 @@ model VendorProfile {
   warehouseLocation  String?
   warehousePhone     String?
   warehouseImageUrl  String?
+  serviceRadiusKm    Float           @default(15)
   createdAt          DateTime        @default(now())
   updatedAt          DateTime        @updatedAt
 
@@ -204,12 +226,14 @@ model EmployeeProfile {
   completedJobs  Int             @default(0)
   phone          String
   isAvailable    Boolean         @default(true)
+  lastAssignedAt DateTime?
   createdAt      DateTime        @default(now())
   updatedAt      DateTime        @updatedAt
 
   bookings       Booking[]       @relation("EmployeeBookings")
   reviews        Review[]        @relation("EmployeeReviews")
   feedback       EmployeeFeedback[]
+  assignments    BookingAssignment[]
 
   @@index([vendorId])
   @@index([isAvailable])
@@ -437,6 +461,24 @@ model Booking {
   cashCollectedAmount    Decimal?             @db.Decimal(10, 2)
   cashCollectedAt        DateTime?
 
+  // Customer-confirmed exact service location (pinned on the map). Authoritative for routing & navigation.
+  serviceLatitude            Float?
+  serviceLongitude           Float?
+  serviceFormattedAddress    String?
+  serviceLocationNote        String?
+  serviceLocationAccuracyM   Float?
+  serviceLocationConfirmedAt DateTime?
+
+  // Provider-first assignment window & server-side fallback bookkeeping
+  providerDeadlineAt     DateTime?            // createdAt + provider response window (immutable, for UI countdown)
+  dispatchDueAt          DateTime?            // next server-side dispatch action: PENDING -> auto-assign due; ASSIGNED -> offer expiry (null = nothing scheduled)
+  dispatchAttempts       Int                  @default(0)
+  assignmentMethod       AssignmentMethod?
+  assignedAt             DateTime?
+  acceptedAt             DateTime?
+  onTheWayAt             DateTime?
+  arrivedAt              DateTime?
+
   createdAt          DateTime             @default(now())
   updatedAt          DateTime             @updatedAt
 
@@ -444,6 +486,8 @@ model Booking {
   payments           Payment[]
   refunds            Refund[]
   review             Review?
+  assignments        BookingAssignment[]
+  calls              BookingCall[]
 
   @@index([bookingNumber])
   @@index([customerId])
@@ -456,6 +500,8 @@ model Booking {
   @@index([customerId, status, createdAt(sort: Desc)])
   @@index([vendorId, status, createdAt(sort: Desc)])
   @@index([status, createdAt(sort: Desc)])
+  @@index([status, dispatchDueAt])
+  @@index([employeeId, status])
 }
 
 model BookingStatusHistory {
@@ -471,6 +517,45 @@ model BookingStatusHistory {
 
   @@index([bookingId])
   @@index([createdAt])
+}
+
+/// Audit trail of every expert offer for a booking. The "single winner" guarantee is enforced by locking the
+/// Booking row (SELECT ... FOR UPDATE) inside prisma.$transaction; the optional partial unique index in
+/// prisma/migrations-sql/dispatch_workflow.sql adds a database-level backstop.
+model BookingAssignment {
+  id           String           @id @default(uuid())
+  bookingId    String
+  booking      Booking          @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  employeeId   String
+  employee     EmployeeProfile  @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  method       AssignmentMethod
+  status       AssignmentStatus @default(OFFERED)
+  assignedBy   String           // userId of provider, or 'SYSTEM' for the auto-assign worker
+  reason       String?
+  offeredAt    DateTime         @default(now())
+  respondedAt  DateTime?
+
+  @@index([bookingId, status])
+  @@index([employeeId, status])
+  @@index([bookingId, offeredAt])
+}
+
+/// Metadata for booking-scoped voice calls. No audio is stored.
+model BookingCall {
+  id            String      @id @default(uuid())
+  bookingId     String
+  booking       Booking     @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  channelName   String
+  callerUserId  String
+  calleeUserId  String
+  status        CallStatus  @default(RINGING)
+  startedAt     DateTime    @default(now())
+  answeredAt    DateTime?
+  endedAt       DateTime?
+  endReason     String?
+
+  @@index([bookingId, status])
+  @@index([calleeUserId, status])
 }
 
 // ==========================================

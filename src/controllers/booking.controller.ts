@@ -5,6 +5,7 @@ import { sendError, sendSuccess } from '../utils/response';
 import { logAuditEvent } from '../utils/audit';
 import { BookingStatus, Prisma, UserRole } from '@prisma/client';
 import { emitBookingEvent, emitBookingRefresh } from '../utils/realtime';
+import { releaseDispatchOnCancel } from '../services/dispatch.service';
 
 export const listBookingsQuerySchema = z.object({
   query: z.object({
@@ -1018,6 +1019,7 @@ export const cancelBooking = async (req: Request, res: Response, next: NextFunct
       return b;
     });
 
+    await releaseDispatchOnCancel(id);
     void emitBookingRefresh(id);
     sendSuccess(res, updated);
   } catch (error) {

@@ -6,6 +6,15 @@ import { sendSuccess, sendError } from '../utils/response';
 import { emitBookingRefresh } from '../utils/realtime';
 import { Prisma, BookingStatus } from '@prisma/client';
 import { emitBookingEvent } from '../utils/realtime';
+import { env } from '../config/env';
+import {
+  addSeconds,
+  isValidCoordinate,
+  resolveWarehouse,
+  type WarehouseCandidate,
+} from '../services/dispatch.rules';
+import { releaseDispatchOnCancel, syncDispatchTimer } from '../services/dispatch.service';
+import { scheduleDispatch } from '../services/dispatch.scheduler';
 
 // -------------------------------------------------------------
 // Validation Schemas
@@ -468,71 +477,26 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
       return;
     }
 
-    // Direct Provider Routing: Automatically match the closest provider to customer doorstep
+    // Warehouse routing: find candidate hubs offering this service and determine best match
     let matchedVendor: (typeof candidateVendors)[0] | null = null;
     if (candidateVendors.length > 0) {
-      if (vendorId) {
-        matchedVendor = candidateVendors.find((v) => v.id === vendorId) || null;
-      }
+      const warehouseCandidates: WarehouseCandidate[] = candidateVendors.map((vendor) => ({
+        id: vendor.id,
+        latitude: vendor.latitude,
+        longitude: vendor.longitude,
+        serviceRadiusKm: vendor.serviceRadiusKm ?? 25,
+        location: vendor.location || '',
+        offersService: vendor.vendorServices.length === 0 || vendor.vendorServices.some((vs) => vs.serviceId === serviceId),
+        availableExperts: vendor.employees.length,
+      }));
 
-      if (!matchedVendor) {
-        const scored = candidateVendors.map((vendor) => {
-          let score = 100;
-          let distanceKm: number | null = null;
+      const point = isValidCoordinate(address.latitude, address.longitude)
+        ? { lat: address.latitude as number, lng: address.longitude as number }
+        : null;
 
-          if (
-            address.latitude != null &&
-            address.longitude != null &&
-            vendor.latitude != null &&
-            vendor.longitude != null
-          ) {
-            distanceKm = calculateDistanceKm(
-              address.latitude,
-              address.longitude,
-              vendor.latitude,
-              vendor.longitude
-            );
-          }
-
-          // Proximity scoring: Providers closest to customer doorstep get top priority
-          if (distanceKm != null) {
-            if (distanceKm <= 5) score += 200;
-            else if (distanceKm <= 15) score += 120;
-            else if (distanceKm <= 30) score += 70;
-            else if (distanceKm <= 60) score += 20;
-            else score -= Math.min(distanceKm * 2, 250);
-          } else {
-            // Text matching fallback on city/location
-            const addrCity = (address.city || '').toLowerCase().trim();
-            const vendorLoc = (vendor.location || '').toLowerCase().trim();
-            if (addrCity && vendorLoc && (vendorLoc.includes(addrCity) || addrCity.includes(vendorLoc))) {
-              score += 90;
-            }
-          }
-
-          // Service catalog matching
-          const supportsExactService = vendor.vendorServices.some((vs) => vs.serviceId === serviceId);
-          if (supportsExactService) {
-            score += 50;
-          } else if (vendor.vendorServices.length === 0) {
-            // General service partner offering platform catalog
-            score += 15;
-          }
-
-          // Workforce capacity boost
-          score += vendor.employees.length * 10;
-
-          // Active jobs load balancing
-          score -= vendor.bookings.length * 8;
-
-          // Quality rating boost
-          score += Math.round((vendor.rating || 5.0) * 4);
-
-          return { vendor, score, distanceKm };
-        });
-
-        scored.sort((a, b) => b.score - a.score);
-        matchedVendor = scored[0].vendor;
+      const resolution = resolveWarehouse(warehouseCandidates, point, address.city, vendorId);
+      if (resolution) {
+        matchedVendor = candidateVendors.find((v) => v.id === resolution.vendorId) || null;
       }
     }
 
@@ -552,6 +516,8 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
     const taxes = new Prisma.Decimal(0);
     const totalAmount = basePrice;
     const bookingNumber = `SFX-${Date.now().toString().slice(-6)}-${Math.floor(100 + Math.random() * 900)}`;
+    const now = new Date();
+    const dispatchDueAt = addSeconds(now, env.PROVIDER_RESPONSE_WINDOW_SECONDS);
 
     const newBooking = await prisma.$transaction(async (tx) => {
       const [booking] = await Promise.all([
@@ -566,6 +532,8 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
             scheduledDate,
             scheduledTimeSlot,
             status: 'PENDING',
+            dispatchDueAt,
+            dispatchAttempts: 0,
             basePrice,
             taxes,
             totalAmount,
@@ -578,7 +546,7 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
                 changedBy: userId,
                 changedByRole: 'CUSTOMER',
                 reason: matchedVendor
-                  ? `Order directly routed to nearest service partner: ${matchedVendor.companyName}`
+                  ? `Order routed to warehouse: ${matchedVendor.warehouseName || matchedVendor.companyName}`
                   : 'Customer initiated new service booking',
               },
             },
@@ -615,12 +583,18 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
       return booking;
     }, { maxWait: 8000, timeout: 15000 });
 
+    // Arm precise in-process timer for 60-second provider response window
+    if (newBooking.dispatchDueAt) {
+      scheduleDispatch(newBooking.id, newBooking.dispatchDueAt);
+      void syncDispatchTimer(newBooking.id);
+    }
+
     // Directly notify the assigned provider to dispatch an expert
     if (matchedVendor?.user) {
       prisma.notification.create({
         data: {
           title: `New booking assigned #${bookingNumber}`,
-          message: `New booking for ${service.name} in ${address.city || 'your service area'}. Scheduled on ${scheduledDate} (${scheduledTimeSlot}). Tap to assign your expert technician.`,
+          message: `New booking for ${service.name} from ${matchedVendor.warehouseName || matchedVendor.companyName}. Scheduled on ${scheduledDate} (${scheduledTimeSlot}). Respond within ${env.PROVIDER_RESPONSE_WINDOW_SECONDS}s.`,
           target: 'SPECIFIC_USER',
           targetUserId: matchedVendor.user.id,
         },
@@ -632,7 +606,7 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
       data: {
         title: `Booking Confirmed #${bookingNumber}`,
         message: matchedVendor
-          ? `Your booking for ${service.name} has been routed to ${matchedVendor.companyName}. An expert will be assigned shortly.`
+          ? `Your booking for ${service.name} has been routed to ${matchedVendor.warehouseName || matchedVendor.companyName}. Finding an expert...`
           : `Your booking for ${service.name} has been placed.`,
         target: 'SPECIFIC_USER',
         targetUserId: userId,
@@ -644,7 +618,7 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
       prisma.notification.createMany({
         data: admins.map((admin) => ({
           title: `New booking #${bookingNumber} routed to provider`,
-          message: `${service.name} on ${scheduledDate} (${scheduledTimeSlot}) in ${address.city || 'area'}. Directly assigned to ${matchedVendor ? matchedVendor.companyName : 'general queue'}.`,
+          message: `${service.name} on ${scheduledDate} (${scheduledTimeSlot}) in ${address.city || 'area'}. Directly assigned to ${matchedVendor ? (matchedVendor.warehouseName || matchedVendor.companyName) : 'general queue'}.`,
           target: 'SPECIFIC_USER' as const,
           targetUserId: admin.id,
         })),
@@ -829,6 +803,8 @@ export const cancelBooking = async (req: Request, res: Response): Promise<void> 
         },
       },
     });
+
+    await releaseDispatchOnCancel(id);
 
     // Real-time dispatch without blocking or redundant DB queries
     emitBookingEvent(

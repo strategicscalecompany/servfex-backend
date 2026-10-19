@@ -35,9 +35,17 @@ const envSchema = z.object({
   FCM_SERVER_KEY: z.string().optional(),
   GOOGLE_MAPS_API_KEY: z.string().optional(),
 
-  // Agora RTC Configuration
-  AGORA_APP_ID: z.string().optional().default('1a7873eba5ac4a818e810f3fb2c54996'),
-  AGORA_APP_CERTIFICATE: z.string().optional().default('61fbb700ee474ee29f26500b2a24d556'),
+  // Agora RTC Configuration (no defaults: credentials must come from the environment only)
+  AGORA_APP_ID: z.string().optional(),
+  AGORA_APP_CERTIFICATE: z.string().optional(),
+  AGORA_TOKEN_TTL_SECONDS: z.string().default('1800').transform((val) => parseInt(val, 10)),
+
+  // Booking dispatch: provider-first window, then server-side auto-assignment
+  PROVIDER_RESPONSE_WINDOW_SECONDS: z.string().default('60').transform((val) => parseInt(val, 10)),
+  AUTO_ASSIGN_RETRY_SECONDS: z.string().default('30').transform((val) => parseInt(val, 10)),
+  EXPERT_ACCEPT_WINDOW_SECONDS: z.string().default('120').transform((val) => parseInt(val, 10)),
+  DISPATCH_SWEEP_INTERVAL_MS: z.string().default('5000').transform((val) => parseInt(val, 10)),
+  DISPATCH_WORKER_ENABLED: z.string().default('true').transform((val) => val !== 'false'),
 
   // Hostinger SMTP Email Configuration
   SMTP_HOST: z.string().default('smtp.hostinger.com'),
