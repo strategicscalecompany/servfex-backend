@@ -1,6 +1,6 @@
 import http from 'http';
 import express from 'express';
-import cors from 'cors';
+
 import helmet from 'helmet';
 import compression from 'compression';
 import cookieParser from 'cookie-parser';
@@ -36,16 +36,7 @@ app.set('trust proxy', 1);
 
 // Initialize Socket.IO for real-time live admin booking updates
 export const io = new SocketIOServer(server, {
-  cors: {
-    origin: (origin, callback) => {
-      if (!origin) return callback(null, true);
-      if (env.NODE_ENV === 'development') return callback(null, true);
-      if (/^https?:\/\/([a-z0-9-]+\.)*servfex\.com$/.test(origin)) return callback(null, true);
-      if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return callback(null, true);
-      callback(null, true);
-    },
-    credentials: true,
-  },
+  cors: { origin: '*' },
 });
 
 // Authenticate every socket from its handshake token. PostgreSQL stays the authority on role/status.
@@ -119,39 +110,19 @@ io.on('connection', (socket) => {
   });
 });
 
-// Cross-Origin Resource Sharing — must be before helmet so CORS headers aren't stripped (Rule #11)
-// CORS_ORIGINS env var: comma-separated list of allowed origins (e.g. https://admin.servfex.com,https://app.servfex.com)
-const allowedOrigins = new Set<string>(
-  (process.env.CORS_ORIGINS || env.CLIENT_URL)
-    .split(',')
-    .map((o) => o.trim())
-    .filter(Boolean)
-);
 
-const corsOptions: cors.CorsOptions = {
-  origin: (origin, callback) => {
-    // Allow requests with no origin (mobile apps, curl, Postman)
-    if (!origin) return callback(null, true);
-    // Always allow in development
-    if (env.NODE_ENV === 'development') return callback(null, true);
-    // Allow any configured origin
-    if (allowedOrigins.has(origin)) return callback(null, true);
-    // Allow any subdomain of servfex.com
-    if (/^https?:\/\/([a-z0-9-]+\.)*servfex\.com$/.test(origin)) return callback(null, true);
-    // Allow localhost for local dev/testing
-    if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return callback(null, true);
-    // Default allow (open API — tighten in production by removing this line)
-    callback(null, true);
-  },
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key'],
-  exposedHeaders: ['X-Total-Count'],
-};
+// Allow all origins — inline middleware, no cors package required.
+// Handles OPTIONS preflight and sets permissive CORS headers on every response.
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*');
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,Idempotency-Key');
+  res.setHeader('Access-Control-Expose-Headers', 'X-Total-Count');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 
-// Explicitly handle OPTIONS preflight before any other middleware (rate limiter, auth, etc.)
-app.options('*', cors(corsOptions));
-app.use(cors(corsOptions));
 
 // Security HTTP Headers (Rule #12 in SECURITY_RULES.md)
 // crossOriginResourcePolicy set to 'cross-origin' so CORS-allowed resources aren't blocked
