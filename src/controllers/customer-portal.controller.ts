@@ -648,21 +648,23 @@ export const cancelBooking = async (req: Request, res: Response): Promise<void> 
     const id = req.params.id as string;
     const { reason } = req.body;
 
-    const customerProfile = await prisma.customerProfile.findUnique({
-      where: { userId },
+    const booking = await prisma.booking.findUnique({
+      where: { id },
+      include: {
+        customer: { select: { id: true, userId: true } },
+        vendor: { select: { userId: true } },
+        employee: { select: { userId: true } },
+      },
     });
 
-    if (!customerProfile) {
-      sendError(res, 'NOT_FOUND', 'Customer profile not found', 404);
+    if (!booking || booking.customer.userId !== userId) {
+      sendError(res, 'NOT_FOUND', 'Booking not found', 404);
       return;
     }
 
-    const booking = await prisma.booking.findFirst({
-      where: { id, customerId: customerProfile.id },
-    });
-
-    if (!booking) {
-      sendError(res, 'NOT_FOUND', 'Booking not found', 404);
+    // Idempotent cancellation: if already cancelled, return immediately
+    if (booking.status === 'CANCELLED') {
+      sendSuccess(res, { booking }, 200);
       return;
     }
 
@@ -673,7 +675,6 @@ export const cancelBooking = async (req: Request, res: Response): Promise<void> 
       'AWAITING_CUSTOMER_CONFIRMATION',
       'AWAITING_PAYMENT',
       'COMPLETED',
-      'CANCELLED',
       'DECLINED',
     ];
     if (nonCancellableStatuses.includes(booking.status)) {
@@ -686,27 +687,35 @@ export const cancelBooking = async (req: Request, res: Response): Promise<void> 
       return;
     }
 
-    const updated = await prisma.$transaction(async (tx) => {
-      const b = await tx.booking.update({
-        where: { id },
-        data: {
-          status: 'CANCELLED',
-          cancellationReason: reason,
-          statusHistory: {
-            create: {
-              oldStatus: booking.status,
-              newStatus: 'CANCELLED',
-              changedBy: userId,
-              changedByRole: 'CUSTOMER',
-              reason: `Cancelled by customer: ${reason}`,
-            },
+    const updated = await prisma.booking.update({
+      where: { id },
+      data: {
+        status: 'CANCELLED',
+        cancellationReason: reason,
+        statusHistory: {
+          create: {
+            oldStatus: booking.status,
+            newStatus: 'CANCELLED',
+            changedBy: userId,
+            changedByRole: 'CUSTOMER',
+            reason: `Cancelled by customer: ${reason}`,
           },
         },
-      });
-      return b;
+      },
     });
 
-    void emitBookingRefresh(id);
+    // Real-time dispatch without blocking or redundant DB queries
+    emitBookingEvent(
+      'booking:updated',
+      {
+        bookingId: updated.id,
+        bookingNumber: updated.bookingNumber,
+        status: updated.status,
+        vendorId: updated.vendorId,
+      },
+      [booking.vendor?.userId, booking.employee?.userId, userId]
+    );
+
     sendSuccess(res, { booking: updated }, 200);
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);

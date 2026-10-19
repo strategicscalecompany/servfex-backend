@@ -972,7 +972,12 @@ export const cancelBooking = async (req: Request, res: Response, next: NextFunct
       return;
     }
 
-    if (booking.status === 'COMPLETED' || booking.status === 'CANCELLED') {
+    if (booking.status === 'CANCELLED') {
+      sendSuccess(res, booking);
+      return;
+    }
+
+    if (booking.status === 'COMPLETED') {
       sendError(res, 'INVALID_ACTION', `Cannot cancel a ${booking.status} booking`, 400);
       return;
     }
@@ -1013,7 +1018,7 @@ export const cancelBooking = async (req: Request, res: Response, next: NextFunct
       return b;
     });
 
-    await emitBookingRefresh(id);
+    void emitBookingRefresh(id);
     sendSuccess(res, updated);
   } catch (error) {
     next(error);
