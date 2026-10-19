@@ -405,10 +405,10 @@ function calculateDistanceKm(lat1: number, lon1: number, lat2: number, lon2: num
 export const createBooking = async (req: Request, res: Response): Promise<void> => {
   try {
     const userId = req.user!.userId;
-    const { serviceId, packageId, addressId, scheduledDate, scheduledTimeSlot, paymentMethod, notes } = req.body;
+    const { serviceId, packageId, addressId, scheduledDate, scheduledTimeSlot, paymentMethod, notes, vendorId } = req.body;
 
-    // Concurrently fetch address, service, customer profile, and admins in 1 single network flight
-    const [existingAddress, service, customerProfile, admins] = await Promise.all([
+    // Concurrently fetch address, service, customer profile, admins, and active providers in 1 single network flight
+    const [existingAddress, service, customerProfile, admins, candidateVendors] = await Promise.all([
       addressId
         ? prisma.userAddress.findFirst({ where: { id: addressId, userId } })
         : prisma.userAddress.findFirst({ where: { userId }, orderBy: [{ isDefault: 'desc' }, { createdAt: 'desc' }] }),
@@ -424,6 +424,29 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
       prisma.user.findMany({
         where: { role: 'SUPER_ADMIN', status: 'ACTIVE', deletedAt: null },
         select: { id: true },
+      }),
+      prisma.vendorProfile.findMany({
+        where: {
+          isActive: true,
+          kycStatus: { not: 'REJECTED' },
+        },
+        include: {
+          user: { select: { id: true, name: true, phone: true, email: true } },
+          vendorServices: {
+            where: { isActive: true },
+            select: { serviceId: true },
+          },
+          employees: {
+            where: { isAvailable: true },
+            select: { id: true, isAvailable: true },
+          },
+          bookings: {
+            where: {
+              status: { in: ['ACCEPTED', 'ASSIGNED', 'ON_THE_WAY', 'ARRIVED', 'IN_PROGRESS'] },
+            },
+            select: { id: true },
+          },
+        },
       }),
     ]);
 
@@ -444,6 +467,76 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
       sendError(res, 'BAD_REQUEST', 'Please select or add a valid doorstep address before placing a booking', 400);
       return;
     }
+
+    // Direct Provider Routing: Automatically match the closest provider to customer doorstep
+    let matchedVendor: (typeof candidateVendors)[0] | null = null;
+    if (candidateVendors.length > 0) {
+      if (vendorId) {
+        matchedVendor = candidateVendors.find((v) => v.id === vendorId) || null;
+      }
+
+      if (!matchedVendor) {
+        const scored = candidateVendors.map((vendor) => {
+          let score = 100;
+          let distanceKm: number | null = null;
+
+          if (
+            address.latitude != null &&
+            address.longitude != null &&
+            vendor.latitude != null &&
+            vendor.longitude != null
+          ) {
+            distanceKm = calculateDistanceKm(
+              address.latitude,
+              address.longitude,
+              vendor.latitude,
+              vendor.longitude
+            );
+          }
+
+          // Proximity scoring: Providers closest to customer doorstep get top priority
+          if (distanceKm != null) {
+            if (distanceKm <= 5) score += 200;
+            else if (distanceKm <= 15) score += 120;
+            else if (distanceKm <= 30) score += 70;
+            else if (distanceKm <= 60) score += 20;
+            else score -= Math.min(distanceKm * 2, 250);
+          } else {
+            // Text matching fallback on city/location
+            const addrCity = (address.city || '').toLowerCase().trim();
+            const vendorLoc = (vendor.location || '').toLowerCase().trim();
+            if (addrCity && vendorLoc && (vendorLoc.includes(addrCity) || addrCity.includes(vendorLoc))) {
+              score += 90;
+            }
+          }
+
+          // Service catalog matching
+          const supportsExactService = vendor.vendorServices.some((vs) => vs.serviceId === serviceId);
+          if (supportsExactService) {
+            score += 50;
+          } else if (vendor.vendorServices.length === 0) {
+            // General service partner offering platform catalog
+            score += 15;
+          }
+
+          // Workforce capacity boost
+          score += vendor.employees.length * 10;
+
+          // Active jobs load balancing
+          score -= vendor.bookings.length * 8;
+
+          // Quality rating boost
+          score += Math.round((vendor.rating || 5.0) * 4);
+
+          return { vendor, score, distanceKm };
+        });
+
+        scored.sort((a, b) => b.score - a.score);
+        matchedVendor = scored[0].vendor;
+      }
+    }
+
+    const assignedVendorId = matchedVendor ? matchedVendor.id : null;
 
     let basePrice: Prisma.Decimal = service.startingPrice;
     let actualPackageId: string | null = null;
@@ -466,7 +559,7 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
           data: {
             bookingNumber,
             customerId: customerProfile.id,
-            vendorId: null,
+            vendorId: assignedVendorId,
             serviceId,
             packageId: actualPackageId,
             addressId: address.id,
@@ -484,7 +577,9 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
                 newStatus: 'PENDING',
                 changedBy: userId,
                 changedByRole: 'CUSTOMER',
-                reason: 'Customer initiated new service booking',
+                reason: matchedVendor
+                  ? `Order directly routed to nearest service partner: ${matchedVendor.companyName}`
+                  : 'Customer initiated new service booking',
               },
             },
           },
@@ -520,25 +615,57 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
       return booking;
     }, { maxWait: 8000, timeout: 15000 });
 
-    // Non-blocking notification creation & socket dispatch outside critical HTTP path
+    // Directly notify the assigned provider to dispatch an expert
+    if (matchedVendor?.user) {
+      prisma.notification.create({
+        data: {
+          title: `New booking assigned #${bookingNumber}`,
+          message: `New booking for ${service.name} in ${address.city || 'your service area'}. Scheduled on ${scheduledDate} (${scheduledTimeSlot}). Tap to assign your expert technician.`,
+          target: 'SPECIFIC_USER',
+          targetUserId: matchedVendor.user.id,
+        },
+      }).catch((e) => console.error('Failed to create vendor notification:', e));
+    }
+
+    // Notify customer that booking is routed directly to the service partner
+    prisma.notification.create({
+      data: {
+        title: `Booking Confirmed #${bookingNumber}`,
+        message: matchedVendor
+          ? `Your booking for ${service.name} has been routed to ${matchedVendor.companyName}. An expert will be assigned shortly.`
+          : `Your booking for ${service.name} has been placed.`,
+        target: 'SPECIFIC_USER',
+        targetUserId: userId,
+      },
+    }).catch((e) => console.error('Failed to create customer notification:', e));
+
+    // Non-blocking informational notification to admins (for transparency / audit)
     if (admins.length > 0) {
       prisma.notification.createMany({
         data: admins.map((admin) => ({
-          title: `New booking request #${bookingNumber}`,
-          message: `${service.name} on ${scheduledDate} (${scheduledTimeSlot}) in ${address.city || 'area'}. Total: ₹${totalAmount.toFixed(2)}. Assign a vendor.`,
+          title: `New booking #${bookingNumber} routed to provider`,
+          message: `${service.name} on ${scheduledDate} (${scheduledTimeSlot}) in ${address.city || 'area'}. Directly assigned to ${matchedVendor ? matchedVendor.companyName : 'general queue'}.`,
           target: 'SPECIFIC_USER' as const,
           targetUserId: admin.id,
         })),
       }).catch((e) => console.error('Failed to create admin notifications:', e));
     }
 
+    // Realtime socket dispatch to Customer & Provider
+    const targetUserIds = [userId];
+    if (matchedVendor?.user?.id) {
+      targetUserIds.push(matchedVendor.user.id);
+    }
+
     emitBookingEvent('booking:new', {
       bookingId: newBooking.id,
       bookingNumber: newBooking.bookingNumber,
       status: newBooking.status,
-      vendorId: null,
+      vendorId: assignedVendorId,
       booking: newBooking,
-    }, [userId]);
+    }, targetUserIds);
+
+    void emitBookingRefresh(newBooking.id);
 
     sendSuccess(res, { booking: newBooking }, 201);
   } catch (err: any) {
