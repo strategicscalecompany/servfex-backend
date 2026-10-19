@@ -434,17 +434,15 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
 
     let address = existingAddress;
     if (!address) {
-      address = await prisma.userAddress.create({
-        data: {
-          userId,
-          label: 'Home',
-          addressLine1: 'Flat 402, Green Glen Layout',
-          city: 'Bengaluru',
-          state: 'KA',
-          postalCode: '560103',
-          isDefault: true,
-        },
+      address = await prisma.userAddress.findFirst({
+        where: { userId },
+        orderBy: [{ isDefault: 'desc' }, { createdAt: 'desc' }],
       });
+    }
+
+    if (!address) {
+      sendError(res, 'BAD_REQUEST', 'Please select or add a valid doorstep address before placing a booking', 400);
+      return;
     }
 
     let basePrice: Prisma.Decimal = service.startingPrice;
