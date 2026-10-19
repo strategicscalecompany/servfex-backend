@@ -111,22 +111,50 @@ io.on('connection', (socket) => {
 });
 
 
-// Allow all origins — inline middleware, no cors package required.
-// Handles OPTIONS preflight and sets permissive CORS headers on every response.
+// Universal permissive CORS middleware — works across all environments, proxies, and browsers.
+// Handles OPTIONS preflight immediately with 204 and dynamically echoes requested headers.
 app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*');
-  res.setHeader('Access-Control-Allow-Credentials', 'true');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,Idempotency-Key');
-  res.setHeader('Access-Control-Expose-Headers', 'X-Total-Count');
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  const origin = req.headers.origin;
+  if (origin) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+  } else {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  }
+
+  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS');
+
+  // Allow whatever headers the browser requested
+  const reqHeaders = req.headers['access-control-request-headers'];
+  if (reqHeaders) {
+    res.setHeader('Access-Control-Allow-Headers', reqHeaders);
+  } else {
+    res.setHeader('Access-Control-Allow-Headers', '*');
+  }
+
+  res.setHeader('Access-Control-Expose-Headers', '*');
+  res.setHeader('Access-Control-Max-Age', '86400'); // Cache preflight for 24 hours
+
+  if (req.method === 'OPTIONS') {
+    return res.status(204).end();
+  }
   next();
 });
 
+// Explicit OPTIONS wildcard handler for any router/path
+app.options('*', (_req, res) => {
+  res.status(204).end();
+});
 
 // Security HTTP Headers (Rule #12 in SECURITY_RULES.md)
 // crossOriginResourcePolicy set to 'cross-origin' so CORS-allowed resources aren't blocked
-app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
+app.use(
+  helmet({
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
+    crossOriginOpenerPolicy: false,
+  })
+);
 
 // Gzip / Deflate HTTP Response Compression for high-speed data transfer
 app.use(compression());
