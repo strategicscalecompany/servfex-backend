@@ -160,8 +160,8 @@ app.use(
 app.use(compression());
 
 // Body Parsers & Cookie Parser
-app.use(express.json({ limit: '5mb' }));
-app.use(express.urlencoded({ extended: true, limit: '5mb' }));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 app.use(cookieParser());
 
 // Structured HTTP Request Logging with Pino (Rule #21 in SECURITY_RULES.md)
