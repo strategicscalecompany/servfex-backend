@@ -19,9 +19,9 @@ const envSchema = z.object({
   FIREBASE_PRIVATE_KEY: z.string().optional(),
   FIREBASE_SERVICE_ACCOUNT_PATH: z.string().optional(),
 
-  // Optional legacy secrets (if any fallback needed)
-  JWT_SECRET: z.string().optional().default('default-legacy-secret-min-32-chars-servfex'),
-  JWT_REFRESH_SECRET: z.string().optional().default('default-legacy-refresh-secret-min-32-chars'),
+  // JWT secrets: strictly loaded from environment variables (.env)
+  JWT_SECRET: z.string().min(1, 'JWT_SECRET must be configured in environment variables (.env)'),
+  JWT_REFRESH_SECRET: z.string().min(1, 'JWT_REFRESH_SECRET must be configured in environment variables (.env)'),
   ACCESS_TOKEN_EXPIRES_IN: z.string().default('15m'),
   REFRESH_TOKEN_EXPIRES_IN_DAYS: z.string().default('7').transform((val) => parseInt(val, 10)),
 
