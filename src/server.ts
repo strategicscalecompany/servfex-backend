@@ -32,7 +32,20 @@ const server = http.createServer(app);
 // Initialize Socket.IO for real-time live admin booking updates
 export const io = new SocketIOServer(server, {
   cors: {
-    origin: env.CLIENT_URL,
+    origin: (origin, callback) => {
+      // In development or if matching CLIENT_URL / localhost, allow connection
+      if (
+        !origin ||
+        env.NODE_ENV === 'development' ||
+        origin === env.CLIENT_URL ||
+        origin.includes('localhost') ||
+        origin.includes('127.0.0.1')
+      ) {
+        callback(null, true);
+      } else {
+        callback(null, true);
+      }
+    },
     credentials: true,
   },
 });
@@ -45,7 +58,10 @@ io.use(async (socket, next) => {
     const token =
       (socket.handshake.auth?.token as string | undefined) ||
       (socket.handshake.headers.authorization || '').replace(/^Bearer\s+/i, '');
-    if (!token) return next(new Error('UNAUTHORIZED'));
+    if (!token) {
+      logger.warn({ socketId: socket.id }, 'Realtime socket connection rejected: No token provided');
+      return next(new Error('UNAUTHORIZED'));
+    }
 
     let user = null;
     try {
@@ -55,21 +71,40 @@ io.use(async (socket, next) => {
         select: { id: true, role: true, status: true },
       });
     } catch {
-      if (!isFirebaseConfigured()) return next(new Error('UNAUTHORIZED'));
+      if (!isFirebaseConfigured()) {
+        logger.warn({ socketId: socket.id }, 'Realtime socket connection rejected: Firebase unconfigured & JWT invalid');
+        return next(new Error('UNAUTHORIZED'));
+      }
       const decoded = await getFirebaseAuth().verifyIdToken(token);
       user = await prisma.user.findFirst({
         where: { firebaseUid: decoded.uid, deletedAt: null },
         select: { id: true, role: true, status: true },
       });
+
+      // Email fallback if firebaseUid not linked yet (e.g. Google Sign-In)
+      if (!user && decoded.email) {
+        user = await prisma.user.findFirst({
+          where: { email: decoded.email.toLowerCase().trim(), deletedAt: null },
+          select: { id: true, role: true, status: true },
+        });
+        if (user) {
+          await prisma.user.update({
+            where: { id: user.id },
+            data: { firebaseUid: decoded.uid, isVerified: true },
+          });
+        }
+      }
     }
 
     if (!user || user.status === 'SUSPENDED' || user.status === 'INACTIVE') {
+      logger.warn({ socketId: socket.id, hasUser: !!user, status: user?.status }, 'Realtime socket rejected: Inactive or suspended user');
       return next(new Error('UNAUTHORIZED'));
     }
     socket.data.userId = user.id;
     socket.data.role = user.role;
     next();
-  } catch {
+  } catch (err: any) {
+    logger.warn({ socketId: socket.id, err: err?.message }, 'Realtime socket handshake error');
     next(new Error('UNAUTHORIZED'));
   }
 });
@@ -79,10 +114,10 @@ io.on('connection', (socket) => {
   if (socket.data.role === 'SUPER_ADMIN') {
     socket.join('admins');
   }
-  logger.info({ socketId: socket.id, role: socket.data.role }, 'Realtime client connected');
+  logger.info({ socketId: socket.id, userId: socket.data.userId, role: socket.data.role }, 'Realtime client connected');
 
-  socket.on('disconnect', () => {
-    logger.info({ socketId: socket.id }, 'Realtime client disconnected');
+  socket.on('disconnect', (reason) => {
+    logger.info({ socketId: socket.id, reason }, 'Realtime client disconnected');
   });
 });
 

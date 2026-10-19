@@ -116,13 +116,19 @@ const VALID_TRANSITIONS: Record<BookingStatus, BookingStatus[]> = {
 
 export const getBookings = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
-    const { page, limit, status, customerId, vendorId, employeeId, scheduledDate, search, sortBy, sortOrder } =
-      req.query as any;
-    const skip = (page - 1) * limit;
+    const { status, customerId, vendorId, employeeId, scheduledDate, search } = req.query as any;
+    const pageNum = Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1);
+    const limitNum = Math.min(100, Math.max(1, parseInt(String(req.query.limit || '15'), 10) || 15));
+    const skip = (pageNum - 1) * limitNum;
+
+    const sortField = ['createdAt', 'scheduledDate', 'totalAmount'].includes(String(req.query.sortBy))
+      ? String(req.query.sortBy)
+      : 'createdAt';
+    const sortDirection: 'asc' | 'desc' = req.query.sortOrder === 'asc' ? 'asc' : 'desc';
 
     const where: any = {};
 
-    if (status) {
+    if (status && status !== 'ALL') {
       where.status = status;
     }
     if (customerId) {
@@ -152,8 +158,8 @@ export const getBookings = async (req: Request, res: Response, next: NextFunctio
       prisma.booking.findMany({
         where,
         skip,
-        take: limit,
-        orderBy: { [sortBy]: sortOrder },
+        take: limitNum,
+        orderBy: { [sortField]: sortDirection },
         include: {
           customer: {
             include: {
@@ -174,10 +180,10 @@ export const getBookings = async (req: Request, res: Response, next: NextFunctio
     ]);
 
     sendSuccess(res, bookings, 200, {
-      page,
-      limit,
+      page: pageNum,
+      limit: limitNum,
       total,
-      totalPages: Math.ceil(total / limit),
+      totalPages: Math.ceil(total / limitNum),
     });
   } catch (error) {
     next(error);

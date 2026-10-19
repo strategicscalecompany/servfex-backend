@@ -2,7 +2,7 @@ import { Request, Response } from 'express';
 import { z } from 'zod';
 import { prisma } from '../config/prisma';
 import { sendSuccess, sendError } from '../utils/response';
-import { emitBookingRefresh } from '../utils/realtime';
+import { emitBookingRefresh, emitBookingEvent } from '../utils/realtime';
 import { Prisma, BookingStatus, DocumentType } from '@prisma/client';
 import { hashPassword } from '../utils/password';
 import { generateAccessToken, generateRefreshToken } from '../utils/token';
@@ -1583,6 +1583,17 @@ export const createVendorInquiry = async (req: Request, res: Response): Promise<
         address: true,
       },
     });
+
+    emitBookingEvent(
+      'booking:new',
+      {
+        bookingId: newBooking.id,
+        bookingNumber: newBooking.bookingNumber,
+        status: newBooking.status,
+        vendorId: newBooking.vendorId,
+      },
+      [customerUser?.id, userId]
+    );
 
     sendSuccess(res, { order: newBooking }, 201);
   } catch (err: any) {

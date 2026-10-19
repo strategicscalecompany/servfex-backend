@@ -30,13 +30,24 @@ export const emitBookingEvent = (
   payload: BookingRealtimeEvent,
   userIds: Array<string | null | undefined> = []
 ): void => {
-  if (!ioInstance) return;
+  if (!ioInstance) {
+    logger.warn('Realtime ioInstance not initialized, skipping booking event emit');
+    return;
+  }
   try {
-    let target = ioInstance.to('admins');
-    for (const id of new Set(userIds.filter(Boolean) as string[])) {
-      target = target.to(`user:${id}`);
+    // 1. Dispatch event to Super Admin dashboard room
+    ioInstance.to('admins').emit(event, payload);
+
+    // 2. Dispatch event to respective user rooms (vendor, employee, customer)
+    const validUserIds = new Set(userIds.filter(Boolean) as string[]);
+    for (const id of validUserIds) {
+      ioInstance.to(`user:${id}`).emit(event, payload);
     }
-    target.emit(event, payload);
+
+    logger.info(
+      { event, bookingId: payload.bookingId, bookingNumber: payload.bookingNumber, targetUserCount: validUserIds.size },
+      'Realtime booking event successfully dispatched'
+    );
   } catch (err) {
     logger.warn({ err }, 'Failed to emit realtime booking event');
   }
