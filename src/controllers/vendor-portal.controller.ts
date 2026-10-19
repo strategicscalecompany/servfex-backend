@@ -15,6 +15,11 @@ import {
   DispatchError,
   rejectAssignment,
 } from '../services/dispatch.service';
+import {
+  canSeeExactLocation,
+  approximateCoordinate,
+  LocationViewerRole,
+} from '../services/dispatch.rules';
 
 // -------------------------------------------------------------
 // Validation Schemas
@@ -584,6 +589,52 @@ export const deleteVendorService = async (req: Request, res: Response): Promise<
 // Vendor Orders & Dispatch
 // -------------------------------------------------------------
 
+function sanitizeOrderForViewer(order: any, viewer: { isVendor: boolean; employeeId?: string }) {
+  if (!order) return order;
+  const isAssigned = !!viewer.employeeId && order.employeeId === viewer.employeeId;
+  const role: LocationViewerRole = viewer.isVendor
+    ? 'VENDOR_OWNER'
+    : isAssigned
+      ? 'ASSIGNED_EXPERT'
+      : 'OTHER_EXPERT';
+
+  const exactAllowed = canSeeExactLocation(role, order.status);
+
+  if (exactAllowed) {
+    return order;
+  }
+
+  const sanitizedAddress = order.address
+    ? {
+        ...order.address,
+        addressLine1: order.address.city ? `Area near ${order.address.city}` : 'Service Area',
+        addressLine2: null,
+        landmark: null,
+        latitude: approximateCoordinate(order.address.latitude),
+        longitude: approximateCoordinate(order.address.longitude),
+      }
+    : order.address;
+
+  const sanitizedCustomer = order.customer
+    ? {
+        ...order.customer,
+        user: order.customer.user
+          ? {
+              ...order.customer.user,
+              phone: null,
+              email: null,
+            }
+          : order.customer.user,
+      }
+    : order.customer;
+
+  return {
+    ...order,
+    address: sanitizedAddress,
+    customer: sanitizedCustomer,
+  };
+}
+
 export const getVendorOrders = async (req: Request, res: Response): Promise<void> => {
   try {
     const userId = req.user!.userId;
@@ -644,9 +695,15 @@ export const getVendorOrders = async (req: Request, res: Response): Promise<void
       prisma.booking.count({ where }),
     ]);
 
+    const viewer = {
+      isVendor: !!user?.vendorProfile,
+      employeeId: user?.employeeProfile?.id,
+    };
+    const sanitizedOrders = orders.map((o) => sanitizeOrderForViewer(o, viewer));
+
     sendSuccess(
       res,
-      { orders },
+      { orders: sanitizedOrders },
       200,
       {
         total,
@@ -711,7 +768,13 @@ export const getVendorOrderById = async (req: Request, res: Response): Promise<v
       return;
     }
 
-    sendSuccess(res, { order }, 200);
+    const viewer = {
+      isVendor: !!user?.vendorProfile,
+      employeeId: user?.employeeProfile?.id,
+    };
+    const sanitizedOrder = sanitizeOrderForViewer(order, viewer);
+
+    sendSuccess(res, { order: sanitizedOrder }, 200);
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
   }
