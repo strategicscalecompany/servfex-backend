@@ -23,6 +23,7 @@ export interface BookingRealtimeEvent {
   bookingNumber?: string;
   status?: string;
   vendorId?: string | null;
+  booking?: any;
 }
 
 export const emitBookingEvent = (
@@ -35,8 +36,9 @@ export const emitBookingEvent = (
     return;
   }
   try {
-    // 1. Dispatch event to Super Admin dashboard room
+    // 1. Dispatch event to Super Admin dashboard room AND broadcast to all connected dashboards
     ioInstance.to('admins').emit(event, payload);
+    ioInstance.emit(event, payload);
 
     // 2. Dispatch event to respective user rooms (vendor, employee, customer)
     const validUserIds = new Set(userIds.filter(Boolean) as string[]);

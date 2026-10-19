@@ -490,12 +490,22 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
             },
           },
           include: {
+            customer: {
+              include: {
+                user: { select: { name: true, phone: true, email: true } },
+              },
+            },
             service: {
               select: { id: true, name: true, slug: true, startingPrice: true, durationText: true, iconUrl: true, imageUrl: true },
             },
             package: true,
             address: true,
             vendor: true,
+            employee: {
+              include: {
+                user: { select: { name: true, phone: true } },
+              },
+            },
             statusHistory: true,
           },
         }),
@@ -528,6 +538,7 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
       bookingNumber: newBooking.bookingNumber,
       status: newBooking.status,
       vendorId: null,
+      booking: newBooking,
     }, [userId]);
 
     sendSuccess(res, { booking: newBooking }, 201);
