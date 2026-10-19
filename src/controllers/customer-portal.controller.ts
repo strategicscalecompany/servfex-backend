@@ -457,8 +457,9 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
       }
     }
 
-    const taxes = new Prisma.Decimal((Number(basePrice) * 0.05).toFixed(2));
-    const totalAmount = basePrice.add(taxes);
+    // Zero GST / taxes and zero extra commission markup on bookings
+    const taxes = new Prisma.Decimal(0);
+    const totalAmount = basePrice;
     const bookingNumber = `SFX-${Date.now().toString().slice(-6)}-${Math.floor(100 + Math.random() * 900)}`;
 
     const newBooking = await prisma.$transaction(async (tx) => {

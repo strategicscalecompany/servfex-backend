@@ -83,10 +83,10 @@ const DEFAULT_BOOKING = {
 };
 
 const DEFAULT_PRICING = {
-  platformCommissionPercent: 15.0,
-  baseTaxPercent: 18.0,
-  minimumBookingFee: 199.0,
-  cancellationFee: 50.0,
+  platformCommissionPercent: 0.0,
+  baseTaxPercent: 0.0,
+  minimumBookingFee: 0.0,
+  cancellationFee: 0.0,
   extraChargesAllowed: true,
 };
 
