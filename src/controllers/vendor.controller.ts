@@ -862,7 +862,11 @@ export const deleteVendor = async (req: Request, res: Response, next: NextFuncti
       where: { id },
       include: {
         user: true,
-        employees: true,
+        employees: {
+          include: {
+            user: true,
+          },
+        },
       },
     });
 
@@ -871,76 +875,87 @@ export const deleteVendor = async (req: Request, res: Response, next: NextFuncti
       return;
     }
 
-    await prisma.$transaction(async (tx) => {
-      // 1. Unlink bookings and reviews from vendor
-      await tx.booking.updateMany({
-        where: { vendorId: id },
-        data: { vendorId: null },
-      });
+    const employeeIds = vendor.employees.map((e) => e.id);
+    const employeeUserIds = vendor.employees.map((e) => e.userId);
+    const allUserIdsToDelete = [vendor.userId, ...employeeUserIds];
 
-      await tx.review.updateMany({
-        where: { vendorId: id },
-        data: { vendorId: null },
-      });
+    await prisma.$transaction(
+      async (tx) => {
+        // 1. Unlink bookings and reviews from vendor and all its employees in parallel
+        await Promise.all([
+          tx.booking.updateMany({
+            where: {
+              OR: [
+                { vendorId: id },
+                ...(employeeIds.length > 0 ? [{ employeeId: { in: employeeIds } }] : []),
+              ],
+            },
+            data: {
+              vendorId: null,
+              employeeId: null,
+            },
+          }),
+          tx.review.updateMany({
+            where: {
+              OR: [
+                { vendorId: id },
+                ...(employeeIds.length > 0 ? [{ employeeId: { in: employeeIds } }] : []),
+              ],
+            },
+            data: {
+              vendorId: null,
+              employeeId: null,
+            },
+          }),
+        ]);
 
-      // 2. Unlink bookings and reviews from vendor's employees, and delete employee records
-      for (const emp of vendor.employees) {
-        await tx.booking.updateMany({
-          where: { employeeId: emp.id },
-          data: { employeeId: null },
+        // 2. Delete VendorProfile (Postgres/Prisma cascades automatically delete VendorServices, EmployeeProfiles, EmployeeFeedbacks)
+        await tx.vendorProfile.delete({
+          where: { id },
         });
-        await tx.review.updateMany({
-          where: { employeeId: emp.id },
-          data: { employeeId: null },
+
+        // 3. Delete all associated user accounts (cascades to Sessions and Documents)
+        await tx.user.deleteMany({
+          where: { id: { in: allUserIdsToDelete } },
         });
-        await tx.employeeFeedback.deleteMany({
-          where: { employeeId: emp.id },
+
+        // 4. Audit log
+        await logAuditEvent({
+          superAdminId: req.user!.userId,
+          action: 'VENDOR_DELETED',
+          entityType: 'VendorProfile',
+          entityId: id,
+          before: { companyName: vendor.companyName, email: vendor.user.email },
+          after: { deleted: true },
+          reason: reason || 'Deleted by Super Admin',
+          ipAddress: req.ip,
+          userAgent: req.headers['user-agent'],
+          tx,
         });
-        await tx.employeeProfile.delete({
-          where: { id: emp.id },
-        });
-        await tx.document.deleteMany({
-          where: { userId: emp.userId },
-        });
-        await tx.session.deleteMany({
-          where: { userId: emp.userId },
-        });
-        await tx.user.delete({
-          where: { id: emp.userId },
-        }).catch(() => {});
+      },
+      {
+        timeout: 30000,
+        maxWait: 15000,
       }
+    );
 
-      // 3. Delete vendor catalog services, documents, sessions, and profile
-      await tx.vendorService.deleteMany({ where: { vendorId: id } });
-      await tx.document.deleteMany({ where: { userId: vendor.userId } });
-      await tx.session.deleteMany({ where: { userId: vendor.userId } });
-      await tx.vendorProfile.delete({ where: { id } });
-
-      // 4. Delete the vendor user account
-      await tx.user.delete({ where: { id: vendor.userId } });
-
-      // 5. Audit log
-      await logAuditEvent({
-        superAdminId: req.user!.userId,
-        action: 'VENDOR_DELETED',
-        entityType: 'VendorProfile',
-        entityId: id,
-        before: { companyName: vendor.companyName, email: vendor.user.email },
-        after: { deleted: true },
-        reason: reason || 'Deleted by Super Admin',
-        ipAddress: req.ip,
-        userAgent: req.headers['user-agent'],
-        tx,
-      });
-    });
-
-    // 6. Delete user from Firebase Auth
+    // 5. Delete users from Firebase Auth
+    const firebaseUidsToDelete: string[] = [];
     if (vendor.user.firebaseUid) {
+      firebaseUidsToDelete.push(vendor.user.firebaseUid);
+    }
+    for (const emp of vendor.employees) {
+      if (emp.user?.firebaseUid) {
+        firebaseUidsToDelete.push(emp.user.firebaseUid);
+      }
+    }
+
+    for (const uid of firebaseUidsToDelete) {
       try {
-        await getFirebaseAuth().deleteUser(vendor.user.firebaseUid);
+        await getFirebaseAuth().deleteUser(uid);
       } catch (fbErr: any) {
         if (fbErr.code !== 'auth/user-not-found') {
-          console.warn('[DeleteVendor] Firebase user deletion warning:', fbErr);
+          console.warn(`[DeleteVendor] Firebase user ${uid} deletion warning:`, fbErr);
         }
       }
     }
