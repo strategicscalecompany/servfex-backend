@@ -10,42 +10,25 @@ async function main() {
   const adminFirebaseUid = process.env.SUPER_ADMIN_FIREBASE_UID?.trim() || null;
   const adminEmail = env.SUPER_ADMIN_EMAIL.toLowerCase().trim();
 
-  const existingAdmin = await prisma.user.findFirst({
-    where: { role: 'SUPER_ADMIN' },
+  const superAdmin = await prisma.user.upsert({
+    where: { email: adminEmail },
+    update: {
+      role: 'SUPER_ADMIN',
+      status: 'ACTIVE',
+      isVerified: true,
+      ...(adminFirebaseUid ? { firebaseUid: adminFirebaseUid } : {}),
+      name: env.SUPER_ADMIN_NAME,
+    },
+    create: {
+      email: adminEmail,
+      firebaseUid: adminFirebaseUid,
+      name: env.SUPER_ADMIN_NAME,
+      phone: '+91 99999 88888',
+      role: 'SUPER_ADMIN',
+      status: 'ACTIVE',
+      isVerified: true,
+    },
   });
-
-  let superAdmin;
-  if (existingAdmin) {
-    superAdmin = await prisma.user.update({
-      where: { id: existingAdmin.id },
-      data: {
-        email: adminEmail,
-        ...(adminFirebaseUid ? { firebaseUid: adminFirebaseUid } : {}),
-        name: env.SUPER_ADMIN_NAME,
-        status: 'ACTIVE',
-        isVerified: true,
-      },
-    });
-  } else {
-    superAdmin = await prisma.user.upsert({
-      where: { email: adminEmail },
-      update: {
-        ...(adminFirebaseUid ? { firebaseUid: adminFirebaseUid } : {}),
-        role: 'SUPER_ADMIN',
-        status: 'ACTIVE',
-        isVerified: true,
-      },
-      create: {
-        email: adminEmail,
-        firebaseUid: adminFirebaseUid,
-        name: env.SUPER_ADMIN_NAME,
-        phone: '+91 99999 88888',
-        role: 'SUPER_ADMIN',
-        status: 'ACTIVE',
-        isVerified: true,
-      },
-    });
-  }
 
   if (adminFirebaseUid) {
     console.log(`✅ Super Admin configured: ${superAdmin.email} (Bound to UID: ${adminFirebaseUid})`);
