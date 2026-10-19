@@ -33,18 +33,11 @@ const server = http.createServer(app);
 export const io = new SocketIOServer(server, {
   cors: {
     origin: (origin, callback) => {
-      // In development or if matching CLIENT_URL / localhost, allow connection
-      if (
-        !origin ||
-        env.NODE_ENV === 'development' ||
-        origin === env.CLIENT_URL ||
-        origin.includes('localhost') ||
-        origin.includes('127.0.0.1')
-      ) {
-        callback(null, true);
-      } else {
-        callback(null, true);
-      }
+      if (!origin) return callback(null, true);
+      if (env.NODE_ENV === 'development') return callback(null, true);
+      if (/^https?:\/\/([a-z0-9-]+\.)*servfex\.com$/.test(origin)) return callback(null, true);
+      if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return callback(null, true);
+      callback(null, true);
     },
     credentials: true,
   },
@@ -122,18 +115,33 @@ io.on('connection', (socket) => {
 });
 
 // Cross-Origin Resource Sharing — must be before helmet so CORS headers aren't stripped (Rule #11)
+// CORS_ORIGINS env var: comma-separated list of allowed origins (e.g. https://admin.servfex.com,https://app.servfex.com)
+const allowedOrigins = new Set<string>(
+  (process.env.CORS_ORIGINS || env.CLIENT_URL)
+    .split(',')
+    .map((o) => o.trim())
+    .filter(Boolean)
+);
+
 const corsOptions: cors.CorsOptions = {
   origin: (origin, callback) => {
-    // Allow requests with no origin (mobile apps, curl, Postman) or any matching origin
-    if (!origin || env.NODE_ENV === 'development' || origin === env.CLIENT_URL) {
-      callback(null, true);
-    } else {
-      callback(null, true);
-    }
+    // Allow requests with no origin (mobile apps, curl, Postman)
+    if (!origin) return callback(null, true);
+    // Always allow in development
+    if (env.NODE_ENV === 'development') return callback(null, true);
+    // Allow any configured origin
+    if (allowedOrigins.has(origin)) return callback(null, true);
+    // Allow any subdomain of servfex.com
+    if (/^https?:\/\/([a-z0-9-]+\.)*servfex\.com$/.test(origin)) return callback(null, true);
+    // Allow localhost for local dev/testing
+    if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return callback(null, true);
+    // Default allow (open API — tighten in production by removing this line)
+    callback(null, true);
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key'],
+  exposedHeaders: ['X-Total-Count'],
 };
 
 // Explicitly handle OPTIONS preflight before any other middleware (rate limiter, auth, etc.)
