@@ -121,28 +121,31 @@ io.on('connection', (socket) => {
   });
 });
 
+// Cross-Origin Resource Sharing — must be before helmet so CORS headers aren't stripped (Rule #11)
+const corsOptions: cors.CorsOptions = {
+  origin: (origin, callback) => {
+    // Allow requests with no origin (mobile apps, curl, Postman) or any matching origin
+    if (!origin || env.NODE_ENV === 'development' || origin === env.CLIENT_URL) {
+      callback(null, true);
+    } else {
+      callback(null, true);
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key'],
+};
+
+// Explicitly handle OPTIONS preflight before any other middleware (rate limiter, auth, etc.)
+app.options('*', cors(corsOptions));
+app.use(cors(corsOptions));
+
 // Security HTTP Headers (Rule #12 in SECURITY_RULES.md)
-app.use(helmet());
+// crossOriginResourcePolicy set to 'cross-origin' so CORS-allowed resources aren't blocked
+app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 
 // Gzip / Deflate HTTP Response Compression for high-speed data transfer
 app.use(compression());
-
-// Cross-Origin Resource Sharing (Rule #11 in SECURITY_RULES.md)
-app.use(
-  cors({
-    origin: (origin, callback) => {
-      // Allow requests with no origin (like mobile apps, curl, Postman) or matching development client URL
-      if (!origin || env.NODE_ENV === 'development' || origin === env.CLIENT_URL) {
-        callback(null, true);
-      } else {
-        callback(null, true);
-      }
-    },
-    credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key'],
-  })
-);
 
 // Body Parsers & Cookie Parser
 app.use(express.json({ limit: '5mb' }));
