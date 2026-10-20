@@ -12,6 +12,7 @@ import { env } from './config/env';
 import { logger } from './config/logger';
 import { prisma } from './config/prisma';
 import { errorHandler } from './middleware/errorHandler';
+import { timingMiddleware } from './middleware/timing.middleware';
 import { verifyAccessToken } from './utils/token';
 import { getFirebaseAuth, isFirebaseConfigured } from './config/firebase';
 import { setRealtimeServer } from './utils/realtime';
@@ -158,6 +159,9 @@ app.use(
 );
 
 // Gzip / Deflate HTTP Response Compression for high-speed data transfer
+// End-to-End Performance & Timing Instrumentation (Phase 2)
+app.use(timingMiddleware);
+
 app.use(compression());
 
 // Body Parsers & Cookie Parser

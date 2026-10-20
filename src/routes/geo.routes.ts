@@ -4,6 +4,32 @@ import { logger } from '../config/logger';
 
 const router = Router();
 
+// In-memory bounded cache for high-frequency geocoding queries
+interface GeoCacheEntry {
+  data: any;
+  expiresAt: number;
+}
+const geoCache = new Map<string, GeoCacheEntry>();
+const MAX_GEO_CACHE = 1000;
+const GEO_CACHE_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
+
+const getCachedGeo = (key: string): any | null => {
+  const entry = geoCache.get(key);
+  if (entry && entry.expiresAt > Date.now()) {
+    return entry.data;
+  }
+  if (entry) geoCache.delete(key);
+  return null;
+};
+
+const setCachedGeo = (key: string, data: any, ttlMs = GEO_CACHE_TTL_MS): void => {
+  if (geoCache.size >= MAX_GEO_CACHE) {
+    const firstKey = geoCache.keys().next().value;
+    if (firstKey) geoCache.delete(firstKey);
+  }
+  geoCache.set(key, { data, expiresAt: Date.now() + ttlMs });
+};
+
 /**
  * GET /api/v1/geo/geocode
  * Search locations using Google Maps Geocoding API (with fallback format)
@@ -12,6 +38,15 @@ router.get('/geocode', async (req: Request, res: Response): Promise<void> => {
   const query = req.query.query as string || req.query.address as string;
   if (!query || !query.trim()) {
     res.status(400).json({ success: false, error: { code: 'INVALID_QUERY', message: 'Address query is required' } });
+    return;
+  }
+
+  const cleanQuery = query.trim().toLowerCase();
+  const cacheKey = `geo:${cleanQuery}`;
+  const cached = getCachedGeo(cacheKey);
+  if (cached) {
+    res.setHeader('Cache-Control', 'public, max-age=300');
+    res.status(200).json({ success: true, data: cached });
     return;
   }
 
@@ -35,6 +70,8 @@ router.get('/geocode', async (req: Request, res: Response): Promise<void> => {
         address_components: item.address_components,
       }));
 
+      setCachedGeo(cacheKey, results);
+      res.setHeader('Cache-Control', 'public, max-age=300');
       res.status(200).json({ success: true, data: results });
       return;
     }
@@ -59,6 +96,22 @@ router.get('/reverse', async (req: Request, res: Response): Promise<void> => {
     return;
   }
 
+  const latNum = parseFloat(lat);
+  const lngNum = parseFloat(lng);
+  if (isNaN(latNum) || isNaN(lngNum)) {
+    res.status(400).json({ success: false, error: { code: 'INVALID_COORDINATES', message: 'Coordinates must be valid numbers' } });
+    return;
+  }
+
+  // Cache by ~11m precision
+  const cacheKey = `rev:${latNum.toFixed(4)}:${lngNum.toFixed(4)}`;
+  const cached = getCachedGeo(cacheKey);
+  if (cached) {
+    res.setHeader('Cache-Control', 'public, max-age=300');
+    res.status(200).json({ success: true, data: cached });
+    return;
+  }
+
   const apiKey = env.GOOGLE_MAPS_API_KEY;
   if (!apiKey) {
     res.status(503).json({ success: false, error: { code: 'KEY_NOT_CONFIGURED', message: 'Google Maps API key is not configured' } });
@@ -66,21 +119,25 @@ router.get('/reverse', async (req: Request, res: Response): Promise<void> => {
   }
 
   try {
-    const url = `https://maps.googleapis.com/maps/api/geocode/json?latlng=${lat},${lng}&key=${apiKey}`;
+    const url = `https://maps.googleapis.com/maps/api/geocode/json?latlng=${latNum},${lngNum}&key=${apiKey}`;
     const response = await fetch(url);
     const data = await response.json();
 
     if (data.status === 'OK' && data.results && data.results.length > 0) {
       const first = data.results[0];
+      const resultData = {
+        formatted_address: first.formatted_address,
+        lat: latNum,
+        lng: lngNum,
+        place_id: first.place_id,
+        address_components: first.address_components,
+      };
+
+      setCachedGeo(cacheKey, resultData);
+      res.setHeader('Cache-Control', 'public, max-age=300');
       res.status(200).json({
         success: true,
-        data: {
-          formatted_address: first.formatted_address,
-          lat: parseFloat(lat),
-          lng: parseFloat(lng),
-          place_id: first.place_id,
-          address_components: first.address_components,
-        },
+        data: resultData,
       });
       return;
     }
