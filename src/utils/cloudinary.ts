@@ -1,5 +1,12 @@
-import { v2 as cloudinary } from 'cloudinary';
+import fs from 'fs/promises';
+import os from 'os';
+import path from 'path';
+import { v2 as cloudinary, UploadApiResponse } from 'cloudinary';
 import { env } from '../config/env';
+
+export const MAX_DOCUMENT_BYTES = 500 * 1024 * 1024;
+const LARGE_UPLOAD_THRESHOLD_BYTES = 20 * 1024 * 1024;
+const CLOUDINARY_UPLOAD_TIMEOUT_MS = 600000;
 
 // Configure Cloudinary explicitly
 cloudinary.config({
@@ -24,6 +31,52 @@ const isPdfPayload = (value: string): boolean =>
   value.toLowerCase().includes('.pdf') ||
   value.startsWith('data:application/octet-stream');
 
+export const estimatePayloadBytes = (value: string): number => {
+  if (!value) return 0;
+  if (value.startsWith('data:')) {
+    const comma = value.indexOf(',');
+    const b64 = comma >= 0 ? value.slice(comma + 1) : value;
+    return Math.floor((b64.length * 3) / 4);
+  }
+  return Buffer.byteLength(value, 'utf8');
+};
+
+const extensionFromDataUri = (dataUri: string): string => {
+  const header = dataUri.slice(0, dataUri.indexOf(',') >= 0 ? dataUri.indexOf(',') : 80).toLowerCase();
+  if (header.includes('pdf')) return '.pdf';
+  if (header.includes('png')) return '.png';
+  if (header.includes('webp')) return '.webp';
+  if (header.includes('gif')) return '.gif';
+  if (header.includes('jpeg') || header.includes('jpg')) return '.jpg';
+  return '.bin';
+};
+
+const uploadDataUriInChunks = async (
+  dataUri: string,
+  folder: string,
+  resourceType: 'image' | 'raw' | 'auto'
+): Promise<string> => {
+  const comma = dataUri.indexOf(',');
+  const b64 = comma >= 0 ? dataUri.slice(comma + 1) : dataUri;
+  const tmpPath = path.join(
+    os.tmpdir(),
+    `servfex-upload-${Date.now()}-${Math.random().toString(36).slice(2)}${extensionFromDataUri(dataUri)}`
+  );
+
+  await fs.writeFile(tmpPath, Buffer.from(b64, 'base64'));
+  try {
+    const result = (await cloudinary.uploader.upload_large(tmpPath, {
+      folder,
+      resource_type: resourceType,
+      chunk_size: 20 * 1024 * 1024,
+      timeout: CLOUDINARY_UPLOAD_TIMEOUT_MS,
+    })) as UploadApiResponse;
+    return result.secure_url;
+  } finally {
+    await fs.unlink(tmpPath).catch(() => undefined);
+  }
+};
+
 /**
  * Uploads an image, PDF, or other file (Base64 data URI, remote HTTP URL) to Cloudinary.
  * Returns the secure HTTPS URL on Cloudinary CDN.
@@ -47,10 +100,17 @@ export const uploadToCloudinary = async (
   try {
     const isPdf = isPdfPayload(fileOrBase64);
     const isImage = fileOrBase64.startsWith('data:image/') || (!fileOrBase64.startsWith('data:') && !isPdf);
+    const resourceType: 'image' | 'raw' | 'auto' = isPdf ? 'raw' : isImage ? 'image' : 'auto';
+    const payloadBytes = estimatePayloadBytes(fileOrBase64);
+
+    if (fileOrBase64.startsWith('data:') && payloadBytes > LARGE_UPLOAD_THRESHOLD_BYTES) {
+      return await uploadDataUriInChunks(fileOrBase64, folder, isImage && !isPdf ? 'auto' : resourceType);
+    }
+
     const result = await cloudinary.uploader.upload(fileOrBase64, {
       folder,
-      resource_type: isPdf ? 'raw' : isImage ? 'image' : 'auto',
-      timeout: 120000,
+      resource_type: resourceType,
+      timeout: CLOUDINARY_UPLOAD_TIMEOUT_MS,
       ...(isImage && !isPdf ? { transformation: [{ quality: 'auto', fetch_format: 'auto' }] } : {}),
     });
 

@@ -1,6 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
-import { uploadToCloudinary } from '../utils/cloudinary';
+import { estimatePayloadBytes, MAX_DOCUMENT_BYTES, uploadToCloudinary } from '../utils/cloudinary';
 import { sendSuccess, sendError } from '../utils/response';
 
 export const uploadImageSchema = z.object({
@@ -29,6 +29,11 @@ export const uploadImage = async (req: Request, res: Response, next: NextFunctio
   try {
     const { image, folder } = req.body;
     const targetFolder = ALLOWED_UPLOAD_FOLDERS.has(folder) ? folder : 'servfex/catalog';
+
+    if (estimatePayloadBytes(image) > MAX_DOCUMENT_BYTES) {
+      sendError(res, 'PAYLOAD_TOO_LARGE', 'Each document must be 500MB or smaller, and all documents together cannot exceed 500MB.', 413);
+      return;
+    }
 
     const secureUrl = await uploadToCloudinary(image, targetFolder);
     if (!secureUrl || secureUrl.startsWith('data:')) {

@@ -165,9 +165,14 @@ app.use(timingMiddleware);
 app.use(compression());
 
 // Body Parsers & Cookie Parser
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+// 700mb covers a 500MB document encoded as a JSON data URI (~4/3 overhead).
+app.use(express.json({ limit: '700mb' }));
+app.use(express.urlencoded({ extended: true, limit: '700mb' }));
 app.use(cookieParser());
+
+server.timeout = 15 * 60 * 1000;
+server.headersTimeout = 16 * 60 * 1000;
+server.requestTimeout = 15 * 60 * 1000;
 
 // Structured HTTP Request Logging with Pino (Rule #21 in SECURITY_RULES.md)
 app.use(

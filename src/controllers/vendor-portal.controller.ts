@@ -21,7 +21,7 @@ import {
   LocationViewerRole,
 } from '../services/dispatch.rules';
 import { generateStartOtp, isValidStartOtp, normalizeStartOtp, stripStartOtp } from '../utils/start-otp';
-import { resolveHostedUrl } from '../utils/cloudinary';
+import { estimatePayloadBytes, MAX_DOCUMENT_BYTES, resolveHostedUrl } from '../utils/cloudinary';
 
 // -------------------------------------------------------------
 // Validation Schemas
@@ -446,6 +446,11 @@ export const uploadVendorDocument = async (req: Request, res: Response): Promise
   try {
     const userId = req.user!.userId;
     const { type, title, fileUrl } = req.body;
+
+    if (estimatePayloadBytes(fileUrl) > MAX_DOCUMENT_BYTES) {
+      sendError(res, 'PAYLOAD_TOO_LARGE', 'This document exceeds the 500MB limit.', 413);
+      return;
+    }
 
     const hostedUrl = await resolveHostedUrl(fileUrl, 'servfex/documents');
     if (!hostedUrl) {

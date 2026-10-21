@@ -6,7 +6,7 @@ import { hashPassword } from '../utils/password';
 import { logAuditEvent } from '../utils/audit';
 import { Prisma, DocumentType, KycStatus } from '@prisma/client';
 import { getFirebaseAuth } from '../config/firebase';
-import { resolveHostedUrl } from '../utils/cloudinary';
+import { estimatePayloadBytes, MAX_DOCUMENT_BYTES, resolveHostedUrl } from '../utils/cloudinary';
 import { sendProviderWelcomeEmail } from '../services/email.service';
 
 const MAX_ONBOARDING_DOCUMENTS = 30;
@@ -268,6 +268,22 @@ export const createVendor = async (req: Request, res: Response, next: NextFuncti
 
     // 2. Process warehouse image upload if provided
     const uploadedWarehouseImage = await resolveHostedUrl(warehouseImage, 'servfex/warehouses');
+
+    if (Array.isArray(documents) && documents.length > 0) {
+      const totalBytes = documents.reduce(
+        (sum: number, doc: { fileUrl?: string }) => sum + estimatePayloadBytes(doc.fileUrl || ''),
+        0
+      );
+      if (totalBytes > MAX_DOCUMENT_BYTES) {
+        sendError(
+          res,
+          'PAYLOAD_TOO_LARGE',
+          'Verification documents cannot exceed 500MB in total. Remove some files and try again.',
+          413
+        );
+        return;
+      }
+    }
 
     // 3. Process documents one-by-one so a large set does not fail the whole onboard
     const processedDocuments: Array<{ title: string; type: DocumentType; fileUrl: string }> = [];
@@ -780,6 +796,11 @@ export const addVendorDocument = async (req: Request, res: Response, next: NextF
 
     if (!vendor) {
       sendError(res, 'VENDOR_NOT_FOUND', 'Vendor not found', 404);
+      return;
+    }
+
+    if (estimatePayloadBytes(fileUrl) > MAX_DOCUMENT_BYTES) {
+      sendError(res, 'PAYLOAD_TOO_LARGE', 'This document exceeds the 500MB limit.', 413);
       return;
     }
 

@@ -25,7 +25,7 @@ export const errorHandler = (
     : err.code || 'INTERNAL_SERVER_ERROR';
 
   const message = isPayloadTooLarge
-    ? 'The uploaded files are too large for a single request. Attach documents one at a time — up to 30 files are supported.'
+    ? 'The uploaded files exceed the 500MB total document limit. Remove some files and try again.'
     : env.NODE_ENV === 'production' && statusCode === 500
       ? 'An unexpected internal error occurred. Please try again later.'
       : err.message || 'Internal server error';
