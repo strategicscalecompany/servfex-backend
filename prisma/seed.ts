@@ -1,6 +1,7 @@
 import { PrismaClient } from '@prisma/client';
 import { env } from '../src/config/env';
 import { ensureMongoSparseUniqueIndexes } from '../src/config/mongo-indexes';
+import { parseSuperAdminEmails, superAdminDisplayName } from '../src/config/super-admins';
 
 const prisma = new PrismaClient();
 
@@ -9,34 +10,36 @@ async function main() {
 
   await ensureMongoSparseUniqueIndexes();
 
-  // 1. Seed Super Admin (Binds to Firebase UID if provided, or auto-binds on first Google Sign-In)
+  // 1. Seed Super Admins (firebaseUid auto-binds on first verified Google Sign-In)
   const adminFirebaseUid = process.env.SUPER_ADMIN_FIREBASE_UID?.trim() || null;
-  const adminEmail = env.SUPER_ADMIN_EMAIL.toLowerCase().trim();
+  const primaryAdminEmail = env.SUPER_ADMIN_EMAIL.toLowerCase().trim();
 
-  const superAdmin = await prisma.user.upsert({
-    where: { email: adminEmail },
-    update: {
-      role: 'SUPER_ADMIN',
-      status: 'ACTIVE',
-      isVerified: true,
-      ...(adminFirebaseUid ? { firebaseUid: adminFirebaseUid } : {}),
-      name: env.SUPER_ADMIN_NAME,
-    },
-    create: {
-      email: adminEmail,
-      ...(adminFirebaseUid ? { firebaseUid: adminFirebaseUid } : {}),
-      name: env.SUPER_ADMIN_NAME,
-      phone: '+91 99999 88888',
-      role: 'SUPER_ADMIN',
-      status: 'ACTIVE',
-      isVerified: true,
-    },
-  });
+  for (const adminEmail of parseSuperAdminEmails()) {
+    const bindUid = adminEmail === primaryAdminEmail ? adminFirebaseUid : null;
+    const superAdmin = await prisma.user.upsert({
+      where: { email: adminEmail },
+      update: {
+        role: 'SUPER_ADMIN',
+        status: 'ACTIVE',
+        isVerified: true,
+        ...(bindUid ? { firebaseUid: bindUid } : {}),
+        name: superAdminDisplayName(adminEmail),
+      },
+      create: {
+        email: adminEmail,
+        ...(bindUid ? { firebaseUid: bindUid } : {}),
+        name: superAdminDisplayName(adminEmail),
+        role: 'SUPER_ADMIN',
+        status: 'ACTIVE',
+        isVerified: true,
+      },
+    });
 
-  if (adminFirebaseUid) {
-    console.log(`✅ Super Admin configured: ${superAdmin.email} (Bound to UID: ${adminFirebaseUid})`);
-  } else {
-    console.log(`✅ Super Admin configured: ${superAdmin.email} (Ready for Google Sign-In auto-binding)`);
+    if (bindUid) {
+      console.log(`✅ Super Admin configured: ${superAdmin.email} (Bound to UID: ${bindUid})`);
+    } else {
+      console.log(`✅ Super Admin configured: ${superAdmin.email} (Ready for Google Sign-In auto-binding)`);
+    }
   }
 
   // 2. Initial Platform Settings
@@ -701,19 +704,25 @@ async function main() {
   });
   }
 
-  // Initial Audit Log
-  await prisma.auditLog.create({
-    data: {
-      superAdminId: superAdmin.id,
-      action: 'SYSTEM_INITIALIZATION',
-      entityType: 'System',
-      entityId: 'ROOT',
-      after: { status: 'INITIALIZED', env: env.NODE_ENV },
-      reason: 'Database initialized and seeded with master schema',
-      ipAddress: '127.0.0.1',
-      userAgent: 'ServFex-Seeder/1.0',
-    },
+  const seededPrimaryAdmin = await prisma.user.findUnique({
+    where: { email: primaryAdminEmail },
+    select: { id: true },
   });
+
+  if (seededPrimaryAdmin) {
+    await prisma.auditLog.create({
+      data: {
+        superAdminId: seededPrimaryAdmin.id,
+        action: 'SYSTEM_INITIALIZATION',
+        entityType: 'System',
+        entityId: 'ROOT',
+        after: { status: 'INITIALIZED', env: env.NODE_ENV },
+        reason: 'Database initialized and seeded with master schema',
+        ipAddress: '127.0.0.1',
+        userAgent: 'ServFex-Seeder/1.0',
+      },
+    });
+  }
 
   console.log('🎉 Seeding successfully completed! All relationships valid and verified.');
 }

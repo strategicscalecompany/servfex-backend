@@ -63,7 +63,11 @@ const envSchema = z.object({
 
   // Super Admin Seed Config (Requires actual Firebase UID for seed)
   SUPER_ADMIN_FIREBASE_UID: z.string().optional(),
-  SUPER_ADMIN_EMAIL: z.string().email().optional().default('admin@servfex.com'),
+  SUPER_ADMIN_EMAIL: z.string().email().optional().default('vamshi.c2002@gmail.com'),
+  SUPER_ADMIN_EMAILS: z
+    .string()
+    .optional()
+    .default('vamshi.c2002@gmail.com,strategicscalecompany@gmail.com'),
   SUPER_ADMIN_PASSWORD: z.string().optional(),
   SUPER_ADMIN_NAME: z.string().optional().default('ServFex Super Admin'),
 });

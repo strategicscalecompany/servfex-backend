@@ -1,9 +1,31 @@
 import { Request, Response, NextFunction } from 'express';
+import { Prisma } from '@prisma/client';
 import { getFirebaseAuth, isFirebaseConfigured } from '../config/firebase';
 import { sendError } from '../utils/response';
 import { prisma } from '../config/prisma';
 import { logger } from '../config/logger';
 import { verifyAccessToken } from '../utils/token';
+import { isAllowlistedSuperAdminEmail } from '../config/super-admins';
+
+const AUTH_USER_SELECT = {
+  id: true,
+  email: true,
+  role: true,
+  status: true,
+} as const;
+
+function isDatabaseError(err: unknown): boolean {
+  return (
+    err instanceof Prisma.PrismaClientKnownRequestError ||
+    err instanceof Prisma.PrismaClientUnknownRequestError ||
+    err instanceof Prisma.PrismaClientInitializationError ||
+    err instanceof Prisma.PrismaClientRustPanicError ||
+    (typeof err === 'object' &&
+      err !== null &&
+      'name' in err &&
+      String((err as { name: string }).name).startsWith('Prisma'))
+  );
+}
 
 export interface AuthenticatedUser {
   userId: string;
@@ -43,7 +65,7 @@ function extractToken(req: Request): string | null {
 
 /**
  * Middleware to authenticate requests using Firebase ID token or Backend JWT token.
- * Verifies token validity and binds to PostgreSQL ServFex user account.
+ * Verifies token validity and binds to the ServFex user account in MongoDB.
  */
 export const authenticate = async (
   req: Request,
@@ -110,22 +132,22 @@ export const authenticate = async (
     // Verify token using Firebase Admin SDK
     const decodedToken = await getFirebaseAuth().verifyIdToken(token);
 
-    // PostgreSQL is the sole authority for ServFex user identity & role
+    // MongoDB is the sole authority for ServFex user identity & role
     let user = await prisma.user.findFirst({
       where: { firebaseUid: decodedToken.uid, deletedAt: null },
-      select: {
-        id: true,
-        email: true,
-        role: true,
-        status: true,
-      },
+      select: AUTH_USER_SELECT,
     });
 
+    const verifiedEmail = decodedToken.email_verified
+      ? decodedToken.email?.toLowerCase().trim()
+      : undefined;
+    const allowlistedAdmin = isAllowlistedSuperAdminEmail(verifiedEmail);
+
     // Auto-link verified Google email if user exists
-    if (!user && decodedToken.email && decodedToken.email_verified) {
+    if (!user && verifiedEmail) {
       const emailMatch = await prisma.user.findFirst({
         where: {
-          email: decodedToken.email.toLowerCase().trim(),
+          email: verifiedEmail,
           deletedAt: null,
         },
       });
@@ -134,18 +156,44 @@ export const authenticate = async (
         user = await prisma.user.update({
           where: { id: emailMatch.id },
           data: { firebaseUid: decodedToken.uid, isVerified: true },
-          select: {
-            id: true,
-            email: true,
-            role: true,
-            status: true,
-          },
+          select: AUTH_USER_SELECT,
         });
         logger.info(
           { email: user.email, role: user.role, firebaseUid: decodedToken.uid },
           'Auto-linked verified Google account for user'
         );
       }
+    }
+
+    if (user && allowlistedAdmin && (user.role !== 'SUPER_ADMIN' || user.status !== 'ACTIVE')) {
+      user = await prisma.user.update({
+        where: { id: user.id },
+        data: {
+          role: 'SUPER_ADMIN',
+          status: 'ACTIVE',
+          isVerified: true,
+          firebaseUid: decodedToken.uid,
+        },
+        select: AUTH_USER_SELECT,
+      });
+      logger.info({ email: user.email, firebaseUid: decodedToken.uid }, 'Promoted allowlisted email to SUPER_ADMIN');
+    }
+
+    if (!user && allowlistedAdmin && verifiedEmail) {
+      const name =
+        (decodedToken as { name?: string }).name || verifiedEmail.split('@')[0];
+      user = await prisma.user.create({
+        data: {
+          email: verifiedEmail,
+          firebaseUid: decodedToken.uid,
+          name,
+          role: 'SUPER_ADMIN',
+          status: 'ACTIVE',
+          isVerified: true,
+        },
+        select: AUTH_USER_SELECT,
+      });
+      logger.info({ userId: user.id, email: user.email }, 'Provisioned allowlisted Super Admin from Google login');
     }
 
     // Auto-provision Customer if authenticating via verified Firebase Google/Phone and not yet in DB
@@ -163,12 +211,7 @@ export const authenticate = async (
           isVerified: true,
           customerProfile: { create: {} },
         },
-        select: {
-          id: true,
-          email: true,
-          role: true,
-          status: true,
-        },
+        select: AUTH_USER_SELECT,
       });
       logger.info({ userId: user.id, email: user.email }, 'Auto-provisioned customer from verified Firebase token');
     }
@@ -205,6 +248,12 @@ export const authenticate = async (
       sendError(res, 'TOKEN_REVOKED', 'Firebase ID token has been revoked.', 401);
       return;
     }
+    if (isDatabaseError(err)) {
+      logger.error({ err }, 'Database error during authenticate');
+      sendError(res, 'INTERNAL_ERROR', 'Failed to load account.', 500);
+      return;
+    }
+    logger.error({ err }, 'Authentication failed');
     sendError(res, 'INVALID_TOKEN', 'Invalid or unverified Firebase ID token.', 401);
   }
 };
@@ -214,8 +263,8 @@ export const authenticate = async (
  *
  * Implements strict security locks:
  * 1. Checks Firebase token revocation via verifyIdToken(token, true)
- * 2. Checks PostgreSQL role === 'SUPER_ADMIN' directly from DB (no memory caching)
- * 3. Checks PostgreSQL account status === 'ACTIVE' and deletedAt === null
+ * 2. Checks MongoDB role === 'SUPER_ADMIN' directly from DB (no memory caching)
+ * 3. Checks MongoDB account status === 'ACTIVE' and deletedAt === null
  * 4. Rejects CUSTOMER, VENDOR, EMPLOYEE, OPERATIONS_MANAGER or unprivileged roles with 403 Forbidden
  */
 export const requireSuperAdmin = async (
@@ -284,48 +333,66 @@ export const requireSuperAdmin = async (
       throw revokedErr;
     }
 
-    // 2. Query PostgreSQL live (no caching) to verify SUPER_ADMIN role & active status
+    // 2. Query MongoDB live (no caching) to verify SUPER_ADMIN role & active status
     let adminUser = await prisma.user.findFirst({
       where: {
         firebaseUid: decodedToken.uid,
         deletedAt: null,
       },
-      select: {
-        id: true,
-        email: true,
-        role: true,
-        status: true,
-      },
+      select: AUTH_USER_SELECT,
     });
 
-    if (!adminUser && decodedToken.email && decodedToken.email_verified) {
+    const verifiedAdminEmail = decodedToken.email_verified
+      ? decodedToken.email?.toLowerCase().trim()
+      : undefined;
+    const allowlistedAdmin = isAllowlistedSuperAdminEmail(verifiedAdminEmail);
+
+    if (!adminUser && verifiedAdminEmail) {
       const emailMatch = await prisma.user.findFirst({
         where: {
-          email: decodedToken.email.toLowerCase().trim(),
-          role: 'SUPER_ADMIN',
+          email: verifiedAdminEmail,
           deletedAt: null,
+          ...(allowlistedAdmin ? {} : { role: 'SUPER_ADMIN' }),
         },
       });
 
-      if (emailMatch) {
+      if (emailMatch && (emailMatch.role === 'SUPER_ADMIN' || allowlistedAdmin)) {
         adminUser = await prisma.user.update({
           where: { id: emailMatch.id },
-          data: { firebaseUid: decodedToken.uid, isVerified: true },
-          select: {
-            id: true,
-            email: true,
-            role: true,
-            status: true,
+          data: {
+            firebaseUid: decodedToken.uid,
+            isVerified: true,
+            ...(allowlistedAdmin
+              ? { role: 'SUPER_ADMIN', status: 'ACTIVE' }
+              : {}),
           },
+          select: AUTH_USER_SELECT,
         });
       }
+    }
+
+    if (
+      adminUser &&
+      allowlistedAdmin &&
+      (adminUser.role !== 'SUPER_ADMIN' || adminUser.status !== 'ACTIVE')
+    ) {
+      adminUser = await prisma.user.update({
+        where: { id: adminUser.id },
+        data: {
+          role: 'SUPER_ADMIN',
+          status: 'ACTIVE',
+          isVerified: true,
+          firebaseUid: decodedToken.uid,
+        },
+        select: AUTH_USER_SELECT,
+      });
     }
 
     if (!adminUser || adminUser.role !== 'SUPER_ADMIN') {
       sendError(
         res,
         'FORBIDDEN',
-        'Access denied: This endpoint requires SUPER_ADMIN authority. Role verified in PostgreSQL.',
+        'Access denied: This endpoint requires SUPER_ADMIN authority.',
         403
       );
       return;
@@ -349,6 +416,11 @@ export const requireSuperAdmin = async (
       sendError(res, 'TOKEN_EXPIRED', 'Super Admin session expired. Please refresh.', 401);
       return;
     }
+    if (isDatabaseError(err)) {
+      logger.error({ err }, 'Database error during Super Admin authorization');
+      sendError(res, 'INTERNAL_ERROR', 'Failed to verify Super Admin privileges.', 500);
+      return;
+    }
     logger.warn({ err: err.message }, 'Super Admin authorization check failed');
     sendError(res, 'UNAUTHORIZED', 'Failed to verify Super Admin privileges', 401);
   }
@@ -356,7 +428,7 @@ export const requireSuperAdmin = async (
 
 /**
  * Middleware that strictly verifies the Firebase ID token and attaches decoded claims,
- * but does NOT require a pre-existing PostgreSQL user account.
+ * but does NOT require a pre-existing ServFex user account.
  * Used for customer/vendor registration/onboarding endpoints.
  */
 export const authenticateFirebaseOnly = async (
