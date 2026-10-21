@@ -8,9 +8,18 @@ declare global {
   var prismaGlobal: PrismaClient | undefined;
 }
 
+function runtimeDatabaseUrl(): string {
+  // This is a long-running Node process with interactive $transaction locks.
+  // Supabase port 6543 is PgBouncer transaction mode and makes those locks
+  // wait 10–20s. DIRECT_URL (session pooler :5432) is the correct runtime URL.
+  const direct = env.DIRECT_URL?.trim();
+  return direct && direct.length > 0 ? direct : env.DATABASE_URL;
+}
+
 const basePrisma =
   globalThis.prismaGlobal ??
   new PrismaClient({
+    datasources: { db: { url: runtimeDatabaseUrl() } },
     log: env.NODE_ENV === 'development' ? ['warn', 'error'] : ['error'],
   });
 

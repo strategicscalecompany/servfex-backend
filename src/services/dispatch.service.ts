@@ -469,6 +469,10 @@ export async function processBookingDispatch(
       return;
     }
     if (isTestingWorkflowEnabled() && booking.bookingSource === 'SALES_MANAGER') {
+      await tx.booking.updateMany({
+        where: { id: bookingId, bookingSource: 'SALES_MANAGER' },
+        data: { dispatchDueAt: null },
+      });
       logger.info({ bookingId }, 'Auto-dispatch skipped for Sales Manager booking (Provider assigns)');
       result = 'SKIPPED_TESTING_WORKFLOW';
       return;
@@ -684,7 +688,7 @@ export async function acceptAssignment(userId: string, bookingId: string) {
   }, TX_OPTIONS);
 
   if (result.alreadyAccepted) effects.refreshBookingId = undefined;
-  await runEffects(effects);
+  void runEffects(effects);
   cancelDispatchTimer(bookingId);
   return result;
 }
@@ -746,7 +750,7 @@ export async function rejectAssignment(userId: string, bookingId: string, reason
 
   if (!outcome.released) return outcome;
 
-  await runEffects(effects);
+  void runEffects(effects);
   const rejected = await prisma.booking.findUnique({
     where: { id: bookingId },
     select: { bookingSource: true },
@@ -814,7 +818,7 @@ export async function advanceTravelStatus(userId: string, bookingId: string, tar
   }, TX_OPTIONS);
 
   if (!result.changed) return result;
-  await runEffects(effects);
+  void runEffects(effects);
   return result;
 }
 

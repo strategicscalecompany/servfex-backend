@@ -44,7 +44,7 @@ const envSchema = z.object({
   PROVIDER_RESPONSE_WINDOW_SECONDS: z.string().default('60').transform((val) => parseInt(val, 10)),
   AUTO_ASSIGN_RETRY_SECONDS: z.string().default('30').transform((val) => parseInt(val, 10)),
   EXPERT_ACCEPT_WINDOW_SECONDS: z.string().default('120').transform((val) => parseInt(val, 10)),
-  DISPATCH_SWEEP_INTERVAL_MS: z.string().default('5000').transform((val) => parseInt(val, 10)),
+  DISPATCH_SWEEP_INTERVAL_MS: z.string().default('15000').transform((val) => parseInt(val, 10)),
   DISPATCH_WORKER_ENABLED: z.string().default('true').transform((val) => val !== 'false'),
 
   // Temporary Expert testing workflow. Set to "false" to restore the original auto-dispatch

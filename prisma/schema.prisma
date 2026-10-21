@@ -555,6 +555,8 @@ model Booking {
   @@index([vendorId, scheduledDate])
   @@index([employeeId, scheduledDate, scheduledTimeSlot])
   @@index([vendorId, bookingSource, createdAt(sort: Desc)])
+  @@index([employeeId, scheduledDate(sort: Desc)])
+  @@index([vendorId, employeeId, status])
 }
 
 /// Lead-generation visit captured by a Sales Manager at a warehouse, hub, or business location.

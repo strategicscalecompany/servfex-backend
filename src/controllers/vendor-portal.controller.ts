@@ -190,18 +190,35 @@ export const updateEmployeeSchema = z.object({
 
 const ORDER_LIST_INCLUDE = {
   customer: {
-    include: {
+    select: {
+      id: true,
+      userId: true,
       user: { select: { name: true, phone: true, profilePhotoUrl: true } },
     },
   },
   service: { select: { id: true, name: true, startingPrice: true, durationText: true, imageUrl: true } },
   package: { select: { id: true, name: true, discountedPrice: true, originalPrice: true, duration: true } },
-  address: true,
+  address: {
+    select: {
+      id: true,
+      addressLine1: true,
+      addressLine2: true,
+      city: true,
+      state: true,
+      pincode: true,
+      landmark: true,
+      latitude: true,
+      longitude: true,
+    },
+  },
   employee: {
-    include: {
+    select: {
+      id: true,
+      userId: true,
       user: { select: { name: true, phone: true } },
     },
   },
+  vendor: { select: { id: true, userId: true, companyName: true } },
 } as const;
 
 const SAFE_USER_SELECT = { id: true, name: true, phone: true, email: true, profilePhotoUrl: true } as const;
@@ -705,10 +722,13 @@ export const deleteVendorService = async (req: Request, res: Response): Promise<
 async function resolvePortalActor(userId: string) {
   const user = await prisma.user.findUnique({
     where: { id: userId },
-    include: {
-      vendorProfile: true,
-      employeeProfile: true,
-      managerProfile: true,
+    select: {
+      id: true,
+      role: true,
+      name: true,
+      vendorProfile: { select: { id: true } },
+      employeeProfile: { select: { id: true, vendorId: true, expertKind: true } },
+      managerProfile: { select: { id: true, vendorId: true } },
     },
   });
   const vendorId =
@@ -818,16 +838,13 @@ export const getVendorOrders = async (req: Request, res: Response): Promise<void
       where.status = statusQuery as BookingStatus;
     }
 
-    const [orders, total] = await Promise.all([
-      prisma.booking.findMany({
-        where,
-        take: limit,
-        skip,
-        orderBy: { scheduledDate: 'desc' },
-        include: ORDER_LIST_INCLUDE,
-      }),
-      prisma.booking.count({ where }),
-    ]);
+    const orders = await prisma.booking.findMany({
+      where,
+      take: limit,
+      skip,
+      orderBy: { scheduledDate: 'desc' },
+      include: ORDER_LIST_INCLUDE,
+    });
 
     const viewer = {
       isVendor,
@@ -841,10 +858,10 @@ export const getVendorOrders = async (req: Request, res: Response): Promise<void
       { orders: sanitizedOrders },
       200,
       {
-        total,
+        total: skip + orders.length,
         page,
         limit,
-        totalPages: Math.ceil(total / limit),
+        totalPages: orders.length < limit ? page : page + 1,
       }
     );
   } catch (err: any) {
@@ -883,25 +900,7 @@ export const getVendorOrderById = async (req: Request, res: Response): Promise<v
 
     const order = await prisma.booking.findFirst({
       where,
-      include: {
-        customer: {
-          include: {
-            user: { select: SAFE_USER_SELECT },
-          },
-        },
-        service: { select: { id: true, name: true, startingPrice: true, durationText: true, imageUrl: true, description: true } },
-        package: { select: { id: true, name: true, discountedPrice: true, originalPrice: true, duration: true } },
-        address: true,
-        employee: {
-          include: {
-            user: { select: { name: true, phone: true } },
-          },
-        },
-        statusHistory: {
-          orderBy: { createdAt: 'asc' },
-        },
-        payments: true,
-      },
+      include: ORDER_LIST_INCLUDE,
     });
 
     if (!order) {
@@ -930,7 +929,13 @@ export const updateOrderStatus = async (req: Request, res: Response): Promise<vo
 
     const user = await prisma.user.findUnique({
       where: { id: userId },
-      include: { vendorProfile: true, employeeProfile: true },
+      select: {
+        id: true,
+        role: true,
+        name: true,
+        vendorProfile: { select: { id: true } },
+        employeeProfile: { select: { id: true, vendorId: true, expertKind: true } },
+      },
     });
 
     let booking;
@@ -975,13 +980,7 @@ export const updateOrderStatus = async (req: Request, res: Response): Promise<vo
         await acceptAssignment(userId, id);
         const order = await prisma.booking.findUnique({
           where: { id },
-          include: {
-            customer: { include: { user: true } },
-            service: true,
-            address: true,
-            employee: { include: { user: true } },
-            vendor: { include: { user: true } },
-          },
+          include: ORDER_LIST_INCLUDE,
         });
         sendSuccess(res, { order }, 200);
         return;
@@ -990,13 +989,7 @@ export const updateOrderStatus = async (req: Request, res: Response): Promise<vo
         await rejectAssignment(userId, id, note);
         const order = await prisma.booking.findUnique({
           where: { id },
-          include: {
-            customer: { include: { user: true } },
-            service: true,
-            address: true,
-            employee: { include: { user: true } },
-            vendor: { include: { user: true } },
-          },
+          include: ORDER_LIST_INCLUDE,
         });
         sendSuccess(res, { order }, 200);
         return;
@@ -1005,13 +998,7 @@ export const updateOrderStatus = async (req: Request, res: Response): Promise<vo
         await advanceTravelStatus(userId, id, status);
         const order = await prisma.booking.findUnique({
           where: { id },
-          include: {
-            customer: { include: { user: true } },
-            service: true,
-            address: true,
-            employee: { include: { user: true } },
-            vendor: { include: { user: true } },
-          },
+          include: ORDER_LIST_INCLUDE,
         });
         sendSuccess(res, { order }, 200);
         return;
@@ -1021,12 +1008,7 @@ export const updateOrderStatus = async (req: Request, res: Response): Promise<vo
     const updated = await prisma.$transaction(async (tx) => {
       const current = await tx.booking.findUnique({
         where: { id },
-        include: {
-          employee: { include: { user: true } },
-          vendor: { include: { user: true } },
-          service: true,
-          customer: { include: { user: true } },
-        },
+        include: ORDER_LIST_INCLUDE,
       });
       if (!current) throw new Error('Order not found');
 
@@ -1060,34 +1042,28 @@ export const updateOrderStatus = async (req: Request, res: Response): Promise<vo
       const b = await tx.booking.update({
         where: { id },
         data: updateData,
-        include: {
-          customer: { include: { user: true } },
-          service: true,
-          address: true,
-          employee: { include: { user: true } },
-          vendor: { include: { user: true } },
-        },
+        include: ORDER_LIST_INCLUDE,
       });
 
       // If employee accepted the order, notify Vendor & Customer
       if (status === 'ACCEPTED' && user?.employeeProfile) {
-        if (current.vendor?.user) {
+        if (current.vendor?.userId) {
           await tx.notification.create({
             data: {
               title: `Job Accepted #${b.bookingNumber}`,
               message: `Expert ${user.name} has accepted order #${b.bookingNumber} (${current.service.name}).`,
               target: 'SPECIFIC_USER',
-              targetUserId: current.vendor.user.id,
+              targetUserId: current.vendor.userId,
             },
           });
         }
-        if (current.customer?.user) {
+        if (current.customer?.userId) {
           await tx.notification.create({
             data: {
               title: `Service Confirmed #${b.bookingNumber}`,
               message: `Expert ${user.name} has accepted your booking for ${current.service.name}.`,
               target: 'SPECIFIC_USER',
-              targetUserId: current.customer.user.id,
+              targetUserId: current.customer.userId,
             },
           });
         }
@@ -1190,12 +1166,7 @@ export const verifyOrderOtp = async (req: Request, res: Response): Promise<void>
             },
           },
         },
-        include: {
-          customer: { include: { user: true } },
-          service: true,
-          address: true,
-          employee: { include: { user: true } },
-        },
+        include: ORDER_LIST_INCLUDE,
       });
     });
 

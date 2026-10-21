@@ -22,9 +22,10 @@ export async function sweepDueBookings(clock: () => Date = () => new Date()): Pr
       where: {
         status: { in: ['PENDING', 'ASSIGNED'] },
         dispatchDueAt: { lte: now },
+        ...(isTestingWorkflowEnabled() ? { bookingSource: { not: 'SALES_MANAGER' } } : {}),
       },
       select: { id: true },
-      take: 50,
+      take: 20,
       orderBy: { dispatchDueAt: 'asc' },
     });
 

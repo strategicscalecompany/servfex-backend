@@ -439,21 +439,23 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
           isActive: true,
           kycStatus: { not: 'REJECTED' },
         },
-        include: {
-          user: { select: { id: true, name: true, phone: true, email: true } },
+        select: {
+          id: true,
+          latitude: true,
+          longitude: true,
+          serviceRadiusKm: true,
+          location: true,
+          warehouseName: true,
+          companyName: true,
+          user: { select: { id: true, name: true } },
           vendorServices: {
             where: { isActive: true },
             select: { serviceId: true },
           },
           employees: {
             where: { isAvailable: true },
-            select: { id: true, isAvailable: true },
-          },
-          bookings: {
-            where: {
-              status: { in: ['ACCEPTED', 'ASSIGNED', 'ON_THE_WAY', 'ARRIVED', 'IN_PROGRESS'] },
-            },
             select: { id: true },
+            take: 25,
           },
         },
       }),
