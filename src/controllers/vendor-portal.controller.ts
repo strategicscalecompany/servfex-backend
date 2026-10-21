@@ -22,6 +22,14 @@ import {
 } from '../services/dispatch.rules';
 import { generateStartOtp, isValidStartOtp, normalizeStartOtp, stripStartOtp } from '../utils/start-otp';
 import { estimatePayloadBytes, MAX_DOCUMENT_BYTES, resolveHostedUrl } from '../utils/cloudinary';
+import {
+  countValidCompletionPhotos,
+  getTestingWorkflowSnapshot,
+  hasRequiredCompletionPhotos,
+  isTestingWorkflowEnabled,
+  MIN_COMPLETION_PHOTOS,
+  uniqueHostedImageUrls,
+} from '../config/testing-workflow';
 
 // -------------------------------------------------------------
 // Validation Schemas
@@ -130,7 +138,13 @@ export const createHubBookingSchema = z.object({
   latitude: z.number().optional(),
   longitude: z.number().optional(),
   notes: z.string().optional(),
-  source: z.enum(['PHONE_HUB', 'EXPERT_TEAM']).optional(),
+  source: z.enum(['PHONE_HUB', 'EXPERT_TEAM', 'SALES_MANAGER']).optional(),
+  idempotencyKey: z.string().min(8).max(80).optional(),
+});
+
+export const uploadCompletionPhotosSchema = z.object({
+  image: z.string().min(8).optional(),
+  images: z.array(z.string().min(8)).max(12).optional(),
 });
 
 export const recordCashSchema = z.object({
@@ -145,12 +159,23 @@ export const assignEmployeeOrderSchema = z.object({
   instructions: z.string().optional(),
 });
 
+const expertKindSchema = z
+  .enum(['SALES_MANAGER', 'SERVICE_PROFESSIONAL', 'SALES', 'SERVICE', 'SALES MANAGER', 'SERVICE PROFESSIONAL'])
+  .optional();
+
+function normalizeExpertKind(value?: string | null): 'SALES_MANAGER' | 'SERVICE_PROFESSIONAL' {
+  const raw = (value || '').toUpperCase().replace(/[\s-]+/g, '_').trim();
+  if (raw === 'SALES_MANAGER' || raw === 'SALES') return 'SALES_MANAGER';
+  return 'SERVICE_PROFESSIONAL';
+}
+
 export const createEmployeeSchema = z.object({
   name: z.string().min(2, 'Employee name is required'),
   email: z.string().email('Valid employee email required'),
   phone: z.string().min(10, 'Valid employee phone required'),
   specialization: z.string().min(2, 'Specialization is required'),
   password: z.string().min(4).optional(),
+  expertKind: expertKindSchema,
 });
 
 export const updateEmployeeSchema = z.object({
@@ -158,7 +183,26 @@ export const updateEmployeeSchema = z.object({
   phone: z.string().min(10).optional(),
   specialization: z.string().min(2).optional(),
   isAvailable: z.boolean().optional(),
+  expertKind: expertKindSchema,
 });
+
+const ORDER_LIST_INCLUDE = {
+  customer: {
+    include: {
+      user: { select: { name: true, phone: true, profilePhotoUrl: true } },
+    },
+  },
+  service: { select: { id: true, name: true, startingPrice: true, durationText: true, imageUrl: true } },
+  package: { select: { id: true, name: true, discountedPrice: true, originalPrice: true, duration: true } },
+  address: true,
+  employee: {
+    include: {
+      user: { select: { name: true, phone: true } },
+    },
+  },
+} as const;
+
+const SAFE_USER_SELECT = { id: true, name: true, phone: true, email: true, profilePhotoUrl: true } as const;
 
 // -------------------------------------------------------------
 // Vendor Auth & Onboarding
@@ -323,7 +367,10 @@ export const getVendorProfile = async (req: Request, res: Response): Promise<voi
           location: user.employeeProfile.vendor.location,
           rating: user.employeeProfile.rating,
           specialization: user.employeeProfile.specialization,
+          expertKind: user.employeeProfile.expertKind,
         },
+        expertKind: user.employeeProfile.expertKind,
+        workflow: getTestingWorkflowSnapshot(),
       }, 200);
       return;
     }
@@ -670,8 +717,14 @@ async function resolvePortalActor(userId: string) {
     isVendor: !!user?.vendorProfile,
     isManager: user?.role === 'OPERATIONS_MANAGER',
     employeeId: user?.employeeProfile?.id,
+    expertKind: user?.employeeProfile?.expertKind || null,
+    isSalesManager: user?.employeeProfile?.expertKind === 'SALES_MANAGER',
   };
 }
+
+export const getVendorWorkflowConfig = async (_req: Request, res: Response): Promise<void> => {
+  sendSuccess(res, { workflow: getTestingWorkflowSnapshot() }, 200);
+};
 
 function sanitizeOrderForViewer(order: any, viewer: { isVendor: boolean; employeeId?: string; isManager?: boolean }) {
   if (!order) return order;
@@ -728,7 +781,7 @@ export const getVendorOrders = async (req: Request, res: Response): Promise<void
     const limit = Math.min(Math.max(parseInt(String(req.query.limit || '20'), 10) || 20, 1), 100);
     const skip = (page - 1) * limit;
 
-    const { user, vendorId, isVendor, isManager, employeeId } = await resolvePortalActor(userId);
+    const { user, vendorId, isVendor, isManager, employeeId, isSalesManager } = await resolvePortalActor(userId);
 
     let where: any = {};
     if (isVendor || isManager) {
@@ -738,14 +791,24 @@ export const getVendorOrders = async (req: Request, res: Response): Promise<void
       }
       where.vendorId = vendorId;
     } else if (user?.employeeProfile) {
-      where.OR = [
-        { employeeId: user.employeeProfile.id },
-        {
+      if (isTestingWorkflowEnabled() && isSalesManager) {
+        where = {
           vendorId: user.employeeProfile.vendorId,
-          employeeId: null,
-          status: { in: ['ASSIGNED', 'PENDING'] },
-        },
-      ];
+          bookingSource: 'SALES_MANAGER',
+        };
+      } else if (isTestingWorkflowEnabled()) {
+        // Service Professionals only see jobs assigned to them (Provider-controlled assignment).
+        where = { employeeId: user.employeeProfile.id };
+      } else {
+        where.OR = [
+          { employeeId: user.employeeProfile.id },
+          {
+            vendorId: user.employeeProfile.vendorId,
+            employeeId: null,
+            status: { in: ['ASSIGNED', 'PENDING'] },
+          },
+        ];
+      }
     } else {
       sendError(res, 'NOT_FOUND', 'Vendor or Employee profile not found', 404);
       return;
@@ -761,21 +824,7 @@ export const getVendorOrders = async (req: Request, res: Response): Promise<void
         take: limit,
         skip,
         orderBy: { scheduledDate: 'desc' },
-        include: {
-          customer: {
-            include: {
-              user: { select: { name: true, phone: true, profilePhotoUrl: true } },
-            },
-          },
-          service: true,
-          package: true,
-          address: true,
-          employee: {
-            include: {
-              user: { select: { name: true, phone: true } },
-            },
-          },
-        },
+        include: ORDER_LIST_INCLUDE,
       }),
       prisma.booking.count({ where }),
     ]);
@@ -808,7 +857,7 @@ export const getVendorOrderById = async (req: Request, res: Response): Promise<v
     const userId = req.user!.userId;
     const id = req.params.id as string;
 
-    const { user, vendorId, isVendor, isManager, employeeId } = await resolvePortalActor(userId);
+    const { user, vendorId, isVendor, isManager, employeeId, isSalesManager } = await resolvePortalActor(userId);
 
     let where: any = { id };
     if (isVendor || isManager) {
@@ -818,10 +867,17 @@ export const getVendorOrderById = async (req: Request, res: Response): Promise<v
       }
       where.vendorId = vendorId;
     } else if (user?.employeeProfile) {
-      where.OR = [
-        { employeeId: user.employeeProfile.id },
-        { vendorId: user.employeeProfile.vendorId },
-      ];
+      if (isTestingWorkflowEnabled() && isSalesManager) {
+        where.vendorId = user.employeeProfile.vendorId;
+        where.bookingSource = 'SALES_MANAGER';
+      } else if (isTestingWorkflowEnabled()) {
+        where.employeeId = user.employeeProfile.id;
+      } else {
+        where.OR = [
+          { employeeId: user.employeeProfile.id },
+          { vendorId: user.employeeProfile.vendorId },
+        ];
+      }
     } else {
       sendError(res, 'NOT_FOUND', 'Vendor or Employee profile not found', 404);
       return;
@@ -832,11 +888,11 @@ export const getVendorOrderById = async (req: Request, res: Response): Promise<v
       include: {
         customer: {
           include: {
-            user: { select: { name: true, phone: true, email: true, profilePhotoUrl: true } },
+            user: { select: SAFE_USER_SELECT },
           },
         },
-        service: true,
-        package: true,
+        service: { select: { id: true, name: true, startingPrice: true, durationText: true, imageUrl: true, description: true } },
+        package: { select: { id: true, name: true, discountedPrice: true, originalPrice: true, duration: true } },
         address: true,
         employee: {
           include: {
@@ -902,6 +958,24 @@ export const updateOrderStatus = async (req: Request, res: Response): Promise<vo
     }
 
     if (user?.employeeProfile) {
+      if (isTestingWorkflowEnabled() && user.employeeProfile.expertKind === 'SALES_MANAGER') {
+        sendError(res, 'FORBIDDEN', 'Sales Managers cannot accept or complete service jobs', 403);
+        return;
+      }
+      if (
+        isTestingWorkflowEnabled() &&
+        (status === 'COMPLETED' || status === 'AWAITING_CUSTOMER_CONFIRMATION' || status === 'IN_PROGRESS')
+      ) {
+        sendError(
+          res,
+          'INVALID_TRANSITION',
+          status === 'IN_PROGRESS'
+            ? 'Use the start OTP endpoint to begin work'
+            : 'Use the completion endpoint after uploading the required photographs',
+          400
+        );
+        return;
+      }
       if (status === 'ACCEPTED') {
         await acceptAssignment(userId, id);
         const order = await prisma.booking.findUnique({
@@ -1062,18 +1136,25 @@ export const verifyOrderOtp = async (req: Request, res: Response): Promise<void>
       });
     } else if (user?.employeeProfile) {
       booking = await prisma.booking.findFirst({
-        where: {
-          id,
-          OR: [
-            { employeeId: user.employeeProfile.id },
-            { vendorId: user.employeeProfile.vendorId },
-          ],
-        },
+        where: isTestingWorkflowEnabled()
+          ? { id, employeeId: user.employeeProfile.id }
+          : {
+              id,
+              OR: [
+                { employeeId: user.employeeProfile.id },
+                { vendorId: user.employeeProfile.vendorId },
+              ],
+            },
       });
     }
 
     if (!booking) {
       sendError(res, 'NOT_FOUND', 'Order not found or unauthorized', 404);
+      return;
+    }
+
+    if (isTestingWorkflowEnabled() && user?.employeeProfile?.expertKind === 'SALES_MANAGER') {
+      sendError(res, 'FORBIDDEN', 'Sales Managers cannot start service jobs', 403);
       return;
     }
 
@@ -1133,36 +1214,124 @@ export const verifyOrderOtp = async (req: Request, res: Response): Promise<void>
 /** @deprecated alias — QR start verification was replaced with a 4-digit OTP. */
 export const verifyOrderQr = verifyOrderOtp;
 
+export const uploadOrderCompletionPhotos = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = req.user!.userId;
+    const id = req.params.id as string;
+    const payloads: string[] = [];
+    if (typeof req.body?.image === 'string') payloads.push(req.body.image);
+    if (Array.isArray(req.body?.images)) payloads.push(...req.body.images.filter((v: unknown) => typeof v === 'string'));
+
+    if (payloads.length === 0) {
+      sendError(res, 'BAD_REQUEST', 'At least one image is required', 400);
+      return;
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      include: { employeeProfile: true },
+    });
+    if (!user?.employeeProfile) {
+      sendError(res, 'FORBIDDEN', 'Only the assigned Service Professional can upload completion photographs', 403);
+      return;
+    }
+    if (isTestingWorkflowEnabled() && user.employeeProfile.expertKind === 'SALES_MANAGER') {
+      sendError(res, 'FORBIDDEN', 'Sales Managers cannot upload service completion photographs', 403);
+      return;
+    }
+
+    const booking = await prisma.booking.findFirst({
+      where: { id, employeeId: user.employeeProfile.id },
+    });
+    if (!booking) {
+      sendError(res, 'NOT_FOUND', 'Order not found or not assigned to you', 404);
+      return;
+    }
+    if (!['IN_PROGRESS', 'ARRIVED'].includes(booking.status)) {
+      sendError(res, 'BAD_REQUEST', `Cannot upload completion photographs while the job is ${booking.status}`, 400);
+      return;
+    }
+
+    const hosted: string[] = [];
+    for (const payload of payloads) {
+      if (estimatePayloadBytes(payload) > MAX_DOCUMENT_BYTES) {
+        sendError(res, 'PAYLOAD_TOO_LARGE', 'Each photograph must be 500MB or smaller', 413);
+        return;
+      }
+      const url = await resolveHostedUrl(payload, 'servfex/completions');
+      if (url) hosted.push(url);
+    }
+    if (hosted.length === 0) {
+      sendError(res, 'IMAGE_UPLOAD_FAILED', 'Photographs could not be hosted. Retry the upload.', 400);
+      return;
+    }
+
+    const merged = uniqueHostedImageUrls([...(booking.completionPhotoUrls || []), ...hosted]);
+    const updated = await prisma.booking.update({
+      where: { id },
+      data: { completionPhotoUrls: merged },
+      select: {
+        id: true,
+        status: true,
+        completionPhotoUrls: true,
+      },
+    });
+
+    sendSuccess(res, {
+      orderId: updated.id,
+      photoUrls: updated.completionPhotoUrls,
+      count: countValidCompletionPhotos(updated.completionPhotoUrls),
+      required: MIN_COMPLETION_PHOTOS,
+      readyToComplete: hasRequiredCompletionPhotos(updated.completionPhotoUrls),
+    }, 200);
+  } catch (err: any) {
+    sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
+  }
+};
+
 export const completeOrder = async (req: Request, res: Response): Promise<void> => {
   try {
     const userId = req.user!.userId;
     const id = req.params.id as string;
-    const { note } = req.body || {};
+    const { note, completionNotes } = req.body || {};
+    const completionReason = note || completionNotes;
 
     const user = await prisma.user.findUnique({
       where: { id: userId },
       include: { vendorProfile: true, employeeProfile: true },
     });
 
+    if (isTestingWorkflowEnabled() && user?.employeeProfile?.expertKind === 'SALES_MANAGER') {
+      sendError(res, 'FORBIDDEN', 'Sales Managers cannot complete service jobs', 403);
+      return;
+    }
+
     let booking;
-    if (user?.vendorProfile) {
+    if (user?.vendorProfile && !isTestingWorkflowEnabled()) {
       booking = await prisma.booking.findFirst({
         where: { id, vendorId: user.vendorProfile.id },
       });
     } else if (user?.employeeProfile) {
       booking = await prisma.booking.findFirst({
-        where: {
-          id,
-          OR: [
-            { employeeId: user.employeeProfile.id },
-            { vendorId: user.employeeProfile.vendorId },
-          ],
-        },
+        where: { id, employeeId: user.employeeProfile.id },
       });
     }
 
     if (!booking) {
       sendError(res, 'NOT_FOUND', 'Order not found or unauthorized', 404);
+      return;
+    }
+
+    if (
+      booking.status === 'AWAITING_CUSTOMER_CONFIRMATION' ||
+      booking.status === 'AWAITING_PAYMENT' ||
+      booking.status === 'COMPLETED'
+    ) {
+      sendSuccess(res, {
+        order: booking,
+        message: 'Completion already submitted.',
+        alreadyCompleted: true,
+      }, 200);
       return;
     }
 
@@ -1176,27 +1345,74 @@ export const completeOrder = async (req: Request, res: Response): Promise<void> 
       return;
     }
 
+    if (isTestingWorkflowEnabled() && !hasRequiredCompletionPhotos(booking.completionPhotoUrls)) {
+      sendError(
+        res,
+        'COMPLETION_PHOTOS_REQUIRED',
+        `Upload at least ${MIN_COMPLETION_PHOTOS} completion photographs before finishing this job. Currently ${countValidCompletionPhotos(booking.completionPhotoUrls)} valid photograph(s) are stored.`,
+        400
+      );
+      return;
+    }
+
     const updated = await prisma.$transaction(async (tx) => {
-      return tx.booking.update({
-        where: { id },
+      await tx.$queryRaw`SELECT id FROM "Booking" WHERE id = ${id} FOR UPDATE`;
+      const current = await tx.booking.findUnique({ where: { id } });
+      if (!current) throw new Error('Order not found');
+      if (
+        current.status === 'AWAITING_CUSTOMER_CONFIRMATION' ||
+        current.status === 'AWAITING_PAYMENT' ||
+        current.status === 'COMPLETED'
+      ) {
+        return tx.booking.findUnique({
+          where: { id },
+          include: {
+            customer: { include: { user: { select: SAFE_USER_SELECT } } },
+            service: { select: { id: true, name: true } },
+            address: true,
+            employee: { include: { user: { select: { name: true, phone: true } } } },
+          },
+        });
+      }
+      if (current.status !== 'IN_PROGRESS') {
+        throw Object.assign(new Error(`Cannot complete order in ${current.status} status.`), { code: 'BAD_REQUEST' });
+      }
+      if (isTestingWorkflowEnabled() && !hasRequiredCompletionPhotos(current.completionPhotoUrls)) {
+        throw Object.assign(
+          new Error(`Upload at least ${MIN_COMPLETION_PHOTOS} completion photographs before finishing this job.`),
+          { code: 'COMPLETION_PHOTOS_REQUIRED' }
+        );
+      }
+
+      const flipped = await tx.booking.updateMany({
+        where: { id, status: 'IN_PROGRESS', employeeId: user?.employeeProfile?.id || booking.employeeId },
         data: {
           status: 'AWAITING_CUSTOMER_CONFIRMATION',
           completionRequestedAt: new Date(),
-          statusHistory: {
-            create: {
-              oldStatus: booking.status,
-              newStatus: 'AWAITING_CUSTOMER_CONFIRMATION',
-              changedBy: userId,
-              changedByRole: (user?.role as any) || 'EMPLOYEE',
-              reason: note || 'Technician completed service delivery. Awaiting customer confirmation.',
-            },
-          },
         },
+      });
+      if (flipped.count !== 1) {
+        throw Object.assign(new Error('Completion changed while submitting. Please refresh.'), { code: 'ASSIGNMENT_CONFLICT' });
+      }
+
+      await tx.bookingStatusHistory.create({
+        data: {
+          bookingId: id,
+          oldStatus: 'IN_PROGRESS',
+          newStatus: 'AWAITING_CUSTOMER_CONFIRMATION',
+          changedBy: userId,
+          changedByRole: (user?.role as any) || 'EMPLOYEE',
+          reason: completionReason || 'Technician completed service delivery. Awaiting customer confirmation.',
+        },
+      });
+
+      return tx.booking.findUnique({
+        where: { id },
         include: {
-          customer: { include: { user: true } },
-          service: true,
+          customer: { include: { user: { select: SAFE_USER_SELECT } } },
+          service: { select: { id: true, name: true } },
           address: true,
-          employee: { include: { user: true } },
+          employee: { include: { user: { select: { name: true, phone: true } } } },
         },
       });
     });
@@ -1204,6 +1420,10 @@ export const completeOrder = async (req: Request, res: Response): Promise<void> 
     void emitBookingRefresh(id);
     sendSuccess(res, { order: updated, message: 'Completion submitted. Awaiting customer confirmation.' }, 200);
   } catch (err: any) {
+    if (err.code === 'COMPLETION_PHOTOS_REQUIRED' || err.code === 'BAD_REQUEST' || err.code === 'ASSIGNMENT_CONFLICT') {
+      sendError(res, err.code, err.message, err.code === 'ASSIGNMENT_CONFLICT' ? 409 : 400);
+      return;
+    }
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
   }
 };
@@ -1319,6 +1539,11 @@ export const assignEmployeeToOrder = async (req: Request, res: Response): Promis
       return;
     }
 
+    if (isTestingWorkflowEnabled() && !employeeId) {
+      sendError(res, 'BAD_REQUEST', 'Select a Service Professional to assign this booking', 400);
+      return;
+    }
+
     let employee: any = null;
     if (employeeId) {
       employee = await prisma.employeeProfile.findFirst({
@@ -1333,6 +1558,10 @@ export const assignEmployeeToOrder = async (req: Request, res: Response): Promis
 
       if (!employee) {
         sendError(res, 'BAD_REQUEST', 'Technician/Employee does not belong to your company', 400);
+        return;
+      }
+      if (isTestingWorkflowEnabled() && employee.expertKind === 'SALES_MANAGER') {
+        sendError(res, 'EXPERT_NOT_ELIGIBLE', 'A Sales Manager cannot be assigned a service job', 400);
         return;
       }
     }
@@ -1457,8 +1686,12 @@ export const getVendorEmployees = async (req: Request, res: Response): Promise<v
       return;
     }
 
+    const eligibleOnly = String(req.query.eligibleForAssignment || '') === 'true';
     const employees = await prisma.employeeProfile.findMany({
-      where: { vendorId: vendorProfile.id },
+      where: {
+        vendorId: vendorProfile.id,
+        ...(isTestingWorkflowEnabled() && eligibleOnly ? { expertKind: 'SERVICE_PROFESSIONAL' } : {}),
+      },
       include: {
         user: {
           select: { id: true, name: true, email: true, phone: true, profilePhotoUrl: true, status: true },
@@ -1477,7 +1710,8 @@ export const getVendorEmployees = async (req: Request, res: Response): Promise<v
 export const createVendorEmployee = async (req: Request, res: Response): Promise<void> => {
   try {
     const userId = req.user!.userId;
-    const { name, email, phone, specialization, password } = req.body;
+    const { name, email, phone, specialization, password, expertKind } = req.body;
+    const resolvedExpertKind = normalizeExpertKind(expertKind);
 
     const vendorProfile = await prisma.vendorProfile.findUnique({
       where: { userId },
@@ -1517,6 +1751,7 @@ export const createVendorEmployee = async (req: Request, res: Response): Promise
             create: {
               vendorId: vendorProfile.id,
               specialization,
+              expertKind: resolvedExpertKind,
               rating: 5.0,
               completedJobs: 0,
               phone,
@@ -1555,7 +1790,7 @@ export const updateVendorEmployee = async (req: Request, res: Response): Promise
   try {
     const userId = req.user!.userId;
     const id = req.params.id as string;
-    const { name, phone, specialization, isAvailable } = req.body;
+    const { name, phone, specialization, isAvailable, expertKind } = req.body;
 
     const vendorProfile = await prisma.vendorProfile.findUnique({
       where: { userId },
@@ -1592,6 +1827,7 @@ export const updateVendorEmployee = async (req: Request, res: Response): Promise
           ...(phone ? { phone } : {}),
           ...(specialization ? { specialization } : {}),
           ...(isAvailable !== undefined ? { isAvailable } : {}),
+          ...(expertKind ? { expertKind: normalizeExpertKind(expertKind) } : {}),
         },
         include: { user: true },
       });
@@ -1833,6 +2069,16 @@ export const createHubBooking = async (req: Request, res: Response): Promise<voi
       return;
     }
 
+    if (isTestingWorkflowEnabled() && source === 'SALES_MANAGER' && user?.employeeProfile?.expertKind !== 'SALES_MANAGER' && !isVendor && !isManager) {
+      sendError(res, 'FORBIDDEN', 'Only a Sales Manager can create Sales Manager bookings', 403);
+      return;
+    }
+
+    if (source === 'SALES_MANAGER' && !customerEmail) {
+      sendError(res, 'BAD_REQUEST', 'Customer email is required for Sales Manager bookings', 400);
+      return;
+    }
+
     const service = await prisma.service.findFirst({
       where: { id: serviceId, isActive: true, deletedAt: null },
     });
@@ -1878,6 +2124,22 @@ export const createHubBooking = async (req: Request, res: Response): Promise<voi
       });
     });
 
+    const recentDuplicate = await prisma.booking.findFirst({
+      where: {
+        vendorId,
+        customerId: customerUser.customerProfile!.id,
+        serviceId: service.id,
+        scheduledDate,
+        createdAt: { gte: new Date(Date.now() - 2 * 60 * 1000) },
+        status: { notIn: ['CANCELLED', 'DECLINED'] },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (recentDuplicate) {
+      sendSuccess(res, { order: stripStartOtp(recentDuplicate), duplicate: true }, 200);
+      return;
+    }
+
     const address = await prisma.userAddress.create({
       data: {
         userId: customerUser.id,
@@ -1894,7 +2156,8 @@ export const createHubBooking = async (req: Request, res: Response): Promise<voi
     });
 
     const bookingNumber = `SFX-${Date.now().toString().slice(-6)}-${Math.floor(100 + Math.random() * 900)}`;
-    const bookingSource = source === 'EXPERT_TEAM' ? 'EXPERT_TEAM' : 'PHONE_HUB';
+    const bookingSource =
+      source === 'SALES_MANAGER' ? 'SALES_MANAGER' : source === 'EXPERT_TEAM' ? 'EXPERT_TEAM' : 'PHONE_HUB';
 
     const booking = await prisma.booking.create({
       data: {
@@ -1918,9 +2181,11 @@ export const createHubBooking = async (req: Request, res: Response): Promise<voi
             changedBy: userId,
             changedByRole: (user?.role as any) || 'OPERATIONS_MANAGER',
             reason:
-              bookingSource === 'PHONE_HUB'
-                ? 'Phone / hub desk booking created by Operations Manager'
-                : 'Expert team created this booking after a customer visit',
+              bookingSource === 'SALES_MANAGER'
+                ? 'Sales Manager created this customer booking'
+                : bookingSource === 'PHONE_HUB'
+                  ? 'Phone / hub desk booking created by Operations Manager'
+                  : 'Expert team created this booking after a customer visit',
           },
         },
       },
@@ -1931,6 +2196,10 @@ export const createHubBooking = async (req: Request, res: Response): Promise<voi
       },
     });
 
+    const vendorOwner = await prisma.vendorProfile.findUnique({
+      where: { id: vendorId },
+      select: { userId: true },
+    });
     emitBookingEvent(
       'booking:new',
       {
@@ -1939,7 +2208,7 @@ export const createHubBooking = async (req: Request, res: Response): Promise<voi
         status: booking.status,
         vendorId: booking.vendorId,
       },
-      [customerUser.id, userId]
+      [customerUser.id, userId, vendorOwner?.userId].filter(Boolean) as string[]
     );
 
     sendSuccess(res, { order: stripStartOtp(booking) }, 201);

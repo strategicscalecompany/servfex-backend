@@ -19,6 +19,8 @@ import {
   verifyOrderOtp,
   createHubBooking,
   completeOrder,
+  uploadOrderCompletionPhotos,
+  getVendorWorkflowConfig,
   recordCashCollection,
   assignEmployeeToOrder,
   createVendorInquiry,
@@ -37,6 +39,7 @@ import {
   updateOrderStatusSchema,
   verifyOrderQrSchema,
   createHubBookingSchema,
+  uploadCompletionPhotosSchema,
   recordCashSchema,
   assignEmployeeOrderSchema,
   createEmployeeSchema,
@@ -44,6 +47,15 @@ import {
   vendorInquirySchema,
   feedbackSchema,
 } from '../controllers/vendor-portal.controller';
+import {
+  createSalesVisit,
+  createSalesVisitSchema,
+  deleteSalesVisit,
+  getSalesVisitById,
+  listSalesVisits,
+  updateSalesVisit,
+  updateSalesVisitSchema,
+} from '../controllers/sales-visit.controller';
 
 const router = Router();
 
@@ -61,6 +73,7 @@ router.use(requireRole('VENDOR', 'EMPLOYEE', 'OPERATIONS_MANAGER'));
 // Profile
 router.get('/profile', getVendorProfile);
 router.patch('/profile', validate(updateVendorProfileSchema), updateVendorProfile);
+router.get('/workflow-config', getVendorWorkflowConfig);
 
 // KYC Documents
 router.get('/documents', getVendorDocuments);
@@ -82,6 +95,7 @@ router.post('/orders/:id/status', validate(updateOrderStatusSchema), updateOrder
 router.post('/orders/:id/verify-otp', validate(verifyOrderQrSchema), verifyOrderOtp);
 router.post('/orders/:id/verify-qr', validate(verifyOrderQrSchema), verifyOrderQr);
 router.post('/orders/:id/complete', completeOrder);
+router.post('/orders/:id/completion-photos', validate(uploadCompletionPhotosSchema), uploadOrderCompletionPhotos);
 router.post('/orders/:id/call-token', generateCallToken);
 router.post('/orders/:id/record-cash', validate(recordCashSchema), recordCashCollection);
 router.post('/orders/:id/assign', validate(assignEmployeeOrderSchema), assignEmployeeToOrder);
@@ -91,6 +105,13 @@ router.get('/employees', getVendorEmployees);
 router.post('/employees', validate(createEmployeeSchema), createVendorEmployee);
 router.patch('/employees/:id', validate(updateEmployeeSchema), updateVendorEmployee);
 router.delete('/employees/:id', deleteVendorEmployee);
+
+// Sales Manager visits (temporary testing workflow)
+router.get('/visits', listSalesVisits);
+router.post('/visits', validate(createSalesVisitSchema), createSalesVisit);
+router.get('/visits/:id', getSalesVisitById);
+router.patch('/visits/:id', validate(updateSalesVisitSchema), updateSalesVisit);
+router.delete('/visits/:id', deleteSalesVisit);
 
 // Reviews & Feedback
 router.get('/reviews', getVendorReviews);

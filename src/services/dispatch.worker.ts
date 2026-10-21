@@ -3,6 +3,7 @@ import { env } from '../config/env';
 import { logger } from '../config/logger';
 import { registerDispatchHandler, scheduleDispatch, clearAllDispatchTimers } from './dispatch.scheduler';
 import { processBookingDispatch } from './dispatch.service';
+import { isTestingWorkflowEnabled } from '../config/testing-workflow';
 
 let sweepTimer: NodeJS.Timeout | null = null;
 let isSweeping = false;
@@ -79,6 +80,12 @@ export async function armPendingBookingsOnBoot(clock: () => Date = () => new Dat
  * 4. Schedules periodic sweep interval.
  */
 export async function startDispatchWorker(): Promise<void> {
+  if (isTestingWorkflowEnabled()) {
+    logger.info(
+      'Dispatch worker isolated by EXPERT_TESTING_WORKFLOW_ENABLED (original worker code is unchanged)'
+    );
+    return;
+  }
   if (!env.DISPATCH_WORKER_ENABLED) {
     logger.info('Dispatch worker disabled by environment configuration');
     return;

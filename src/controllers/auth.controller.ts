@@ -7,6 +7,7 @@ import { logger } from '../config/logger';
 import { hashPassword, verifyPassword } from '../utils/password';
 import { generateAccessToken, generateRefreshToken, verifyAccessToken } from '../utils/token';
 import { generateAndSendEmailOtp, verifyEmailOtp } from '../services/otp.service';
+import { isTestingWorkflowEnabled } from '../config/testing-workflow';
 
 export const loginSchema = z.object({
   email: z.string().email('Valid email is required'),
@@ -128,10 +129,12 @@ export const login = async (
       location: user.vendorProfile?.location || user.managerProfile?.city || 'India',
       bio: user.vendorProfile?.bio || '',
       category: user.employeeProfile?.specialization || user.managerProfile?.kind || '',
+      expertKind: user.employeeProfile?.expertKind || null,
       rating: user.vendorProfile?.rating ?? user.employeeProfile?.rating ?? 5.0,
       vendorProfile: user.vendorProfile,
       employeeProfile: user.employeeProfile,
       managerProfile: user.managerProfile,
+      testingWorkflowEnabled: isTestingWorkflowEnabled(),
     };
 
     logger.info({ userId: user.id, email: user.email, role: user.role }, 'User successfully logged in via credentials');
@@ -195,7 +198,16 @@ export const getCurrentUser = async (
       })
       .catch((err) => logger.warn({ err }, 'Failed to update lastLoginAt'));
 
-    sendSuccess(res, { user });
+    sendSuccess(res, {
+      user: {
+        ...user,
+        expertKind: user.employeeProfile?.expertKind || null,
+        testingWorkflowEnabled: isTestingWorkflowEnabled(),
+      },
+      workflow: {
+        testingWorkflowEnabled: isTestingWorkflowEnabled(),
+      },
+    });
   } catch (error) {
     next(error);
   }
@@ -416,10 +428,12 @@ export const googleLogin = async (
       location: user.vendorProfile?.location || user.managerProfile?.city || 'India',
       bio: user.vendorProfile?.bio || '',
       category: user.employeeProfile?.specialization || user.managerProfile?.kind || '',
+      expertKind: user.employeeProfile?.expertKind || null,
       rating: user.vendorProfile?.rating ?? user.employeeProfile?.rating ?? 5.0,
       vendorProfile: user.vendorProfile,
       employeeProfile: user.employeeProfile,
       managerProfile: user.managerProfile,
+      testingWorkflowEnabled: isTestingWorkflowEnabled(),
     };
 
     logger.info({ userId: user.id, email: user.email, role: user.role }, 'User successfully logged in via Google');

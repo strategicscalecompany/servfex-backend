@@ -47,6 +47,10 @@ const envSchema = z.object({
   DISPATCH_SWEEP_INTERVAL_MS: z.string().default('5000').transform((val) => parseInt(val, 10)),
   DISPATCH_WORKER_ENABLED: z.string().default('true').transform((val) => val !== 'false'),
 
+  // Temporary Expert testing workflow. Set to "false" to restore the original auto-dispatch
+  // and unrestricted Expert portal behaviour without deleting any code.
+  EXPERT_TESTING_WORKFLOW_ENABLED: z.string().default('true').transform((val) => val !== 'false'),
+
   // Hostinger SMTP Email Configuration
   SMTP_HOST: z.string().default('smtp.hostinger.com'),
   SMTP_PORT: z.string().default('465').transform((val) => parseInt(val, 10)),

@@ -14,6 +14,7 @@ import {
   rankEligibleExperts,
   type ExpertCandidate,
 } from './dispatch.rules';
+import { isTestingWorkflowEnabled } from '../config/testing-workflow';
 
 type Tx = Prisma.TransactionClient;
 
@@ -287,13 +288,17 @@ async function loadExpertCandidates(
   booking: DispatchBooking
 ): Promise<{ candidates: ExpertCandidate[]; nameById: Map<string, string> }> {
   const experts = await tx.employeeProfile.findMany({
-    where: { vendorId: booking.vendorId as string },
+    where: {
+      vendorId: booking.vendorId as string,
+      ...(isTestingWorkflowEnabled() ? { expertKind: 'SERVICE_PROFESSIONAL' } : {}),
+    },
     select: {
       id: true,
       userId: true,
       isAvailable: true,
       lastAssignedAt: true,
       completedJobs: true,
+      expertKind: true,
       user: { select: { name: true, status: true, deletedAt: true } },
     },
   });
@@ -425,6 +430,7 @@ export type DispatchResult =
   | 'SKIPPED_LOCKED'
   | 'SKIPPED_NOT_DUE'
   | 'SKIPPED_STATE_CHANGED'
+  | 'SKIPPED_TESTING_WORKFLOW'
   | 'AUTO_ASSIGNED'
   | 'NO_EXPERT'
   | 'OFFER_EXPIRED';
@@ -440,6 +446,13 @@ export async function processBookingDispatch(
   bookingId: string,
   clock: () => Date = () => new Date()
 ): Promise<DispatchResult> {
+  // Isolate auto-dispatch without deleting the worker, scheduler, or ranking rules.
+  // Restore by setting EXPERT_TESTING_WORKFLOW_ENABLED=false.
+  if (isTestingWorkflowEnabled()) {
+    logger.info({ bookingId }, 'Auto-dispatch skipped: temporary expert testing workflow is enabled');
+    return 'SKIPPED_TESTING_WORKFLOW';
+  }
+
   let result: DispatchResult = 'SKIPPED_STATE_CHANGED';
   const effects: Effects = {};
 
@@ -555,6 +568,13 @@ export async function assignExpertManually(input: ManualAssignInput) {
     if (!employee) {
       throw new DispatchError('EXPERT_NOT_IN_WAREHOUSE', 'Expert does not belong to your warehouse', 400);
     }
+    if (isTestingWorkflowEnabled() && employee.expertKind === 'SALES_MANAGER') {
+      throw new DispatchError(
+        'EXPERT_NOT_ELIGIBLE',
+        `${employee.user.name} is a Sales Manager and cannot be assigned a service job`,
+        400
+      );
+    }
     if (!employee.isAvailable || employee.user.status !== 'ACTIVE' || employee.user.deletedAt) {
       throw new DispatchError('EXPERT_UNAVAILABLE', `${employee.user.name} is currently unavailable`, 409);
     }
@@ -597,6 +617,9 @@ async function loadExpertContext(tx: Tx, userId: string) {
     include: { user: { select: { name: true } } },
   });
   if (!profile) throw new DispatchError('FORBIDDEN', 'Only experts can respond to assignments', 403);
+  if (isTestingWorkflowEnabled() && profile.expertKind === 'SALES_MANAGER') {
+    throw new DispatchError('FORBIDDEN', 'Sales Managers cannot accept or complete service jobs', 403);
+  }
   return profile;
 }
 
@@ -725,6 +748,11 @@ export async function rejectAssignment(userId: string, bookingId: string, reason
   if (!outcome.released) return outcome;
 
   await runEffects(effects);
+  if (isTestingWorkflowEnabled()) {
+    // Original auto re-dispatch stays in this function but is isolated while testing.
+    logger.info({ bookingId }, 'Rejection left booking PENDING for Provider assignment (testing workflow)');
+    return outcome;
+  }
   // Re-offer right away; if this fails the sweeper retries because dispatchDueAt is already due.
   processBookingDispatch(bookingId).catch((err) =>
     logger.warn({ err, bookingId }, 'Immediate re-dispatch after rejection failed (sweeper will retry)')

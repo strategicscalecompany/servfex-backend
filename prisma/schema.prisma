@@ -32,6 +32,14 @@ enum BookingSource {
   CUSTOMER_APP
   EXPERT_TEAM
   PHONE_HUB
+  SALES_MANAGER
+}
+
+/// Temporary testing-workflow expert classification. Existing employees default to SERVICE_PROFESSIONAL
+/// so the original job-assignment behaviour is preserved when the flag is off.
+enum ExpertKind {
+  SERVICE_PROFESSIONAL
+  SALES_MANAGER
 }
 
 enum UserStatus {
@@ -224,6 +232,7 @@ model VendorProfile {
   vendorServices     VendorService[]
   bookings           Booking[]       @relation("VendorBookings")
   reviews            Review[]        @relation("VendorReviews")
+  salesVisits        SalesVisit[]
 
   @@index([kycStatus])
   @@index([isActive])
@@ -236,6 +245,7 @@ model EmployeeProfile {
   vendorId       String
   vendor         VendorProfile   @relation(fields: [vendorId], references: [id], onDelete: Cascade)
   specialization String
+  expertKind     ExpertKind      @default(SERVICE_PROFESSIONAL)
   rating         Float           @default(5.0)
   completedJobs  Int             @default(0)
   phone          String
@@ -248,9 +258,12 @@ model EmployeeProfile {
   reviews        Review[]        @relation("EmployeeReviews")
   feedback       EmployeeFeedback[]
   assignments    BookingAssignment[]
+  salesVisits    SalesVisit[]
 
   @@index([vendorId])
   @@index([isAvailable])
+  @@index([vendorId, isAvailable])
+  @@index([vendorId, expertKind])
 }
 
 model ManagerProfile {
@@ -512,6 +525,10 @@ model Booking {
   onTheWayAt             DateTime?
   arrivedAt              DateTime?
 
+  // Hosted completion photograph URLs. Empty for historic bookings; required (min 4) only while the
+  // temporary expert testing workflow is enabled.
+  completionPhotoUrls    String[]             @default([])
+
   createdAt          DateTime             @default(now())
   updatedAt          DateTime             @updatedAt
 
@@ -535,6 +552,33 @@ model Booking {
   @@index([status, createdAt(sort: Desc)])
   @@index([status, dispatchDueAt])
   @@index([employeeId, status])
+  @@index([vendorId, scheduledDate])
+  @@index([employeeId, scheduledDate, scheduledTimeSlot])
+  @@index([vendorId, bookingSource, createdAt(sort: Desc)])
+}
+
+/// Lead-generation visit captured by a Sales Manager at a warehouse, hub, or business location.
+/// Isolated from Booking so a visit never auto-creates a customer job.
+model SalesVisit {
+  id             String          @id @default(uuid())
+  employeeId     String
+  employee       EmployeeProfile @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  vendorId       String
+  vendor         VendorProfile   @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  locationName   String
+  addressLine    String
+  latitude       Float?
+  longitude      Float?
+  inChargeName   String
+  inChargePhone  String
+  inChargeEmail  String?
+  photoUrls      String[]
+  notes          String?
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  @@index([employeeId, createdAt(sort: Desc)])
+  @@index([vendorId, createdAt(sort: Desc)])
 }
 
 model BookingStatusHistory {

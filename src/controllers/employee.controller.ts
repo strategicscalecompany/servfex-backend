@@ -27,6 +27,7 @@ export const createEmployeeSchema = z.object({
     password: z.string().min(6),
     vendorId: z.string().uuid(),
     specialization: z.string().min(2),
+    expertKind: z.enum(['SALES_MANAGER', 'SERVICE_PROFESSIONAL']).optional(),
   }),
 });
 
@@ -162,7 +163,7 @@ export const getEmployeeById = async (req: Request, res: Response, next: NextFun
 
 export const createEmployee = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
-    const { name, email, phone, password, vendorId, specialization } = req.body;
+    const { name, email, phone, password, vendorId, specialization, expertKind } = req.body;
 
     const vendor = await prisma.vendorProfile.findUnique({
       where: { id: vendorId },
@@ -201,6 +202,7 @@ export const createEmployee = async (req: Request, res: Response, next: NextFunc
             create: {
               vendorId,
               specialization,
+              expertKind: expertKind === 'SALES_MANAGER' ? 'SALES_MANAGER' : 'SERVICE_PROFESSIONAL',
               phone,
               isAvailable: true,
             },
