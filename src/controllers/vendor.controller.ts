@@ -356,7 +356,7 @@ export const createVendor = async (req: Request, res: Response, next: NextFuncti
     const assignedPassword = password || 'ServFex@2026';
     const passwordHash = await hashPassword(assignedPassword);
 
-    // 5. Create or attach VendorProfile in PostgreSQL
+    // 5. Create or attach VendorProfile in MongoDB
     const newVendor = await prisma.$transaction(async (tx) => {
       let vendorProfile;
       let targetUserId: string;

@@ -2,6 +2,7 @@ import { PrismaClient } from '@prisma/client';
 import { env } from './env';
 import { logger } from './logger';
 import { recordDbQueryMetric } from '../utils/metrics';
+import { rewriteMongoNotDeletedArgs } from '../utils/mongo-filters';
 
 declare global {
   // eslint-disable-next-line no-var
@@ -27,7 +28,7 @@ const extendedPrisma = basePrisma.$extends({
       async $allOperations({ model, operation, args, query }: any) {
         const start = performance.now();
         try {
-          return await query(args);
+          return await query(rewriteMongoNotDeletedArgs(args));
         } finally {
           const duration = performance.now() - start;
           recordDbQueryMetric(duration);

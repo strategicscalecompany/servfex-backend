@@ -27,7 +27,16 @@ export async function ensureMongoSparseUniqueIndexes(): Promise<void> {
     updates: [
       { q: { firebaseUid: null }, u: { $unset: { firebaseUid: '' } }, multi: true },
       { q: { phone: null }, u: { $unset: { phone: '' } }, multi: true },
+      { q: { deletedAt: null }, u: { $unset: { deletedAt: '' } }, multi: true },
     ],
+  });
+  await prisma.$runCommandRaw({
+    update: 'Service',
+    updates: [{ q: { deletedAt: null }, u: { $unset: { deletedAt: '' } }, multi: true }],
+  });
+  await prisma.$runCommandRaw({
+    update: 'ServiceCategory',
+    updates: [{ q: { deletedAt: null }, u: { $unset: { deletedAt: '' } }, multi: true }],
   });
   logger.info('MongoDB sparse unique indexes ensured');
 }
