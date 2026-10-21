@@ -16,6 +16,8 @@ import {
   getVendorOrderById,
   updateOrderStatus,
   verifyOrderQr,
+  verifyOrderOtp,
+  createHubBooking,
   completeOrder,
   recordCashCollection,
   assignEmployeeToOrder,
@@ -34,6 +36,7 @@ import {
   updateVendorServiceSchema,
   updateOrderStatusSchema,
   verifyOrderQrSchema,
+  createHubBookingSchema,
   recordCashSchema,
   assignEmployeeOrderSchema,
   createEmployeeSchema,
@@ -53,7 +56,7 @@ router.post('/auth/register', validate(registerVendorSchema), registerVendor);
 // Protected Vendor Endpoints (Roles: VENDOR, EMPLOYEE)
 // -------------------------------------------------------------
 router.use(authenticate);
-router.use(requireRole('VENDOR', 'EMPLOYEE'));
+router.use(requireRole('VENDOR', 'EMPLOYEE', 'OPERATIONS_MANAGER'));
 
 // Profile
 router.get('/profile', getVendorProfile);
@@ -72,9 +75,11 @@ router.delete('/services/:id', deleteVendorService);
 // Order Dispatch & Management
 router.get('/orders', getVendorOrders);
 router.post('/orders', validate(vendorInquirySchema), createVendorInquiry);
+router.post('/hub-bookings', validate(createHubBookingSchema), createHubBooking);
 router.get('/orders/:id', getVendorOrderById);
 router.patch('/orders/:id/status', validate(updateOrderStatusSchema), updateOrderStatus);
 router.post('/orders/:id/status', validate(updateOrderStatusSchema), updateOrderStatus);
+router.post('/orders/:id/verify-otp', validate(verifyOrderQrSchema), verifyOrderOtp);
 router.post('/orders/:id/verify-qr', validate(verifyOrderQrSchema), verifyOrderQr);
 router.post('/orders/:id/complete', completeOrder);
 router.post('/orders/:id/call-token', generateCallToken);

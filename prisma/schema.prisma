@@ -20,6 +20,18 @@ enum UserRole {
   CUSTOMER
   VENDOR
   EMPLOYEE
+  OPERATIONS_MANAGER
+}
+
+enum ManagerKind {
+  OPERATIONS
+  BUSINESS_DEVELOPMENT
+}
+
+enum BookingSource {
+  CUSTOMER_APP
+  EXPERT_TEAM
+  PHONE_HUB
 }
 
 enum UserStatus {
@@ -133,6 +145,7 @@ model User {
   customerProfile CustomerProfile?
   vendorProfile   VendorProfile?
   employeeProfile EmployeeProfile?
+  managerProfile  ManagerProfile?
 
   // General relations
   addresses       UserAddress[]
@@ -207,6 +220,7 @@ model VendorProfile {
   updatedAt          DateTime        @updatedAt
 
   employees          EmployeeProfile[]
+  managers           ManagerProfile[]
   vendorServices     VendorService[]
   bookings           Booking[]       @relation("VendorBookings")
   reviews            Review[]        @relation("VendorReviews")
@@ -237,6 +251,23 @@ model EmployeeProfile {
 
   @@index([vendorId])
   @@index([isAvailable])
+}
+
+model ManagerProfile {
+  id         String      @id @default(uuid())
+  userId     String      @unique
+  user       User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  kind       ManagerKind @default(OPERATIONS)
+  zone       String      @default("Central Territory Zone")
+  city       String      @default("Hyderabad")
+  shiftHours String      @default("09:00 AM - 06:00 PM")
+  vendorId   String?
+  vendor     VendorProfile? @relation(fields: [vendorId], references: [id], onDelete: SetNull)
+  createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
+
+  @@index([vendorId])
+  @@index([kind])
 }
 
 model UserAddress {
@@ -445,12 +476,14 @@ model Booking {
 
   paymentStatus      PaymentStatus        @default(PENDING)
   paymentMethod      PaymentMethod        @default(ONLINE)
+  bookingSource      BookingSource        @default(CUSTOMER_APP)
 
   notes              String?
   cancellationReason String?
   adminNotes         String?
 
-  // Verification, Completion & Dispute Tracking
+  // Rapido-style 4-digit start OTP. Stored server-side; returned only to the customer.
+  // Legacy column names kept so existing rows and clients keep working.
   qrChallengeToken       String?
   qrChallengeExpiresAt   DateTime?
   qrVerifiedAt           DateTime?

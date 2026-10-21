@@ -14,6 +14,21 @@ export const loginSchema = z.object({
   role: z.string().optional(),
 });
 
+/** Maps client portal labels onto PostgreSQL UserRole values. */
+export function normalizePortalRole(role?: string): string | undefined {
+  if (!role) return undefined;
+  const raw = role.toUpperCase().trim();
+  if (raw === 'PROVIDER' || raw === 'EMPLOYEE') return 'EMPLOYEE';
+  if (raw === 'MANAGER' || raw === 'OPERATIONS_MANAGER') return 'OPERATIONS_MANAGER';
+  return raw;
+}
+
+function toClientRole(dbRole: string): string {
+  if (dbRole === 'EMPLOYEE') return 'PROVIDER';
+  if (dbRole === 'OPERATIONS_MANAGER') return 'MANAGER';
+  return dbRole;
+}
+
 /**
  * Direct email/password login endpoint for mobile apps and web.
  * Authenticates against PostgreSQL and returns JWT tokens.
@@ -28,17 +43,10 @@ export const login = async (
     const { email, password, role } = req.body;
     const cleanEmail = email.toLowerCase().trim();
 
-    // Normalizing role: in mobile app PROVIDER corresponds to EMPLOYEE
-    const targetRole = role === 'PROVIDER' ? 'EMPLOYEE' : role;
+    const targetRole = normalizePortalRole(role);
 
-    const roleFilter = targetRole
-      ? {
-          OR: [
-            { role: targetRole as any },
-            { role: 'SUPER_ADMIN' as any },
-          ],
-        }
-      : {};
+    // Super Admin never shares the Manager / Vendor / Expert portals.
+    const roleFilter = targetRole ? { role: targetRole as any } : {};
 
     const user = await prisma.user.findFirst({
       where: {
@@ -54,6 +62,9 @@ export const login = async (
           },
         },
         customerProfile: true,
+        managerProfile: {
+          include: { vendor: true },
+        },
       },
     });
 
@@ -105,17 +116,22 @@ export const login = async (
       email: user.email,
       phone: user.phone || '',
       name: user.name,
-      role: user.role === 'EMPLOYEE' ? 'PROVIDER' : user.role, // Compatible with mobile app UserRole
+      role: toClientRole(user.role),
       actualRole: user.role,
       status: user.status,
       profilePhotoUrl: user.profilePhotoUrl,
-      companyName: user.vendorProfile?.companyName || user.employeeProfile?.vendor?.companyName || user.name,
-      location: user.vendorProfile?.location || 'India',
+      companyName:
+        user.vendorProfile?.companyName ||
+        user.employeeProfile?.vendor?.companyName ||
+        user.managerProfile?.vendor?.companyName ||
+        user.name,
+      location: user.vendorProfile?.location || user.managerProfile?.city || 'India',
       bio: user.vendorProfile?.bio || '',
-      category: user.employeeProfile?.specialization || '',
+      category: user.employeeProfile?.specialization || user.managerProfile?.kind || '',
       rating: user.vendorProfile?.rating ?? user.employeeProfile?.rating ?? 5.0,
       vendorProfile: user.vendorProfile,
       employeeProfile: user.employeeProfile,
+      managerProfile: user.managerProfile,
     };
 
     logger.info({ userId: user.id, email: user.email, role: user.role }, 'User successfully logged in via credentials');
@@ -162,6 +178,7 @@ export const getCurrentUser = async (
         customerProfile: true,
         vendorProfile: true,
         employeeProfile: true,
+        managerProfile: true,
       },
     });
 
@@ -258,7 +275,7 @@ export const googleLogin = async (
     }
 
     const cleanEmail = decodedEmail.toLowerCase().trim();
-    const targetRole = role === 'PROVIDER' ? 'EMPLOYEE' : (role || 'VENDOR');
+    const targetRole = normalizePortalRole(role) || 'VENDOR';
 
     let user = await prisma.user.findFirst({
       where: {
@@ -276,6 +293,9 @@ export const googleLogin = async (
           },
         },
         customerProfile: true,
+        managerProfile: {
+          include: { vendor: true },
+        },
       },
     });
 
@@ -304,6 +324,9 @@ export const googleLogin = async (
               },
             },
             customerProfile: true,
+            managerProfile: {
+              include: { vendor: true },
+            },
           },
         });
         logger.info({ userId: user.id, email: user.email }, 'Auto-created new Customer account via Google Sign-In');
@@ -318,8 +341,11 @@ export const googleLogin = async (
       }
     }
 
-    // Verify whether this user is authorized for the requested portal
-    const isAuthorized = user.role === 'SUPER_ADMIN' || user.role === targetRole;
+    // Super Admin stays on the admin website. Managers use the vendor-app Manager portal only.
+    const isAuthorized =
+      targetRole === 'OPERATIONS_MANAGER'
+        ? user.role === 'OPERATIONS_MANAGER'
+        : user.role === targetRole || (user.role === 'SUPER_ADMIN' && targetRole !== 'OPERATIONS_MANAGER' && targetRole !== 'CUSTOMER');
     if (!isAuthorized) {
       sendError(
         res,
@@ -356,6 +382,9 @@ export const googleLogin = async (
           },
         },
         customerProfile: true,
+        managerProfile: {
+          include: { vendor: true },
+        },
       },
     });
 
@@ -375,17 +404,22 @@ export const googleLogin = async (
       email: user.email,
       phone: user.phone || '',
       name: user.name,
-      role: user.role === 'EMPLOYEE' ? 'PROVIDER' : user.role,
+      role: toClientRole(user.role),
       actualRole: user.role,
       status: user.status,
       profilePhotoUrl: user.profilePhotoUrl,
-      companyName: user.vendorProfile?.companyName || user.employeeProfile?.vendor?.companyName || user.name,
-      location: user.vendorProfile?.location || 'India',
+      companyName:
+        user.vendorProfile?.companyName ||
+        user.employeeProfile?.vendor?.companyName ||
+        user.managerProfile?.vendor?.companyName ||
+        user.name,
+      location: user.vendorProfile?.location || user.managerProfile?.city || 'India',
       bio: user.vendorProfile?.bio || '',
-      category: user.employeeProfile?.specialization || '',
+      category: user.employeeProfile?.specialization || user.managerProfile?.kind || '',
       rating: user.vendorProfile?.rating ?? user.employeeProfile?.rating ?? 5.0,
       vendorProfile: user.vendorProfile,
       employeeProfile: user.employeeProfile,
+      managerProfile: user.managerProfile,
     };
 
     logger.info({ userId: user.id, email: user.email, role: user.role }, 'User successfully logged in via Google');
@@ -646,6 +680,7 @@ async function validateUserForPasswordReset(
         },
       },
       customerProfile: true,
+      managerProfile: true,
     },
   });
 
@@ -697,16 +732,9 @@ async function validateUserForPasswordReset(
   // Role & portal hierarchy verification
   if (role) {
     const rawRole = role.toUpperCase().trim();
-    const targetRole =
-      rawRole === 'PROVIDER' || rawRole === 'EMPLOYEE'
-        ? 'EMPLOYEE'
-        : rawRole === 'MANAGER'
-        ? 'SUPER_ADMIN'
-        : rawRole;
+    const targetRole = normalizePortalRole(rawRole) || rawRole;
 
-    // Super Admin has master authority to reset in any portal
-    if (user.role !== 'SUPER_ADMIN') {
-      if (user.role !== targetRole) {
+    if (user.role !== targetRole) {
         const portalLabel =
           rawRole === 'VENDOR'
             ? 'Home Service Provider'
@@ -722,6 +750,8 @@ async function validateUserForPasswordReset(
             ? 'Home Service Expert'
             : user.role === 'CUSTOMER'
             ? 'Customer'
+            : user.role === 'OPERATIONS_MANAGER'
+            ? 'Manager'
             : user.role;
 
         return {
@@ -733,7 +763,6 @@ async function validateUserForPasswordReset(
           },
         };
       }
-    }
 
     // Role-specific onboarding hierarchy verification
     if (user.role === 'VENDOR') {
@@ -788,15 +817,17 @@ async function validateUserForPasswordReset(
           },
         };
       }
-    } else if (rawRole === 'MANAGER' && user.role !== 'SUPER_ADMIN') {
-      return {
-        valid: false,
-        error: {
-          code: 'UNAUTHORIZED_MANAGER',
-          message: 'This email is not registered as an authorized Manager.',
-          statusCode: 403,
-        },
-      };
+    } else if (targetRole === 'OPERATIONS_MANAGER') {
+      if (user.role !== 'OPERATIONS_MANAGER' || !user.managerProfile) {
+        return {
+          valid: false,
+          error: {
+            code: 'UNAUTHORIZED_MANAGER',
+            message: 'This email is not registered as an authorized Manager. Ask Super Admin to provision a Manager login for the vendor app.',
+            statusCode: 403,
+          },
+        };
+      }
     }
   }
 

@@ -18,6 +18,7 @@ import {
   rescheduleBooking,
   submitCustomerReview,
   getBookingQrToken,
+  getBookingStartOtp,
   confirmBookingCompletion,
   reportBookingIssue,
   registerCustomerSchema,
@@ -63,6 +64,7 @@ router.patch('/addresses/:id/default', setDefaultCustomerAddress);
 router.post('/bookings', validate(createBookingSchema), createBooking);
 router.get('/bookings', getCustomerBookings);
 router.get('/bookings/:id', getCustomerBookingById);
+router.get('/bookings/:id/start-otp', getBookingStartOtp);
 router.get('/bookings/:id/qr-token', getBookingQrToken);
 router.post('/bookings/:id/call-token', generateCallToken);
 router.post('/bookings/:id/confirm-completion', confirmBookingCompletion);

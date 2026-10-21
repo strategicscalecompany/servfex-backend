@@ -216,7 +216,7 @@ export const authenticate = async (
  * 1. Checks Firebase token revocation via verifyIdToken(token, true)
  * 2. Checks PostgreSQL role === 'SUPER_ADMIN' directly from DB (no memory caching)
  * 3. Checks PostgreSQL account status === 'ACTIVE' and deletedAt === null
- * 4. Rejects CUSTOMER, VENDOR, EMPLOYEE or unprivileged roles with 403 Forbidden
+ * 4. Rejects CUSTOMER, VENDOR, EMPLOYEE, OPERATIONS_MANAGER or unprivileged roles with 403 Forbidden
  */
 export const requireSuperAdmin = async (
   req: Request,

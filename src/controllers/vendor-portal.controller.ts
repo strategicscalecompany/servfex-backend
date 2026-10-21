@@ -20,6 +20,7 @@ import {
   approximateCoordinate,
   LocationViewerRole,
 } from '../services/dispatch.rules';
+import { generateStartOtp, isValidStartOtp, normalizeStartOtp, stripStartOtp } from '../utils/start-otp';
 
 // -------------------------------------------------------------
 // Validation Schemas
@@ -107,11 +108,29 @@ export const verifyOrderQrSchema = z
   .object({
     token: z.string().optional(),
     qrToken: z.string().optional(),
+    otp: z.string().optional(),
+    startOtp: z.string().optional(),
   })
-  .refine((data) => Boolean(data.token || data.qrToken), {
-    message: 'QR challenge verification token is required',
-    path: ['token'],
+  .refine((data) => Boolean(data.otp || data.startOtp || data.token || data.qrToken), {
+    message: '4-digit start OTP is required',
+    path: ['otp'],
   });
+
+export const createHubBookingSchema = z.object({
+  customerName: z.string().min(2),
+  customerPhone: z.string().min(10),
+  customerEmail: z.string().email().optional(),
+  serviceId: z.string().uuid(),
+  scheduledDate: z.string().min(1),
+  scheduledTimeSlot: z.string().min(1),
+  addressLine1: z.string().min(3),
+  city: z.string().min(2),
+  landmark: z.string().optional(),
+  latitude: z.number().optional(),
+  longitude: z.number().optional(),
+  notes: z.string().optional(),
+  source: z.enum(['PHONE_HUB', 'EXPERT_TEAM']).optional(),
+});
 
 export const recordCashSchema = z.object({
   amount: z.number().positive().optional(),
@@ -308,7 +327,40 @@ export const getVendorProfile = async (req: Request, res: Response): Promise<voi
       return;
     }
 
-    sendError(res, 'NOT_FOUND', 'Neither vendor nor employee profile found', 404);
+    const managerUser = await prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        id: true,
+        email: true,
+        phone: true,
+        name: true,
+        role: true,
+        status: true,
+        profilePhotoUrl: true,
+        createdAt: true,
+        managerProfile: {
+          include: {
+            vendor: true,
+          },
+        },
+      },
+    });
+
+    if (managerUser?.managerProfile) {
+      sendSuccess(res, {
+        vendor: {
+          ...managerUser,
+          companyName: managerUser.managerProfile.vendor?.companyName || managerUser.name,
+          location: managerUser.managerProfile.city,
+          managerKind: managerUser.managerProfile.kind,
+          zone: managerUser.managerProfile.zone,
+        },
+        managerProfile: managerUser.managerProfile,
+      }, 200);
+      return;
+    }
+
+    sendError(res, 'NOT_FOUND', 'Neither vendor, employee, nor manager profile found', 404);
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
   }
@@ -589,10 +641,31 @@ export const deleteVendorService = async (req: Request, res: Response): Promise<
 // Vendor Orders & Dispatch
 // -------------------------------------------------------------
 
-function sanitizeOrderForViewer(order: any, viewer: { isVendor: boolean; employeeId?: string }) {
+async function resolvePortalActor(userId: string) {
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    include: {
+      vendorProfile: true,
+      employeeProfile: true,
+      managerProfile: true,
+    },
+  });
+  const vendorId =
+    user?.vendorProfile?.id || user?.employeeProfile?.vendorId || user?.managerProfile?.vendorId || null;
+  return {
+    user,
+    vendorId,
+    isVendor: !!user?.vendorProfile,
+    isManager: user?.role === 'OPERATIONS_MANAGER',
+    employeeId: user?.employeeProfile?.id,
+  };
+}
+
+function sanitizeOrderForViewer(order: any, viewer: { isVendor: boolean; employeeId?: string; isManager?: boolean }) {
   if (!order) return order;
+  const withoutOtp = stripStartOtp(order);
   const isAssigned = !!viewer.employeeId && order.employeeId === viewer.employeeId;
-  const role: LocationViewerRole = viewer.isVendor
+  const role: LocationViewerRole = viewer.isVendor || viewer.isManager
     ? 'VENDOR_OWNER'
     : isAssigned
       ? 'ASSIGNED_EXPERT'
@@ -601,7 +674,7 @@ function sanitizeOrderForViewer(order: any, viewer: { isVendor: boolean; employe
   const exactAllowed = canSeeExactLocation(role, order.status);
 
   if (exactAllowed) {
-    return order;
+    return withoutOtp;
   }
 
   const sanitizedAddress = order.address
@@ -628,11 +701,11 @@ function sanitizeOrderForViewer(order: any, viewer: { isVendor: boolean; employe
       }
     : order.customer;
 
-  return {
-    ...order,
+  return stripStartOtp({
+    ...withoutOtp,
     address: sanitizedAddress,
     customer: sanitizedCustomer,
-  };
+  });
 }
 
 export const getVendorOrders = async (req: Request, res: Response): Promise<void> => {
@@ -643,15 +716,15 @@ export const getVendorOrders = async (req: Request, res: Response): Promise<void
     const limit = Math.min(Math.max(parseInt(String(req.query.limit || '20'), 10) || 20, 1), 100);
     const skip = (page - 1) * limit;
 
-    const user = await prisma.user.findUnique({
-      where: { id: userId },
-      include: { vendorProfile: true, employeeProfile: true },
-    });
+    const { user, vendorId, isVendor, isManager, employeeId } = await resolvePortalActor(userId);
 
     let where: any = {};
-    if (user?.vendorProfile) {
-      // Vendors only see jobs the Super Admin has dispatched to them.
-      where.vendorId = user.vendorProfile.id;
+    if (isVendor || isManager) {
+      if (!vendorId) {
+        sendError(res, 'HUB_NOT_ASSIGNED', 'This manager is not assigned to a local provider hub yet', 403);
+        return;
+      }
+      where.vendorId = vendorId;
     } else if (user?.employeeProfile) {
       where.OR = [
         { employeeId: user.employeeProfile.id },
@@ -696,8 +769,9 @@ export const getVendorOrders = async (req: Request, res: Response): Promise<void
     ]);
 
     const viewer = {
-      isVendor: !!user?.vendorProfile,
-      employeeId: user?.employeeProfile?.id,
+      isVendor,
+      isManager,
+      employeeId,
     };
     const sanitizedOrders = orders.map((o) => sanitizeOrderForViewer(o, viewer));
 
@@ -722,14 +796,15 @@ export const getVendorOrderById = async (req: Request, res: Response): Promise<v
     const userId = req.user!.userId;
     const id = req.params.id as string;
 
-    const user = await prisma.user.findUnique({
-      where: { id: userId },
-      include: { vendorProfile: true, employeeProfile: true },
-    });
+    const { user, vendorId, isVendor, isManager, employeeId } = await resolvePortalActor(userId);
 
     let where: any = { id };
-    if (user?.vendorProfile) {
-      where.vendorId = user.vendorProfile.id;
+    if (isVendor || isManager) {
+      if (!vendorId) {
+        sendError(res, 'HUB_NOT_ASSIGNED', 'This manager is not assigned to a local provider hub yet', 403);
+        return;
+      }
+      where.vendorId = vendorId;
     } else if (user?.employeeProfile) {
       where.OR = [
         { employeeId: user.employeeProfile.id },
@@ -769,8 +844,9 @@ export const getVendorOrderById = async (req: Request, res: Response): Promise<v
     }
 
     const viewer = {
-      isVendor: !!user?.vendorProfile,
-      employeeId: user?.employeeProfile?.id,
+      isVendor,
+      isManager,
+      employeeId,
     };
     const sanitizedOrder = sanitizeOrderForViewer(order, viewer);
 
@@ -959,22 +1035,18 @@ export const updateOrderStatus = async (req: Request, res: Response): Promise<vo
   }
 };
 
-export const verifyOrderQr = async (req: Request, res: Response): Promise<void> => {
+export const verifyOrderOtp = async (req: Request, res: Response): Promise<void> => {
   try {
     const userId = req.user!.userId;
     const id = req.params.id as string;
-    const rawToken = req.body.token || req.body.qrToken;
-    const token = typeof rawToken === 'string' ? rawToken.trim() : '';
+    const token = normalizeStartOtp(req.body.otp || req.body.startOtp || req.body.token || req.body.qrToken);
 
-    const user = await prisma.user.findUnique({
-      where: { id: userId },
-      include: { vendorProfile: true, employeeProfile: true },
-    });
+    const { user, vendorId } = await resolvePortalActor(userId);
 
     let booking;
-    if (user?.vendorProfile) {
+    if (vendorId && (user?.vendorProfile || user?.managerProfile)) {
       booking = await prisma.booking.findFirst({
-        where: { id, vendorId: user.vendorProfile.id },
+        where: { id, vendorId },
       });
     } else if (user?.employeeProfile) {
       booking = await prisma.booking.findFirst({
@@ -993,23 +1065,23 @@ export const verifyOrderQr = async (req: Request, res: Response): Promise<void> 
       return;
     }
 
+    if (!isValidStartOtp(token)) {
+      sendError(res, 'INVALID_OTP', 'Enter the 4-digit start OTP shown on the customer app', 400);
+      return;
+    }
+
     if (!booking.qrChallengeToken) {
-      sendError(res, 'BAD_REQUEST', 'No active verification QR token was requested by the customer for this order', 400);
+      sendError(res, 'BAD_REQUEST', 'No start OTP is active for this order. Ask the customer to open the booking in their app', 400);
       return;
     }
 
     if (booking.qrVerifiedAt) {
-      sendError(res, 'BAD_REQUEST', 'This service has already been QR-verified and started', 400);
+      sendError(res, 'BAD_REQUEST', 'This service has already been OTP-verified and started', 400);
       return;
     }
 
-    if (booking.qrChallengeToken.toUpperCase() !== token.trim().toUpperCase()) {
-      sendError(res, 'INVALID_QR_TOKEN', 'QR token challenge does not match this booking reference', 400);
-      return;
-    }
-
-    if (booking.qrChallengeExpiresAt && new Date() > booking.qrChallengeExpiresAt) {
-      sendError(res, 'QR_TOKEN_EXPIRED', 'The customer QR token has expired. Please ask the customer to refresh the screen', 400);
+    if (booking.qrChallengeToken !== token) {
+      sendError(res, 'INVALID_OTP', 'Start OTP does not match this booking. Ask the customer for the 4-digit code', 400);
       return;
     }
 
@@ -1019,13 +1091,14 @@ export const verifyOrderQr = async (req: Request, res: Response): Promise<void> 
         data: {
           status: 'IN_PROGRESS',
           qrVerifiedAt: new Date(),
+          qrChallengeToken: null,
           statusHistory: {
             create: {
               oldStatus: booking.status,
               newStatus: 'IN_PROGRESS',
               changedBy: userId,
               changedByRole: (user?.role as any) || 'EMPLOYEE',
-              reason: 'Customer QR verified on site by technician. Work officially commenced.',
+              reason: 'Customer start OTP verified on site. Work officially commenced.',
             },
           },
         },
@@ -1039,11 +1112,14 @@ export const verifyOrderQr = async (req: Request, res: Response): Promise<void> 
     });
 
     void emitBookingRefresh(id);
-    sendSuccess(res, { order: updated, message: 'QR verified successfully. Service is now IN PROGRESS.' }, 200);
+    sendSuccess(res, { order: stripStartOtp(updated), message: 'OTP verified successfully. Service is now IN PROGRESS.' }, 200);
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
   }
 };
+
+/** @deprecated alias — QR start verification was replaced with a 4-digit OTP. */
+export const verifyOrderQr = verifyOrderOtp;
 
 export const completeOrder = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -1084,7 +1160,7 @@ export const completeOrder = async (req: Request, res: Response): Promise<void> 
     }
 
     if (!booking.qrVerifiedAt) {
-      sendError(res, 'BAD_REQUEST', 'Cannot complete order without verified QR service commencement', 400);
+      sendError(res, 'BAD_REQUEST', 'Cannot complete order without verified start OTP', 400);
       return;
     }
 
@@ -1685,6 +1761,8 @@ export const createVendorInquiry = async (req: Request, res: Response): Promise<
         extraCharges: new Prisma.Decimal(0),
         totalAmount: budget ? new Prisma.Decimal(parseFloat(budget.replace(/[^0-9.]/g, '')) || Number(service.startingPrice)) : service.startingPrice,
         notes: message || null,
+        bookingSource: user?.employeeProfile ? 'EXPERT_TEAM' : 'EXPERT_TEAM',
+        qrChallengeToken: generateStartOtp(),
         statusHistory: {
           create: {
             newStatus: 'PENDING',
@@ -1712,7 +1790,147 @@ export const createVendorInquiry = async (req: Request, res: Response): Promise<
       [customerUser?.id, userId]
     );
 
-    sendSuccess(res, { order: newBooking }, 201);
+    sendSuccess(res, { order: stripStartOtp(newBooking) }, 201);
+  } catch (err: any) {
+    sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
+  }
+};
+
+export const createHubBooking = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = req.user!.userId;
+    const {
+      customerName,
+      customerPhone,
+      customerEmail,
+      serviceId,
+      scheduledDate,
+      scheduledTimeSlot,
+      addressLine1,
+      city,
+      landmark,
+      latitude,
+      longitude,
+      notes,
+      source,
+    } = req.body;
+
+    const { user, vendorId, isManager, isVendor } = await resolvePortalActor(userId);
+    if (!vendorId || (!isManager && !isVendor && !user?.employeeProfile)) {
+      sendError(res, 'FORBIDDEN', 'Only a hub manager, provider, or expert can create a desk booking', 403);
+      return;
+    }
+
+    const service = await prisma.service.findFirst({
+      where: { id: serviceId, isActive: true, deletedAt: null },
+    });
+    if (!service) {
+      sendError(res, 'NOT_FOUND', 'Service not found or inactive', 404);
+      return;
+    }
+
+    const cleanPhone = String(customerPhone).replace(/\s+/g, '');
+    const cleanEmail = (customerEmail || `${cleanPhone.replace(/\D/g, '')}@hub.servfex.local`).toLowerCase().trim();
+
+    const customerUser = await prisma.$transaction(async (tx) => {
+      const existing = await tx.user.findFirst({
+        where: {
+          deletedAt: null,
+          role: 'CUSTOMER',
+          OR: [{ phone: cleanPhone }, { email: cleanEmail }],
+        },
+        include: { customerProfile: true, addresses: true },
+      });
+
+      if (existing) {
+        if (!existing.customerProfile) {
+          await tx.customerProfile.create({ data: { userId: existing.id } });
+        }
+        return tx.user.findUniqueOrThrow({
+          where: { id: existing.id },
+          include: { customerProfile: true, addresses: true },
+        });
+      }
+
+      return tx.user.create({
+        data: {
+          name: customerName,
+          email: cleanEmail,
+          phone: cleanPhone,
+          role: 'CUSTOMER',
+          status: 'ACTIVE',
+          isVerified: true,
+          customerProfile: { create: {} },
+        },
+        include: { customerProfile: true, addresses: true },
+      });
+    });
+
+    const address = await prisma.userAddress.create({
+      data: {
+        userId: customerUser.id,
+        label: 'Service Address',
+        addressLine1,
+        city,
+        state: city,
+        postalCode: '000000',
+        landmark: landmark || null,
+        latitude: latitude ?? null,
+        longitude: longitude ?? null,
+        isDefault: customerUser.addresses.length === 0,
+      },
+    });
+
+    const bookingNumber = `SFX-${Date.now().toString().slice(-6)}-${Math.floor(100 + Math.random() * 900)}`;
+    const bookingSource = source === 'EXPERT_TEAM' ? 'EXPERT_TEAM' : 'PHONE_HUB';
+
+    const booking = await prisma.booking.create({
+      data: {
+        bookingNumber,
+        customerId: customerUser.customerProfile!.id,
+        serviceId: service.id,
+        addressId: address.id,
+        vendorId,
+        scheduledDate,
+        scheduledTimeSlot,
+        status: 'PENDING',
+        basePrice: service.startingPrice,
+        taxes: new Prisma.Decimal(0),
+        totalAmount: service.startingPrice,
+        notes: notes || null,
+        bookingSource,
+        qrChallengeToken: generateStartOtp(),
+        statusHistory: {
+          create: {
+            newStatus: 'PENDING',
+            changedBy: userId,
+            changedByRole: (user?.role as any) || 'OPERATIONS_MANAGER',
+            reason:
+              bookingSource === 'PHONE_HUB'
+                ? 'Phone / hub desk booking created by Operations Manager'
+                : 'Expert team created this booking after a customer visit',
+          },
+        },
+      },
+      include: {
+        customer: { include: { user: { select: { name: true, phone: true } } } },
+        service: true,
+        address: true,
+      },
+    });
+
+    emitBookingEvent(
+      'booking:new',
+      {
+        bookingId: booking.id,
+        bookingNumber: booking.bookingNumber,
+        status: booking.status,
+        vendorId: booking.vendorId,
+      },
+      [customerUser.id, userId]
+    );
+
+    sendSuccess(res, { order: stripStartOtp(booking) }, 201);
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
   }

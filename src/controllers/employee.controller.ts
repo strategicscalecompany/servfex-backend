@@ -434,14 +434,17 @@ export const createManagerSchema = z.object({
     zone: z.string().optional().default('Central Territory Zone'),
     city: z.string().optional().default('Hyderabad'),
     shiftHours: z.string().optional().default('09:00 AM - 06:00 PM'),
+    kind: z.enum(['OPERATIONS', 'BUSINESS_DEVELOPMENT']).optional().default('OPERATIONS'),
+    vendorId: z.string().uuid().optional().nullable(),
   }),
 });
 
 export const createManager = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
-    const { name, email, phone, password, zone, city, shiftHours } = req.body;
+    const { name, email, phone, password, zone, city, shiftHours, kind, vendorId } = req.body;
     const cleanEmail = email.toLowerCase().trim();
     const assignedPassword = password || `Manager@${Math.floor(1000 + Math.random() * 9000)}`;
+    const managerKind = kind === 'BUSINESS_DEVELOPMENT' ? 'BUSINESS_DEVELOPMENT' : 'OPERATIONS';
 
     const existingUser = await prisma.user.findFirst({
       where: {
@@ -473,6 +476,14 @@ export const createManager = async (req: Request, res: Response, next: NextFunct
       }
     }
 
+    if (vendorId) {
+      const hub = await prisma.vendorProfile.findFirst({ where: { id: vendorId } });
+      if (!hub) {
+        sendError(res, 'NOT_FOUND', 'Assigned hub / local provider was not found', 404);
+        return;
+      }
+    }
+
     const newManager = await prisma.$transaction(async (tx) => {
       const user = await tx.user.create({
         data: {
@@ -481,10 +492,20 @@ export const createManager = async (req: Request, res: Response, next: NextFunct
           phone,
           passwordHash,
           firebaseUid,
-          role: 'SUPER_ADMIN',
+          role: 'OPERATIONS_MANAGER',
           status: 'ACTIVE',
           isVerified: true,
+          managerProfile: {
+            create: {
+              kind: managerKind,
+              zone,
+              city,
+              shiftHours,
+              vendorId: vendorId || null,
+            },
+          },
         },
+        include: { managerProfile: { include: { vendor: true } } },
       });
 
       await logAuditEvent({
@@ -492,7 +513,7 @@ export const createManager = async (req: Request, res: Response, next: NextFunct
         action: 'MANAGER_APPOINTED',
         entityType: 'User',
         entityId: user.id,
-        after: { name, email: cleanEmail, phone, zone, city, shiftHours },
+        after: { name, email: cleanEmail, phone, zone, city, shiftHours, kind: managerKind, vendorId },
         ipAddress: req.ip,
         userAgent: req.headers['user-agent'],
         tx,
@@ -522,10 +543,14 @@ export const createManager = async (req: Request, res: Response, next: NextFunct
 
 export const getManagers = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
+    const kind = typeof req.query.kind === 'string' ? req.query.kind : undefined;
     const managers = await prisma.user.findMany({
       where: {
-        role: 'SUPER_ADMIN',
+        role: 'OPERATIONS_MANAGER',
         deletedAt: null,
+        ...(kind === 'OPERATIONS' || kind === 'BUSINESS_DEVELOPMENT'
+          ? { managerProfile: { kind } }
+          : {}),
       },
       select: {
         id: true,
@@ -536,6 +561,13 @@ export const getManagers = async (req: Request, res: Response, next: NextFunctio
         status: true,
         profilePhotoUrl: true,
         createdAt: true,
+        managerProfile: {
+          include: {
+            vendor: {
+              select: { id: true, companyName: true, warehouseName: true, warehousePhone: true, location: true },
+            },
+          },
+        },
       },
       orderBy: { createdAt: 'desc' },
     });

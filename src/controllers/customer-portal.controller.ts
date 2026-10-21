@@ -1,7 +1,7 @@
 import { Request, Response } from 'express';
 import { z } from 'zod';
-import crypto from 'crypto';
 import { prisma } from '../config/prisma';
+import { generateStartOtp, customerStartOtpPayload } from '../utils/start-otp';
 import { sendSuccess, sendError } from '../utils/response';
 import { emitBookingRefresh } from '../utils/realtime';
 import { Prisma, BookingStatus } from '@prisma/client';
@@ -539,6 +539,8 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
             totalAmount,
             paymentMethod: paymentMethod || 'ONLINE',
             paymentStatus: 'PENDING',
+            bookingSource: 'CUSTOMER_APP',
+            qrChallengeToken: generateStartOtp(),
             notes: notes || null,
             statusHistory: {
               create: {
@@ -736,7 +738,8 @@ export const getCustomerBookingById = async (req: Request, res: Response): Promi
       return;
     }
 
-    sendSuccess(res, { booking }, 200);
+    const startOtp = customerStartOtpPayload(booking);
+    sendSuccess(res, { booking: { ...booking, startOtp, qrChallengeToken: startOtp } }, 200);
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
   }
@@ -974,13 +977,14 @@ export const submitCustomerReview = async (req: Request, res: Response): Promise
 };
 
 // -------------------------------------------------------------
-// QR Challenge Verification & Completion Lifecycle
+// Rapido-style 4-digit start OTP
 // -------------------------------------------------------------
 
-export const getBookingQrToken = async (req: Request, res: Response): Promise<void> => {
+export const getBookingStartOtp = async (req: Request, res: Response): Promise<void> => {
   try {
     const userId = req.user!.userId;
     const id = req.params.id as string;
+    const refresh = String(req.query.refresh || '') === 'true';
 
     const customerProfile = await prisma.customerProfile.findUnique({
       where: { userId },
@@ -1002,35 +1006,44 @@ export const getBookingQrToken = async (req: Request, res: Response): Promise<vo
     }
 
     if (['COMPLETED', 'CANCELLED', 'DECLINED'].includes(booking.status)) {
-      sendError(res, 'BAD_REQUEST', `Cannot generate verification QR for ${booking.status} booking`, 400);
+      sendError(res, 'BAD_REQUEST', `Cannot issue a start OTP for a ${booking.status} booking`, 400);
       return;
     }
 
-    // Cryptographic 32-character single-use challenge
-    const token = `SFX-QR-${crypto.randomBytes(16).toString('hex').toUpperCase()}`;
-    const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 mins TTL
+    if (booking.qrVerifiedAt) {
+      sendError(res, 'BAD_REQUEST', 'Start OTP has already been used. The expert has commenced this job.', 400);
+      return;
+    }
 
-    await prisma.booking.update({
-      where: { id },
-      data: {
-        qrChallengeToken: token,
-        qrChallengeExpiresAt: expiresAt,
-      },
-    });
+    const existing = customerStartOtpPayload(booking);
+    const token = refresh || !existing ? generateStartOtp() : existing;
+
+    if (token !== existing) {
+      await prisma.booking.update({
+        where: { id },
+        data: {
+          qrChallengeToken: token,
+          qrChallengeExpiresAt: null,
+        },
+      });
+    }
 
     sendSuccess(res, {
       bookingId: id,
       bookingNumber: booking.bookingNumber,
       serviceName: booking.service.name,
+      startOtp: token,
       token,
       qrChallengeToken: token,
-      expiresAt: expiresAt.toISOString(),
-      ttlSeconds: 900,
+      otp: token,
     });
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
   }
 };
+
+/** @deprecated alias — QR start verification was replaced with a 4-digit OTP. */
+export const getBookingQrToken = getBookingStartOtp;
 
 export const confirmBookingCompletion = async (req: Request, res: Response): Promise<void> => {
   try {

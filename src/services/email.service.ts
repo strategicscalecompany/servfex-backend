@@ -704,7 +704,7 @@ export async function sendExpertWelcomeEmail(params: ExpertWelcomeEmailParams): 
                   <li style="margin-bottom:4px;">Open the <strong>ServFex Partner & Tech App</strong> and tap <strong>"Home Service Expert"</strong>.</li>
                   <li style="margin-bottom:4px;">Log in using your designated email and password provided below.</li>
                   <li style="margin-bottom:4px;">When assigned a service, tap <strong>"Accept Service"</strong> to view turn-by-turn navigation to the customer.</li>
-                  <li>Scan the client's QR code on site to start work, and swipe to complete when finished!</li>
+                  <li>Ask the customer for the 4-digit start OTP in their app, enter it to start work, and swipe to complete when finished!</li>
                 </ol>
               </div>
 
