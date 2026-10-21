@@ -47,7 +47,7 @@ export const io = new SocketIOServer(server, {
     credentials: true,
     methods: ['GET', 'POST'],
   },
-  transports: ['websocket', 'polling'],
+  transports: ['polling', 'websocket'],
   pingInterval: 25000,
   pingTimeout: 20000,
   allowEIO3: true,
@@ -66,12 +66,19 @@ io.use(async (socket, next) => {
       return next(new Error('UNAUTHORIZED'));
     }
 
+    const socketUserSelect = {
+      id: true,
+      role: true,
+      status: true,
+      deletedAt: true,
+    } as const;
+
     let user = null;
     try {
       const payload = verifyAccessToken(token);
-      user = await prisma.user.findFirst({
-        where: { id: payload.userId, deletedAt: null },
-        select: { id: true, role: true, status: true },
+      user = await prisma.user.findUnique({
+        where: { id: payload.userId },
+        select: socketUserSelect,
       });
     } catch {
       if (!isFirebaseConfigured()) {
@@ -80,23 +87,27 @@ io.use(async (socket, next) => {
       }
       const decoded = await getFirebaseAuth().verifyIdToken(token);
       user = await prisma.user.findFirst({
-        where: { firebaseUid: decoded.uid, deletedAt: null },
-        select: { id: true, role: true, status: true },
+        where: { firebaseUid: decoded.uid },
+        select: socketUserSelect,
       });
 
       // Email fallback if firebaseUid not linked yet (e.g. Google Sign-In)
-      if (!user && decoded.email) {
-        user = await prisma.user.findFirst({
-          where: { email: decoded.email.toLowerCase().trim(), deletedAt: null },
-          select: { id: true, role: true, status: true },
+      if ((!user || user.deletedAt) && decoded.email) {
+        user = await prisma.user.findUnique({
+          where: { email: decoded.email.toLowerCase().trim() },
+          select: socketUserSelect,
         });
-        if (user) {
+        if (user && !user.deletedAt) {
           await prisma.user.update({
             where: { id: user.id },
             data: { firebaseUid: decoded.uid, isVerified: true },
           });
         }
       }
+    }
+
+    if (user?.deletedAt) {
+      user = null;
     }
 
     if (!user || user.status === 'SUSPENDED' || user.status === 'INACTIVE') {
@@ -207,7 +218,7 @@ app.get('/health', (_req, res) => {
     status: 'ok',
     service: 'servfex-api',
     version: 'v1',
-    authBuild: 'super-admin-allowlist-v4',
+    authBuild: 'super-admin-allowlist-v5',
     database: 'mongodb',
   });
 });
