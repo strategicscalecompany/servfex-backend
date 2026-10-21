@@ -9,8 +9,9 @@ const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
   CLIENT_URL: z.string().default('http://localhost:5173'),
   
-  // Database
+  // Database (MongoDB Atlas). DATABASE_URL is what Prisma reads; MONGODB_URI is an optional alias.
   DATABASE_URL: z.string().min(1, 'DATABASE_URL is required'),
+  MONGODB_URI: z.string().optional(),
   DIRECT_URL: z.string().optional(),
 
   // Firebase Admin SDK Configuration

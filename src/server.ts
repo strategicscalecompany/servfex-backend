@@ -11,6 +11,7 @@ import { Server as SocketIOServer } from 'socket.io';
 import { env } from './config/env';
 import { logger } from './config/logger';
 import { prisma } from './config/prisma';
+import { ensureMongoSparseUniqueIndexes } from './config/mongo-indexes';
 import { errorHandler } from './middleware/errorHandler';
 import { corsMiddleware } from './middleware/cors';
 import { timingMiddleware } from './middleware/timing.middleware';
@@ -51,7 +52,7 @@ export const io = new SocketIOServer(server, {
   allowEIO3: true,
 });
 
-// Authenticate every socket from its handshake token. PostgreSQL stays the authority on role/status.
+// Authenticate every socket from its handshake token. MongoDB stays the authority on role/status.
 setRealtimeServer(io);
 
 io.use(async (socket, next) => {
@@ -235,6 +236,7 @@ server.listen(env.PORT, '0.0.0.0', async () => {
   logger.info(`ServFex Super Admin API listening on port ${env.PORT} on 0.0.0.0 in ${env.NODE_ENV} mode`);
   try {
     await prisma.$connect();
+    await ensureMongoSparseUniqueIndexes();
     logger.info('Database connection pool established successfully');
   } catch (err: any) {
     logger.error({ err }, 'Failed to warm database connection on startup');

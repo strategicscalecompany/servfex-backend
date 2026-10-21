@@ -311,7 +311,7 @@ router.patch('/settings/app', validate(appConfigSchema), updateAppConfiguration)
 router.get('/system/health', async (req, res, next) => {
   try {
     const start = Date.now();
-    await prisma.$queryRaw`SELECT 1`;
+    await prisma.$runCommandRaw({ ping: 1 });
     const dbLatencyMs = Date.now() - start;
 
     res.json({

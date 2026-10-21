@@ -1,14 +1,13 @@
 // ServFex Master Prisma Schema
-// Single source of truth for PostgreSQL (Supabase)
+// Single source of truth for MongoDB Atlas
 
 generator client {
   provider = "prisma-client-js"
 }
 
 datasource db {
-  provider  = "postgresql"
-  url       = env("DATABASE_URL")
-  directUrl = env("DIRECT_URL")
+  provider = "mongodb"
+  url      = env("DATABASE_URL")
 }
 
 // ==========================================
@@ -134,7 +133,7 @@ enum NotificationTarget {
 // ==========================================
 
 model User {
-  id              String      @id @default(uuid())
+  id              String      @id @default(uuid()) @map("_id")
   firebaseUid     String?     @unique
   email           String      @unique
   phone           String?     @unique
@@ -163,16 +162,13 @@ model User {
   reviewsWritten  Review[]          @relation("CustomerReviews")
   feedbackGiven   EmployeeFeedback[] @relation("FeedbackGiven")
 
-  @@index([firebaseUid])
-  @@index([email])
-  @@index([phone])
   @@index([role])
   @@index([status])
   @@index([deletedAt])
 }
 
 model Session {
-  id          String   @id @default(uuid())
+  id          String   @id @default(uuid()) @map("_id")
   userId      String
   user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   tokenHash   String   @unique
@@ -184,16 +180,15 @@ model Session {
   updatedAt   DateTime @updatedAt
 
   @@index([userId])
-  @@index([tokenHash])
   @@index([expiresAt])
 }
 
 model CustomerProfile {
-  id               String   @id @default(uuid())
+  id               String   @id @default(uuid()) @map("_id")
   userId           String   @unique
   user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   totalBookings    Int      @default(0)
-  totalSpent       Decimal  @default(0.00) @db.Decimal(10, 2)
+  totalSpent       String   @default("0.00") // 2-decimal rupees; Prisma Mongo has no Decimal128
   emergencyContact String?
   notes            String?
   createdAt        DateTime @default(now())
@@ -203,7 +198,7 @@ model CustomerProfile {
 }
 
 model VendorProfile {
-  id                 String          @id @default(uuid())
+  id                 String          @id @default(uuid()) @map("_id")
   userId             String          @unique
   user               User            @relation(fields: [userId], references: [id], onDelete: Cascade)
   companyName        String
@@ -217,7 +212,7 @@ model VendorProfile {
   bio                String?
   rating             Float           @default(5.0)
   reviewCount        Int             @default(0)
-  commissionRate     Decimal         @default(15.00) @db.Decimal(5, 2)
+  commissionRate     String          @default("15.00") // 2-decimal percent; Prisma Mongo has no Decimal128
   isActive           Boolean         @default(true)
   warehouseName      String?
   warehouseLocation  String?
@@ -239,7 +234,7 @@ model VendorProfile {
 }
 
 model EmployeeProfile {
-  id             String          @id @default(uuid())
+  id             String          @id @default(uuid()) @map("_id")
   userId         String          @unique
   user           User            @relation(fields: [userId], references: [id], onDelete: Cascade)
   vendorId       String
@@ -267,7 +262,7 @@ model EmployeeProfile {
 }
 
 model ManagerProfile {
-  id         String      @id @default(uuid())
+  id         String      @id @default(uuid()) @map("_id")
   userId     String      @unique
   user       User        @relation(fields: [userId], references: [id], onDelete: Cascade)
   kind       ManagerKind @default(OPERATIONS)
@@ -284,7 +279,7 @@ model ManagerProfile {
 }
 
 model UserAddress {
-  id           String    @id @default(uuid())
+  id           String    @id @default(uuid()) @map("_id")
   userId       String
   user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
   label        String    @default("Home")
@@ -311,7 +306,7 @@ model UserAddress {
 // ==========================================
 
 model ServiceCategory {
-  id            String               @id @default(uuid())
+  id            String               @id @default(uuid()) @map("_id")
   name          String
   slug          String               @unique
   iconUrl       String?              // PNG/JPG Cloudinary URL for category tile
@@ -326,13 +321,12 @@ model ServiceCategory {
   services      Service[]
   subCategories ServiceSubCategory[]
 
-  @@index([slug])
   @@index([isActive])
   @@index([deletedAt])
 }
 
 model ServiceSubCategory {
-  id           String          @id @default(uuid())
+  id           String          @id @default(uuid()) @map("_id")
   categoryId   String
   category     ServiceCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
   name         String
@@ -348,7 +342,7 @@ model ServiceSubCategory {
 }
 
 model Service {
-  id             String              @id @default(uuid())
+  id             String              @id @default(uuid()) @map("_id")
   categoryId     String
   category       ServiceCategory     @relation(fields: [categoryId], references: [id], onDelete: Restrict)
   subCategoryId  String?
@@ -360,7 +354,7 @@ model Service {
   imageUrl       String?             // DEPRECATED — kept for backwards compat
   bannerImages   String[]
   bannerVideo    String?
-  startingPrice  Decimal             @db.Decimal(10, 2)
+  startingPrice  String // 2-decimal rupees; Prisma Mongo has no Decimal128
   priceUnit      String              @default("per service")
   durationText   String              @default("60 mins")
   rating         Float               @default(5.0)
@@ -379,7 +373,6 @@ model Service {
 
   @@index([categoryId])
   @@index([subCategoryId])
-  @@index([slug])
   @@index([isActive])
   @@index([deletedAt])
   @@index([isActive, deletedAt, isPopular, rating(sort: Desc)])
@@ -387,7 +380,7 @@ model Service {
 }
 
 model ServicePackage {
-  id                 String   @id @default(uuid())
+  id                 String   @id @default(uuid()) @map("_id")
   serviceId          String
   service            Service  @relation(fields: [serviceId], references: [id], onDelete: Cascade)
 
@@ -397,8 +390,8 @@ model ServicePackage {
   badgeText          String?
 
   // Pricing
-  originalPrice      Decimal? @db.Decimal(10, 2)
-  discountedPrice    Decimal? @db.Decimal(10, 2)
+  originalPrice      String?
+  discountedPrice    String?
   savingsLabel       String?
   pricePerUnitLabel  String?
   duration           String   @default("60 mins")
@@ -427,7 +420,7 @@ model ServicePackage {
   // Legacy fields — kept for backwards compat
   title              String?
   description        String?
-  price              Decimal? @db.Decimal(10, 2)
+  price              String?
   durationMinutes    Int?     @default(60)
   features           Json?    @default("[]")
 
@@ -439,12 +432,12 @@ model ServicePackage {
 }
 
 model VendorService {
-  id           String        @id @default(uuid())
+  id           String        @id @default(uuid()) @map("_id")
   vendorId     String
   vendor       VendorProfile @relation(fields: [vendorId], references: [id], onDelete: Cascade)
   serviceId    String
   service      Service       @relation(fields: [serviceId], references: [id], onDelete: Cascade)
-  customPrice  Decimal?      @db.Decimal(10, 2)
+  customPrice  String?
   isActive     Boolean       @default(true)
   availability String        @default("Mon-Sat: 09:00 - 18:00")
   createdAt    DateTime      @default(now())
@@ -460,7 +453,7 @@ model VendorService {
 // ==========================================
 
 model Booking {
-  id                 String               @id @default(uuid())
+  id                 String               @id @default(uuid()) @map("_id")
   bookingNumber      String               @unique
   customerId         String
   customer           CustomerProfile      @relation("CustomerBookings", fields: [customerId], references: [id], onDelete: Restrict)
@@ -480,13 +473,12 @@ model Booking {
 
   status             BookingStatus        @default(PENDING)
 
-  basePrice          Decimal              @db.Decimal(10, 2)
-  taxes              Decimal              @default(0.00) @db.Decimal(10, 2)
-  discountAmount     Decimal              @default(0.00) @db.Decimal(10, 2)
-  extraCharges       Decimal              @default(0.00) @db.Decimal(10, 2)
-  totalAmount        Decimal              @db.Decimal(10, 2)
-  expertPayout       Decimal?             @db.Decimal(10, 2)
-
+  basePrice          String
+  taxes              String               @default("0.00")
+  discountAmount     String               @default("0.00")
+  extraCharges       String               @default("0.00")
+  totalAmount        String
+  expertPayout       String? 
   paymentStatus      PaymentStatus        @default(PENDING)
   paymentMethod      PaymentMethod        @default(ONLINE)
   bookingSource      BookingSource        @default(CUSTOMER_APP)
@@ -504,7 +496,7 @@ model Booking {
   customerConfirmedAt    DateTime?
   disputeReason          String?
   disputeReportedAt      DateTime?
-  cashCollectedAmount    Decimal?             @db.Decimal(10, 2)
+  cashCollectedAmount    String?
   cashCollectedAt        DateTime?
 
   // Customer-confirmed exact service location (pinned on the map). Authoritative for routing & navigation.
@@ -539,7 +531,6 @@ model Booking {
   assignments        BookingAssignment[]
   calls              BookingCall[]
 
-  @@index([bookingNumber])
   @@index([customerId])
   @@index([vendorId])
   @@index([employeeId])
@@ -562,7 +553,7 @@ model Booking {
 /// Lead-generation visit captured by a Sales Manager at a warehouse, hub, or business location.
 /// Isolated from Booking so a visit never auto-creates a customer job.
 model SalesVisit {
-  id             String          @id @default(uuid())
+  id             String          @id @default(uuid()) @map("_id")
   employeeId     String
   employee       EmployeeProfile @relation(fields: [employeeId], references: [id], onDelete: Cascade)
   vendorId       String
@@ -584,7 +575,7 @@ model SalesVisit {
 }
 
 model BookingStatusHistory {
-  id            String        @id @default(uuid())
+  id            String        @id @default(uuid()) @map("_id")
   bookingId     String
   booking       Booking       @relation(fields: [bookingId], references: [id], onDelete: Cascade)
   oldStatus     BookingStatus?
@@ -598,11 +589,10 @@ model BookingStatusHistory {
   @@index([createdAt])
 }
 
-/// Audit trail of every expert offer for a booking. The "single winner" guarantee is enforced by locking the
-/// Booking row (SELECT ... FOR UPDATE) inside prisma.$transaction; the optional partial unique index in
-/// prisma/migrations-sql/dispatch_workflow.sql adds a database-level backstop.
+/// Audit trail of every expert offer for a booking. The "single winner" guarantee is enforced inside
+/// prisma.$transaction by conditional updateMany (status/assignment must still match the expected pre-state).
 model BookingAssignment {
-  id           String           @id @default(uuid())
+  id           String           @id @default(uuid()) @map("_id")
   bookingId    String
   booking      Booking          @relation(fields: [bookingId], references: [id], onDelete: Cascade)
   employeeId   String
@@ -621,7 +611,7 @@ model BookingAssignment {
 
 /// Metadata for booking-scoped voice calls. No audio is stored.
 model BookingCall {
-  id            String      @id @default(uuid())
+  id            String      @id @default(uuid()) @map("_id")
   bookingId     String
   booking       Booking     @relation(fields: [bookingId], references: [id], onDelete: Cascade)
   channelName   String
@@ -642,12 +632,12 @@ model BookingCall {
 // ==========================================
 
 model Payment {
-  id              String        @id @default(uuid())
+  id              String        @id @default(uuid()) @map("_id")
   bookingId       String
   booking         Booking       @relation(fields: [bookingId], references: [id], onDelete: Restrict)
   transactionRef  String        @unique
   idempotencyKey  String?       @unique
-  amount          Decimal       @db.Decimal(10, 2)
+  amount          String
   currency        String        @default("INR")
   status          PaymentStatus @default(PENDING)
   method          PaymentMethod @default(ONLINE)
@@ -656,20 +646,19 @@ model Payment {
 
   refunds         Refund[]
 
-  @@index([transactionRef])
   @@index([bookingId])
   @@index([status])
   @@index([createdAt])
 }
 
 model Refund {
-  id             String       @id @default(uuid())
+  id             String       @id @default(uuid()) @map("_id")
   paymentId      String
   payment        Payment      @relation(fields: [paymentId], references: [id], onDelete: Restrict)
   bookingId      String
   booking        Booking      @relation(fields: [bookingId], references: [id], onDelete: Restrict)
   idempotencyKey String?      @unique
-  amount         Decimal      @db.Decimal(10, 2)
+  amount         String
   reason         String
   status         RefundStatus @default(PENDING)
   processedBy    String       // SUPER_ADMIN userId
@@ -685,7 +674,7 @@ model Refund {
 // ==========================================
 
 model Review {
-  id          String           @id @default(uuid())
+  id          String           @id @default(uuid()) @map("_id")
   bookingId   String?          @unique
   booking     Booking?         @relation(fields: [bookingId], references: [id], onDelete: SetNull)
   customerId  String
@@ -709,7 +698,7 @@ model Review {
 }
 
 model EmployeeFeedback {
-  id           String          @id @default(uuid())
+  id           String          @id @default(uuid()) @map("_id")
   employeeId   String
   employee     EmployeeProfile @relation(fields: [employeeId], references: [id], onDelete: Cascade)
   userId       String
@@ -727,7 +716,7 @@ model EmployeeFeedback {
 // ==========================================
 
 model Document {
-  id                 String       @id @default(uuid())
+  id                 String       @id @default(uuid()) @map("_id")
   userId             String
   user               User         @relation(fields: [userId], references: [id], onDelete: Cascade)
   type               DocumentType
@@ -747,7 +736,7 @@ model Document {
 // ==========================================
 
 model Notification {
-  id           String             @id @default(uuid())
+  id           String             @id @default(uuid()) @map("_id")
   title        String
   message      String
   target       NotificationTarget @default(ALL)
@@ -765,23 +754,19 @@ model Notification {
 // ==========================================
 
 model PlatformSetting {
-  id          String   @id @default(uuid())
+  id          String   @id @default(uuid()) @map("_id")
   key         String   @unique
   value       Json
   description String?
   updatedAt   DateTime @updatedAt
-
-  @@index([key])
 }
 
 model AppConfiguration {
-  id          String   @id @default(uuid())
+  id          String   @id @default(uuid()) @map("_id")
   key         String   @unique
   value       Json
   description String?
   updatedAt   DateTime @updatedAt
-
-  @@index([key])
 }
 
 // ==========================================
@@ -789,7 +774,7 @@ model AppConfiguration {
 // ==========================================
 
 model AuditLog {
-  id           String   @id @default(uuid())
+  id           String   @id @default(uuid()) @map("_id")
   superAdminId String
   superAdmin   User     @relation("AdminAuditLogs", fields: [superAdminId], references: [id], onDelete: Restrict)
   action       String   // e.g., CUSTOMER_SUSPENDED, VENDOR_APPROVED, BOOKING_PRICE_OVERRIDDEN

@@ -21,6 +21,7 @@ import {
   LocationViewerRole,
 } from '../services/dispatch.rules';
 import { generateStartOtp, isValidStartOtp, normalizeStartOtp, stripStartOtp } from '../utils/start-otp';
+import { toMoney, toMoneyOrNull } from '../utils/money';
 import { estimatePayloadBytes, MAX_DOCUMENT_BYTES, resolveHostedUrl } from '../utils/cloudinary';
 import {
   COMPLETABLE_JOB_STATUSES,
@@ -297,7 +298,7 @@ export const registerVendor = async (req: Request, res: Response): Promise<void>
               kycStatus: 'APPROVED',
               rating: 5.0,
               reviewCount: 0,
-              commissionRate: new Prisma.Decimal(15.0),
+              commissionRate: toMoney(15),
               isActive: true,
             },
           },
@@ -603,7 +604,7 @@ export const addVendorService = async (req: Request, res: Response): Promise<voi
           name: title || 'Custom Service',
           slug: `custom-${Date.now()}`,
           description: description || 'Custom service offering',
-          startingPrice: new Prisma.Decimal(price || customPrice || 499),
+          startingPrice: toMoney(price || customPrice || 499),
           priceUnit: 'per service',
           durationText: '60 mins',
           rating: 5.0,
@@ -623,14 +624,14 @@ export const addVendorService = async (req: Request, res: Response): Promise<voi
         },
       },
       update: {
-        customPrice: finalPrice !== undefined ? new Prisma.Decimal(finalPrice) : null,
+        customPrice: finalPrice !== undefined ? toMoneyOrNull(finalPrice) : null,
         availability: availability || 'Mon-Sat: 09:00 - 18:00',
         isActive: isActive !== undefined ? isActive : true,
       },
       create: {
         vendorId,
         serviceId: targetServiceId,
-        customPrice: finalPrice !== undefined ? new Prisma.Decimal(finalPrice) : null,
+        customPrice: finalPrice !== undefined ? toMoneyOrNull(finalPrice) : null,
         availability: availability || 'Mon-Sat: 09:00 - 18:00',
         isActive: isActive !== undefined ? isActive : true,
       },
@@ -676,7 +677,7 @@ export const updateVendorService = async (req: Request, res: Response): Promise<
     const updated = await prisma.vendorService.update({
       where: { id },
       data: {
-        ...(finalPrice !== undefined ? { customPrice: finalPrice ? new Prisma.Decimal(finalPrice) : null } : {}),
+        ...(finalPrice !== undefined ? { customPrice: finalPrice ? toMoney(finalPrice) : null } : {}),
         ...(availability !== undefined ? { availability } : {}),
         ...(isActive !== undefined ? { isActive } : {}),
       },
@@ -1329,7 +1330,6 @@ export const completeOrder = async (req: Request, res: Response): Promise<void> 
 
     try {
       await prisma.$transaction(async (tx) => {
-        await tx.$queryRaw`SELECT id FROM "Booking" WHERE id = ${id} FOR UPDATE`;
         const current = await tx.booking.findUnique({ where: { id } });
         if (!current) throw Object.assign(new Error('Order not found'), { code: 'NOT_FOUND' });
         if (
@@ -1456,7 +1456,7 @@ export const recordCashCollection = async (req: Request, res: Response): Promise
       return;
     }
 
-    const collectedAmount = amount ? new Prisma.Decimal(amount) : booking.totalAmount;
+    const collectedAmount = toMoney(amount ?? booking.totalAmount);
     const isConfirmedByCustomer = booking.customerConfirmedAt != null;
     const nextStatus: BookingStatus = isConfirmedByCustomer ? 'COMPLETED' : booking.status;
 
@@ -1601,7 +1601,7 @@ export const assignEmployeeToOrder = async (req: Request, res: Response): Promis
       };
 
       if (resolvedPayout != null && resolvedPayout > 0) {
-        updateData.expertPayout = new Prisma.Decimal(Number(resolvedPayout).toFixed(2));
+        updateData.expertPayout = toMoney(resolvedPayout);
       }
 
       if (resolvedInstructions) {
@@ -1989,11 +1989,13 @@ export const createVendorInquiry = async (req: Request, res: Response): Promise<
         scheduledDate: preferredDate || new Date().toISOString().split('T')[0],
         scheduledTimeSlot: '10:00 AM - 12:00 PM',
         status: 'PENDING',
-        basePrice: service.startingPrice,
-        taxes: new Prisma.Decimal(0),
-        discountAmount: new Prisma.Decimal(0),
-        extraCharges: new Prisma.Decimal(0),
-        totalAmount: budget ? new Prisma.Decimal(parseFloat(budget.replace(/[^0-9.]/g, '')) || Number(service.startingPrice)) : service.startingPrice,
+        basePrice: toMoney(service.startingPrice),
+        taxes: toMoney(0),
+        discountAmount: toMoney(0),
+        extraCharges: toMoney(0),
+        totalAmount: budget
+          ? toMoney(parseFloat(budget.replace(/[^0-9.]/g, '')) || Number(service.startingPrice))
+          : toMoney(service.startingPrice),
         notes: message || null,
         bookingSource: user?.employeeProfile ? 'EXPERT_TEAM' : 'EXPERT_TEAM',
         qrChallengeToken: generateStartOtp(),
@@ -2155,9 +2157,9 @@ export const createHubBooking = async (req: Request, res: Response): Promise<voi
         scheduledDate,
         scheduledTimeSlot,
         status: 'PENDING',
-        basePrice: service.startingPrice,
-        taxes: new Prisma.Decimal(0),
-        totalAmount: service.startingPrice,
+        basePrice: toMoney(service.startingPrice),
+        taxes: toMoney(0),
+        totalAmount: toMoney(service.startingPrice),
         notes: notes || null,
         bookingSource,
         qrChallengeToken: generateStartOtp(),

@@ -1,10 +1,13 @@
-import { PrismaClient, Prisma } from '@prisma/client';
+import { PrismaClient } from '@prisma/client';
 import { env } from '../src/config/env';
+import { ensureMongoSparseUniqueIndexes } from '../src/config/mongo-indexes';
 
 const prisma = new PrismaClient();
 
 async function main() {
   console.log('🌱 Starting ServFex Master Database Seeding...');
+
+  await ensureMongoSparseUniqueIndexes();
 
   // 1. Seed Super Admin (Binds to Firebase UID if provided, or auto-binds on first Google Sign-In)
   const adminFirebaseUid = process.env.SUPER_ADMIN_FIREBASE_UID?.trim() || null;
@@ -21,7 +24,7 @@ async function main() {
     },
     create: {
       email: adminEmail,
-      firebaseUid: adminFirebaseUid,
+      ...(adminFirebaseUid ? { firebaseUid: adminFirebaseUid } : {}),
       name: env.SUPER_ADMIN_NAME,
       phone: '+91 99999 88888',
       role: 'SUPER_ADMIN',
@@ -130,7 +133,7 @@ async function main() {
       name: 'Full Home Deep Cleaning',
       slug: 'full-home-deep-cleaning',
       description: 'Intensive deep cleaning covering living rooms, kitchens, bathrooms, and balconies.',
-      startingPrice: new Prisma.Decimal('1499.00'),
+      startingPrice: '1499.00',
       durationText: '3-4 hours',
       rating: 4.85,
       reviewCount: 38,
@@ -141,7 +144,7 @@ async function main() {
           {
             title: 'Essential Clean (1-2 BHK)',
             description: 'Vacuuming, mopping, kitchen degreasing, bathroom scrubbing.',
-            price: new Prisma.Decimal('1499.00'),
+            price: '1499.00',
             durationMinutes: 180,
             features: ['Dry dusting & vacuuming', 'Wet mopping', 'Kitchen surface sanitize', 'Bathroom deep scrub'],
             isPopular: true,
@@ -149,7 +152,7 @@ async function main() {
           {
             title: 'Premium Deep Clean (3-4 BHK)',
             description: 'Comprehensive sanitization with sofa shampooing and balcony jet wash.',
-            price: new Prisma.Decimal('2899.00'),
+            price: '2899.00',
             durationMinutes: 240,
             features: ['Everything in Essential', 'Sofa & carpet shampoo', 'High-pressure balcony jet wash', 'Appliance exterior shine'],
             isPopular: false,
@@ -169,7 +172,7 @@ async function main() {
       name: 'Split AC Deep Foam Jet Service',
       slug: 'split-ac-regular-service',
       description: 'Foam jet cleaning of filters, cooling coils, drain tray and outdoor unit inspection.',
-      startingPrice: new Prisma.Decimal('699.00'),
+      startingPrice: '699.00',
       durationText: '45 mins',
       rating: 4.9,
       reviewCount: 94,
@@ -180,7 +183,7 @@ async function main() {
           {
             title: 'Single AC Power Foam Clean',
             description: 'Anti-bacterial foam cleaning for 1 split AC indoor and outdoor unit.',
-            price: new Prisma.Decimal('699.00'),
+            price: '699.00',
             durationMinutes: 45,
             features: ['Foam-jet coil spray', 'Drain pipe flushing', 'Gas pressure diagnosis'],
             isPopular: true,
@@ -188,7 +191,7 @@ async function main() {
           {
             title: 'Double AC Power Saver Pack',
             description: 'Complete servicing for two AC units with filter sanitization.',
-            price: new Prisma.Decimal('1299.00'),
+            price: '1299.00',
             durationMinutes: 90,
             features: ['2 AC units complete service', 'Indoor & outdoor jet cleaning', 'Free thermostat calibration'],
             isPopular: false,
@@ -208,7 +211,7 @@ async function main() {
       name: 'Tap, Pipe & Drain Repair',
       slug: 'tap-drain-repair',
       description: 'Leakage fixing, tap replacement, pipe repair, and drain unclogging.',
-      startingPrice: new Prisma.Decimal('349.00'),
+      startingPrice: '349.00',
       durationText: '30-60 mins',
       rating: 4.75,
       reviewCount: 52,
@@ -219,7 +222,7 @@ async function main() {
           {
             title: 'Standard Repair Visit',
             description: 'Inspection and minor repair of 1-2 plumbing fixtures.',
-            price: new Prisma.Decimal('349.00'),
+            price: '349.00',
             durationMinutes: 45,
             features: ['Fault detection', 'Leakage sealant application', 'Hardware installation'],
             isPopular: true,
@@ -231,7 +234,147 @@ async function main() {
   });
   console.log(`✅ Seeded services and packages`);
 
-  // 5. Seed Mock Vendors, Employees & Bookings (Only if SEED_MOCK_DATA === 'true')
+  // 5. Seed HyperServ vendor (PESARI SUJITHA) — always, not gated by mock data
+  const hyperServLocation = 'VCCQ+RV9, Mancherial, Telangana 504208, India';
+  const hyperServPhone = '+919908258461';
+
+  const hyperServUser = await prisma.user.upsert({
+    where: { email: 'hyperserv@servfex.com' },
+    update: {
+      name: 'PESARI SUJITHA',
+      phone: hyperServPhone,
+      role: 'VENDOR',
+      status: 'ACTIVE',
+      isVerified: true,
+    },
+    create: {
+      name: 'PESARI SUJITHA',
+      email: 'hyperserv@servfex.com',
+      phone: hyperServPhone,
+      role: 'VENDOR',
+      status: 'ACTIVE',
+      isVerified: true,
+    },
+    include: { vendorProfile: true, addresses: true, employeeProfile: true },
+  });
+
+  const hyperServVendor = hyperServUser.vendorProfile
+    ? await prisma.vendorProfile.update({
+        where: { id: hyperServUser.vendorProfile.id },
+        data: {
+          companyName: 'HyperServ',
+          businessLicense: 'BL-TG-MNC-HYPERSERV',
+          kycStatus: 'APPROVED',
+          location: hyperServLocation,
+          latitude: 18.8724,
+          longitude: 79.4444,
+          warehouseName: 'HyperServ Mancherial',
+          warehouseLocation: hyperServLocation,
+          warehousePhone: hyperServPhone,
+          isActive: true,
+          commissionRate: '15.00',
+        },
+      })
+    : await prisma.vendorProfile.create({
+        data: {
+          userId: hyperServUser.id,
+          companyName: 'HyperServ',
+          businessLicense: 'BL-TG-MNC-HYPERSERV',
+          kycStatus: 'APPROVED',
+          location: hyperServLocation,
+          latitude: 18.8724,
+          longitude: 79.4444,
+          warehouseName: 'HyperServ Mancherial',
+          warehouseLocation: hyperServLocation,
+          warehousePhone: hyperServPhone,
+          isActive: true,
+          commissionRate: '15.00',
+        },
+      });
+
+  const existingHyperServAddress = hyperServUser.addresses.find(
+    (addr) => addr.postalCode === '504208' && addr.city === 'Mancherial'
+  );
+  if (!existingHyperServAddress) {
+    await prisma.userAddress.create({
+      data: {
+        userId: hyperServUser.id,
+        label: 'Warehouse',
+        addressLine1: 'VCCQ+RV9',
+        addressLine2: 'Mancherial',
+        city: 'Mancherial',
+        state: 'Telangana',
+        postalCode: '504208',
+        latitude: 18.8724,
+        longitude: 79.4444,
+        isDefault: true,
+      },
+    });
+  }
+
+  const hyperServTechnician = await prisma.user.upsert({
+    where: { email: 'technician.hyperserv@servfex.com' },
+    update: {
+      name: 'PESARI SUJITHA',
+      role: 'EMPLOYEE',
+      status: 'ACTIVE',
+      isVerified: true,
+    },
+    create: {
+      name: 'PESARI SUJITHA',
+      email: 'technician.hyperserv@servfex.com',
+      role: 'EMPLOYEE',
+      status: 'ACTIVE',
+      isVerified: true,
+    },
+    include: { employeeProfile: true },
+  });
+
+  if (hyperServTechnician.employeeProfile) {
+    await prisma.employeeProfile.update({
+      where: { id: hyperServTechnician.employeeProfile.id },
+      data: {
+        vendorId: hyperServVendor.id,
+        specialization: 'General Service Technician',
+        expertKind: 'SERVICE_PROFESSIONAL',
+        phone: hyperServPhone,
+        isAvailable: true,
+      },
+    });
+  } else {
+    await prisma.employeeProfile.create({
+      data: {
+        userId: hyperServTechnician.id,
+        vendorId: hyperServVendor.id,
+        specialization: 'General Service Technician',
+        expertKind: 'SERVICE_PROFESSIONAL',
+        phone: hyperServPhone,
+        isAvailable: true,
+      },
+    });
+  }
+
+  for (const svc of [cleaningService, acService, plumbingService]) {
+    await prisma.vendorService.upsert({
+      where: {
+        vendorId_serviceId: {
+          vendorId: hyperServVendor.id,
+          serviceId: svc.id,
+        },
+      },
+      update: { isActive: true },
+      create: {
+        vendorId: hyperServVendor.id,
+        serviceId: svc.id,
+        isActive: true,
+        availability: 'All days: 08:00 - 20:00',
+      },
+    });
+  }
+
+  console.log(`✅ Seeded HyperServ vendor (PESARI SUJITHA, ${hyperServPhone}) with 1 technician`);
+
+  // 6. Seed Mock Vendors, Employees & Bookings (Only if SEED_MOCK_DATA === 'true')
   if (process.env.SEED_MOCK_DATA === 'true') {
   const vendorUserA = await prisma.user.upsert({
     where: { email: 'vendor.apex@servfex.com' },
@@ -252,7 +395,7 @@ async function main() {
           location: 'Andheri West, Mumbai',
           rating: 4.88,
           reviewCount: 45,
-          commissionRate: new Prisma.Decimal('14.00'),
+          commissionRate: '14.00',
           isActive: true,
         },
       },
@@ -279,7 +422,7 @@ async function main() {
           location: 'Koramangala, Bangalore',
           rating: 4.92,
           reviewCount: 88,
-          commissionRate: new Prisma.Decimal('15.00'),
+          commissionRate: '15.00',
           isActive: true,
         },
       },
@@ -299,7 +442,7 @@ async function main() {
     create: {
       vendorId: vendorUserA.vendorProfile!.id,
       serviceId: cleaningService.id,
-      customPrice: new Prisma.Decimal('1449.00'),
+      customPrice: '1449.00',
       isActive: true,
       availability: 'Mon-Sat: 08:00 - 20:00',
     },
@@ -316,7 +459,7 @@ async function main() {
     create: {
       vendorId: vendorUserB.vendorProfile!.id,
       serviceId: acService.id,
-      customPrice: new Prisma.Decimal('679.00'),
+      customPrice: '679.00',
       isActive: true,
       availability: 'All days: 09:00 - 21:00',
     },
@@ -390,7 +533,7 @@ async function main() {
           location: 'Connaught Place, New Delhi',
           rating: 4.95,
           reviewCount: 64,
-          commissionRate: new Prisma.Decimal('15.00'),
+          commissionRate: '15.00',
           isActive: true,
         },
       },
@@ -439,7 +582,7 @@ async function main() {
       customerProfile: {
         create: {
           totalBookings: 3,
-          totalSpent: new Prisma.Decimal('3897.00'),
+          totalSpent: '3897.00',
           emergencyContact: '+91 98450 99999',
         },
       },
@@ -478,11 +621,11 @@ async function main() {
       scheduledDate: todayStr,
       scheduledTimeSlot: '10:00 AM - 01:00 PM',
       status: 'COMPLETED',
-      basePrice: new Prisma.Decimal('1499.00'),
-      taxes: new Prisma.Decimal('269.82'),
-      discountAmount: new Prisma.Decimal('150.00'),
-      extraCharges: new Prisma.Decimal('0.00'),
-      totalAmount: new Prisma.Decimal('1618.82'),
+      basePrice: '1499.00',
+      taxes: '269.82',
+      discountAmount: '150.00',
+      extraCharges: '0.00',
+      totalAmount: '1618.82',
       paymentStatus: 'PAID',
       paymentMethod: 'UPI',
       notes: 'Please sanitize balcony carefully',
@@ -496,7 +639,7 @@ async function main() {
     create: {
       bookingId: booking1.id,
       transactionRef: 'TXN-SFX-202609-881',
-      amount: new Prisma.Decimal('1618.82'),
+      amount: '1618.82',
       currency: 'INR',
       status: 'PAID',
       method: 'UPI',
@@ -534,11 +677,11 @@ async function main() {
       scheduledDate: todayStr,
       scheduledTimeSlot: '02:00 PM - 03:00 PM',
       status: 'IN_PROGRESS',
-      basePrice: new Prisma.Decimal('699.00'),
-      taxes: new Prisma.Decimal('125.82'),
-      discountAmount: new Prisma.Decimal('0.00'),
-      extraCharges: new Prisma.Decimal('0.00'),
-      totalAmount: new Prisma.Decimal('824.82'),
+      basePrice: '699.00',
+      taxes: '125.82',
+      discountAmount: '0.00',
+      extraCharges: '0.00',
+      totalAmount: '824.82',
       paymentStatus: 'PAID',
       paymentMethod: 'ONLINE',
     },
@@ -550,7 +693,7 @@ async function main() {
     create: {
       bookingId: booking2.id,
       transactionRef: 'TXN-SFX-202609-882',
-      amount: new Prisma.Decimal('824.82'),
+      amount: '824.82',
       currency: 'INR',
       status: 'PAID',
       method: 'ONLINE',

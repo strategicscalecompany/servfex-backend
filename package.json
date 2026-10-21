@@ -20,7 +20,7 @@
     "admin",
     "api",
     "prisma",
-    "postgresql",
+    "mongodb",
     "express"
   ],
   "author": "ServFex Team",

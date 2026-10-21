@@ -5,6 +5,7 @@ import { sendError, sendSuccess } from '../utils/response';
 import { logAuditEvent } from '../utils/audit';
 import { uploadToCloudinary } from '../utils/cloudinary';
 import { Prisma } from '@prisma/client';
+import { toMoney } from '../utils/money';
 
 // ==========================================
 // VALIDATION SCHEMAS
@@ -246,8 +247,8 @@ export const createPackage = async (req: Request, res: Response, next: NextFunct
           name,
           shortDescription: shortDescription || null,
           badgeText: badgeText || null,
-          originalPrice: new Prisma.Decimal(originalPrice),
-          discountedPrice: new Prisma.Decimal(discountedPrice),
+          originalPrice: toMoney(originalPrice),
+          discountedPrice: toMoney(discountedPrice),
           savingsLabel: savingsLabel || null,
           pricePerUnitLabel: pricePerUnitLabel || null,
           duration: duration || '60 mins',
@@ -265,7 +266,7 @@ export const createPackage = async (req: Request, res: Response, next: NextFunct
           // Keep legacy fields populated for backwards compat
           title: name,
           description: shortDescription || name,
-          price: new Prisma.Decimal(discountedPrice),
+          price: toMoney(discountedPrice),
           durationMinutes: 60,
           features: highlights || [],
         },
@@ -329,10 +330,10 @@ export const updatePackage = async (req: Request, res: Response, next: NextFunct
           ...(name !== undefined ? { name, title: name } : {}),
           ...(shortDescription !== undefined ? { shortDescription, description: shortDescription } : {}),
           ...(badgeText !== undefined ? { badgeText } : {}),
-          ...(originalPrice !== undefined ? { originalPrice: new Prisma.Decimal(originalPrice) } : {}),
+          ...(originalPrice !== undefined ? { originalPrice: toMoney(originalPrice) } : {}),
           ...(discountedPrice !== undefined ? {
-            discountedPrice: new Prisma.Decimal(discountedPrice),
-            price: new Prisma.Decimal(discountedPrice),
+            discountedPrice: toMoney(discountedPrice),
+            price: toMoney(discountedPrice),
           } : {}),
           ...(savingsLabel !== undefined ? { savingsLabel } : {}),
           ...(pricePerUnitLabel !== undefined ? { pricePerUnitLabel } : {}),

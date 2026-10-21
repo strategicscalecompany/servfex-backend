@@ -8,6 +8,7 @@ import { Prisma, DocumentType, KycStatus } from '@prisma/client';
 import { getFirebaseAuth } from '../config/firebase';
 import { estimatePayloadBytes, MAX_DOCUMENT_BYTES, resolveHostedUrl } from '../utils/cloudinary';
 import { sendProviderWelcomeEmail } from '../services/email.service';
+import { toMoney } from '../utils/money';
 
 const MAX_ONBOARDING_DOCUMENTS = 30;
 
@@ -394,7 +395,7 @@ export const createVendor = async (req: Request, res: Response, next: NextFuncti
               latitude: latitude !== undefined ? latitude : null,
               longitude: longitude !== undefined ? longitude : null,
               bio: bio || null,
-              commissionRate: new Prisma.Decimal(commissionRate || 15.0),
+              commissionRate: toMoney(commissionRate || 15.0),
               kycStatus: 'APPROVED',
               isActive: true,
             },
@@ -414,7 +415,7 @@ export const createVendor = async (req: Request, res: Response, next: NextFuncti
               latitude: latitude !== undefined ? latitude : null,
               longitude: longitude !== undefined ? longitude : null,
               bio: bio || null,
-              commissionRate: new Prisma.Decimal(commissionRate || 15.0),
+              commissionRate: toMoney(commissionRate || 15.0),
               kycStatus: 'APPROVED',
               isActive: true,
             },
@@ -446,7 +447,7 @@ export const createVendor = async (req: Request, res: Response, next: NextFuncti
                 latitude: latitude !== undefined ? latitude : null,
                 longitude: longitude !== undefined ? longitude : null,
                 bio: bio || null,
-                commissionRate: new Prisma.Decimal(commissionRate || 15.0),
+                commissionRate: toMoney(commissionRate || 15.0),
                 kycStatus: 'APPROVED',
                 isActive: true,
               },
@@ -749,7 +750,7 @@ export const updateVendor = async (req: Request, res: Response, next: NextFuncti
       if (bio !== undefined) data.bio = bio;
       if (businessLicense !== undefined) data.businessLicense = businessLicense;
       if (taxId !== undefined) data.taxId = taxId;
-      if (commissionRate !== undefined) data.commissionRate = new Prisma.Decimal(commissionRate);
+      if (commissionRate !== undefined) data.commissionRate = toMoney(commissionRate);
       if (latitude !== undefined) data.latitude = latitude;
       if (longitude !== undefined) data.longitude = longitude;
       if (warehouseName !== undefined) data.warehouseName = warehouseName;
@@ -1025,12 +1026,12 @@ export const assignVendorService = async (req: Request, res: Response, next: Nex
       create: {
         vendorId,
         serviceId,
-        customPrice: customPrice !== undefined && customPrice !== '' && customPrice !== null ? new Prisma.Decimal(customPrice) : null,
+        customPrice: customPrice !== undefined && customPrice !== '' && customPrice !== null ? toMoney(customPrice) : null,
         availability: availability || 'Mon-Sat: 09:00 - 18:00',
         isActive: isActive !== undefined ? isActive : true,
       },
       update: {
-        ...(customPrice !== undefined ? { customPrice: customPrice !== '' && customPrice !== null ? new Prisma.Decimal(customPrice) : null } : {}),
+        ...(customPrice !== undefined ? { customPrice: customPrice !== '' && customPrice !== null ? toMoney(customPrice) : null } : {}),
         ...(availability ? { availability } : {}),
         ...(isActive !== undefined ? { isActive } : {}),
       },

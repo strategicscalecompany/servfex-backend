@@ -4,6 +4,7 @@ import { prisma } from '../config/prisma';
 import { sendError, sendSuccess } from '../utils/response';
 import { logAuditEvent } from '../utils/audit';
 import { Prisma } from '@prisma/client';
+import { asDecimal, sumMoney, toMoney } from '../utils/money';
 
 export const listPaymentsQuerySchema = z.object({
   query: z.object({
@@ -143,12 +144,9 @@ export const processRefund = async (req: Request, res: Response, next: NextFunct
       return;
     }
 
-    const refundDecimal = new Prisma.Decimal(amount);
-    const existingRefundTotal = payment.refunds.reduce(
-      (sum: Prisma.Decimal, r: any) => sum.plus(r.amount),
-      new Prisma.Decimal(0)
-    );
-    const maxRefundable = payment.amount.minus(existingRefundTotal);
+    const refundDecimal = asDecimal(amount);
+    const existingRefundTotal = sumMoney(payment.refunds.map((r) => r.amount));
+    const maxRefundable = asDecimal(payment.amount).minus(existingRefundTotal);
 
     if (refundDecimal.greaterThan(maxRefundable)) {
       sendError(
@@ -169,7 +167,7 @@ export const processRefund = async (req: Request, res: Response, next: NextFunct
         data: {
           paymentId,
           bookingId: payment.bookingId,
-          amount: refundDecimal,
+          amount: toMoney(refundDecimal),
           reason,
           status: 'COMPLETED',
           processedBy: req.user!.userId,
@@ -226,36 +224,38 @@ export const getFinancialReconciliation = async (
   next: NextFunction
 ): Promise<void> => {
   try {
-    const [totalPaid, totalRefunded, paymentMethodsBreakdown] = await Promise.all([
-      prisma.payment.aggregate({
-        _sum: { amount: true },
+    const [paidPayments, completedRefunds] = await Promise.all([
+      prisma.payment.findMany({
         where: { status: 'PAID' },
+        select: { amount: true, method: true },
       }),
-      prisma.refund.aggregate({
-        _sum: { amount: true },
+      prisma.refund.findMany({
         where: { status: 'COMPLETED' },
-      }),
-      prisma.payment.groupBy({
-        by: ['method'],
-        _sum: { amount: true },
-        _count: true,
-        where: { status: 'PAID' },
+        select: { amount: true },
       }),
     ]);
 
-    const gross = totalPaid._sum.amount ? Number(totalPaid._sum.amount) : 0;
-    const refunds = totalRefunded._sum.amount ? Number(totalRefunded._sum.amount) : 0;
-    const net = gross - refunds;
+    const gross = Number(sumMoney(paidPayments.map((p) => p.amount)));
+    const refunds = Number(sumMoney(completedRefunds.map((r) => r.amount)));
+    const net = asDecimal(gross).minus(asDecimal(refunds));
+
+    const methodTotals = new Map<string, { total: Prisma.Decimal; count: number }>();
+    for (const payment of paidPayments) {
+      const current = methodTotals.get(payment.method) || { total: asDecimal(0), count: 0 };
+      current.total = current.total.plus(asDecimal(payment.amount));
+      current.count += 1;
+      methodTotals.set(payment.method, current);
+    }
 
     sendSuccess(res, {
       grossVolume: gross,
       totalRefunds: refunds,
-      netVolume: net,
+      netVolume: Number(net),
       currency: 'INR',
-      methodsBreakdown: paymentMethodsBreakdown.map((m) => ({
-        method: m.method,
-        total: m._sum.amount ? Number(m._sum.amount) : 0,
-        count: m._count,
+      methodsBreakdown: Array.from(methodTotals.entries()).map(([method, data]) => ({
+        method,
+        total: Number(data.total),
+        count: data.count,
       })),
     });
   } catch (error) {

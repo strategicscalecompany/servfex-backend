@@ -11,7 +11,7 @@ let isSweeping = false;
 /**
  * Sweep the database for bookings whose dispatch timeout has elapsed.
  * Only processes bookings in PENDING or ASSIGNED status whose dispatchDueAt <= now.
- * Concurrency is handled by row-level locking (FOR UPDATE SKIP LOCKED) in processBookingDispatch.
+ * Concurrency is handled by Mongo transactions + conditional updateMany in processBookingDispatch.
  */
 export async function sweepDueBookings(clock: () => Date = () => new Date()): Promise<number> {
   if (isSweeping) return 0;

@@ -9,11 +9,9 @@ declare global {
 }
 
 function runtimeDatabaseUrl(): string {
-  // This is a long-running Node process with interactive $transaction locks.
-  // Supabase port 6543 is PgBouncer transaction mode and makes those locks
-  // wait 10–20s. DIRECT_URL (session pooler :5432) is the correct runtime URL.
-  const direct = env.DIRECT_URL?.trim();
-  return direct && direct.length > 0 ? direct : env.DATABASE_URL;
+  const mongo = env.MONGODB_URI?.trim();
+  if (mongo) return mongo;
+  return env.DATABASE_URL;
 }
 
 const basePrisma =

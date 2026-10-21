@@ -15,6 +15,7 @@ import {
 } from '../services/dispatch.rules';
 import { releaseDispatchOnCancel, syncDispatchTimer } from '../services/dispatch.service';
 import { scheduleDispatch } from '../services/dispatch.scheduler';
+import { asDecimal, toMoney } from '../utils/money';
 
 // -------------------------------------------------------------
 // Validation Schemas
@@ -179,7 +180,7 @@ export const registerCustomer = async (req: Request, res: Response): Promise<voi
           customerProfile: {
             create: {
               totalBookings: 0,
-              totalSpent: new Prisma.Decimal(0),
+              totalSpent: '0.00',
             },
           },
         },
@@ -504,13 +505,13 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
 
     const assignedVendorId = matchedVendor ? matchedVendor.id : null;
 
-    let basePrice: Prisma.Decimal = service.startingPrice;
+    let basePrice = asDecimal(service.startingPrice);
     let actualPackageId: string | null = null;
     if (packageId) {
       const selectedPackage = service.packages.find((p) => p.id === packageId);
       if (selectedPackage) {
         actualPackageId = selectedPackage.id;
-        basePrice = selectedPackage.discountedPrice ?? selectedPackage.price ?? service.startingPrice;
+        basePrice = asDecimal(selectedPackage.discountedPrice ?? selectedPackage.price ?? service.startingPrice);
       }
     }
 
@@ -536,9 +537,9 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
             status: 'PENDING',
             dispatchDueAt,
             dispatchAttempts: 0,
-            basePrice,
-            taxes,
-            totalAmount,
+            basePrice: toMoney(basePrice),
+            taxes: toMoney(taxes),
+            totalAmount: toMoney(totalAmount),
             paymentMethod: paymentMethod || 'ONLINE',
             paymentStatus: 'PENDING',
             bookingSource: 'CUSTOMER_APP',
@@ -579,7 +580,7 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
           where: { id: customerProfile.id },
           data: {
             totalBookings: { increment: 1 },
-            totalSpent: { increment: totalAmount },
+            totalSpent: toMoney(asDecimal(customerProfile.totalSpent).plus(totalAmount)),
           },
         }),
       ]);

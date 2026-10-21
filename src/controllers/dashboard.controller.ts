@@ -1,6 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import { prisma } from '../config/prisma';
 import { sendSuccess } from '../utils/response';
+import { sumMoney } from '../utils/money';
 
 export const getDashboardStats = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
@@ -17,9 +18,7 @@ export const getDashboardStats = async (req: Request, res: Response, next: NextF
       totalEmployees,
       todayBookings,
       bookingStatusGroups,
-      revenueSummary,
-      monthlyRevenueSummary,
-      todayRevenueSummary,
+      paidPayments,
       recentBookings,
       recentVendors,
       recentAuditLogs,
@@ -43,24 +42,9 @@ export const getDashboardStats = async (req: Request, res: Response, next: NextF
         _count: { id: true },
       }),
 
-      // Financials (calculated strictly from Payment ledger)
-      prisma.payment.aggregate({
-        _sum: { amount: true },
+      prisma.payment.findMany({
         where: { status: 'PAID' },
-      }),
-      prisma.payment.aggregate({
-        _sum: { amount: true },
-        where: {
-          status: 'PAID',
-          createdAt: { gte: firstDayOfMonth },
-        },
-      }),
-      prisma.payment.aggregate({
-        _sum: { amount: true },
-        where: {
-          status: 'PAID',
-          createdAt: { gte: today },
-        },
+        select: { amount: true, createdAt: true },
       }),
 
       // Recent Bookings
@@ -137,9 +121,9 @@ export const getDashboardStats = async (req: Request, res: Response, next: NextF
         cancelledJobs,
       },
       revenue: {
-        totalRevenue: revenueSummary._sum.amount ? Number(revenueSummary._sum.amount) : 0,
-        monthlyRevenue: monthlyRevenueSummary._sum.amount ? Number(monthlyRevenueSummary._sum.amount) : 0,
-        todayRevenue: todayRevenueSummary._sum.amount ? Number(todayRevenueSummary._sum.amount) : 0,
+        totalRevenue: Number(sumMoney(paidPayments.map((p) => p.amount))),
+        monthlyRevenue: Number(sumMoney(paidPayments.filter((p) => p.createdAt >= firstDayOfMonth).map((p) => p.amount))),
+        todayRevenue: Number(sumMoney(paidPayments.filter((p) => p.createdAt >= today).map((p) => p.amount))),
         currency: 'INR',
       },
       recentBookings,

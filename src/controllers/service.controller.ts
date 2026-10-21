@@ -6,6 +6,7 @@ import { logAuditEvent } from '../utils/audit';
 import { Prisma } from '@prisma/client';
 import { uploadToCloudinary } from '../utils/cloudinary';
 import { invalidateCatalogCache } from './catalog.controller';
+import { toMoney, toMoneyOrNull } from '../utils/money';
 
 export const listServicesQuerySchema = z.object({
   query: z.object({
@@ -224,7 +225,7 @@ export const createService = async (req: Request, res: Response, next: NextFunct
           name,
           slug: slug.toLowerCase(),
           description,
-          startingPrice: new Prisma.Decimal(startingPrice),
+          startingPrice: toMoney(startingPrice),
           priceUnit: priceUnit || 'per service',
           durationText: durationText || '60 mins',
           iconUrl: uploadedIconUrl,
@@ -329,7 +330,7 @@ export const updateService = async (req: Request, res: Response, next: NextFunct
           ...(name ? { name } : {}),
           ...(slug ? { slug: slug.toLowerCase() } : {}),
           ...(description ? { description } : {}),
-          ...(startingPrice !== undefined ? { startingPrice: new Prisma.Decimal(startingPrice) } : {}),
+          ...(startingPrice !== undefined ? { startingPrice: toMoney(startingPrice) } : {}),
           ...(priceUnit ? { priceUnit } : {}),
           ...(durationText ? { durationText } : {}),
           ...(iconUrl !== undefined ? { iconUrl: uploadedIconUrl } : {}),
@@ -382,12 +383,12 @@ export const setVendorPricing = async (req: Request, res: Response, next: NextFu
         create: {
           vendorId,
           serviceId,
-          customPrice: customPrice !== undefined ? new Prisma.Decimal(customPrice) : null,
+          customPrice: customPrice !== undefined ? toMoneyOrNull(customPrice) : null,
           isActive: isActive !== undefined ? isActive : true,
           availability: availability || 'Mon-Sat: 09:00 - 18:00',
         },
         update: {
-          ...(customPrice !== undefined ? { customPrice: new Prisma.Decimal(customPrice) } : {}),
+          ...(customPrice !== undefined ? { customPrice: toMoney(customPrice) } : {}),
           ...(isActive !== undefined ? { isActive } : {}),
           ...(availability ? { availability } : {}),
         },

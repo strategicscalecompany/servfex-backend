@@ -15,6 +15,7 @@ import {
   type ExpertCandidate,
 } from './dispatch.rules';
 import { isTestingWorkflowEnabled } from '../config/testing-workflow';
+import { toMoney } from '../utils/money';
 
 type Tx = Prisma.TransactionClient;
 
@@ -33,24 +34,28 @@ export class DispatchError extends Error {
 }
 
 // ---------------------------------------------------------------------------
-// Row locks (the atomicity primitive behind "only one expert wins")
+// Transaction occupancy (the atomicity primitive behind "only one expert wins")
 // ---------------------------------------------------------------------------
 
 /**
- * Takes a row-level lock on the booking for the rest of the transaction. Every state transition that
- * can race (manual assign, auto assign, accept, reject, expiry, cancel) goes through this lock and then
- * RE-READS the booking, so exactly one of two concurrent actors can observe the pre-transition state.
- * With `skipLocked` the call returns false instead of waiting (used by the background worker).
+ * Pins the booking document in the current Mongo transaction snapshot, then callers RE-READ and
+ * apply conditional updateMany so only one concurrent actor can win the pre-transition state.
+ * `skipLocked` is retained for call-site compatibility; Mongo has no SKIP LOCKED, so a missing
+ * document returns false and a present document returns true.
  */
-export async function lockBooking(tx: Tx, bookingId: string, skipLocked = false): Promise<boolean> {
-  const rows = skipLocked
-    ? await tx.$queryRaw<{ id: string }[]>`SELECT id FROM "Booking" WHERE id = ${bookingId} FOR UPDATE SKIP LOCKED`
-    : await tx.$queryRaw<{ id: string }[]>`SELECT id FROM "Booking" WHERE id = ${bookingId} FOR UPDATE`;
-  return rows.length > 0;
+export async function lockBooking(tx: Tx, bookingId: string, _skipLocked = false): Promise<boolean> {
+  const booking = await tx.booking.findUnique({
+    where: { id: bookingId },
+    select: { id: true },
+  });
+  return Boolean(booking);
 }
 
 async function lockEmployee(tx: Tx, employeeId: string): Promise<void> {
-  await tx.$queryRaw`SELECT id FROM "EmployeeProfile" WHERE id = ${employeeId} FOR UPDATE`;
+  await tx.employeeProfile.findUnique({
+    where: { id: employeeId },
+    select: { id: true },
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -216,7 +221,7 @@ export async function offerToExpertInTx(tx: Tx, p: OfferParams): Promise<void> {
       assignmentMethod: p.method,
       assignedAt: now,
       dispatchDueAt: addSeconds(now, env.EXPERT_ACCEPT_WINDOW_SECONDS),
-      ...(p.expertPayout ? { expertPayout: p.expertPayout } : {}),
+      ...(p.expertPayout ? { expertPayout: toMoney(p.expertPayout) } : {}),
       ...(p.dispatchNote ? { notes: p.dispatchNote } : {}),
     },
   });

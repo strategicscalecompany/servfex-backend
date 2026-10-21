@@ -6,6 +6,7 @@ import { logAuditEvent } from '../utils/audit';
 import { BookingStatus, Prisma, UserRole } from '@prisma/client';
 import { emitBookingEvent, emitBookingRefresh } from '../utils/realtime';
 import { releaseDispatchOnCancel } from '../services/dispatch.service';
+import { asDecimal, toMoney } from '../utils/money';
 
 export const listBookingsQuerySchema = z.object({
   query: z.object({
@@ -916,10 +917,10 @@ export const overrideBookingPrice = async (req: Request, res: Response, next: Ne
 
     // AUTHORITATIVE SERVER-SIDE FINANCIAL INVARIANT:
     // totalAmount = basePrice + taxes + extraCharges - discountAmount
-    const newBase = basePrice !== undefined ? new Prisma.Decimal(basePrice) : booking.basePrice;
-    const newTaxes = taxes !== undefined ? new Prisma.Decimal(taxes) : booking.taxes;
-    const newDiscount = discountAmount !== undefined ? new Prisma.Decimal(discountAmount) : booking.discountAmount;
-    const newExtra = extraCharges !== undefined ? new Prisma.Decimal(extraCharges) : booking.extraCharges;
+    const newBase = asDecimal(basePrice !== undefined ? basePrice : booking.basePrice);
+    const newTaxes = asDecimal(taxes !== undefined ? taxes : booking.taxes);
+    const newDiscount = asDecimal(discountAmount !== undefined ? discountAmount : booking.discountAmount);
+    const newExtra = asDecimal(extraCharges !== undefined ? extraCharges : booking.extraCharges);
 
     const calculatedTotal = newBase.plus(newTaxes).plus(newExtra).minus(newDiscount);
 
@@ -932,11 +933,11 @@ export const overrideBookingPrice = async (req: Request, res: Response, next: Ne
       const b = await tx.booking.update({
         where: { id },
         data: {
-          basePrice: newBase,
-          taxes: newTaxes,
-          discountAmount: newDiscount,
-          extraCharges: newExtra,
-          totalAmount: calculatedTotal,
+          basePrice: toMoney(newBase),
+          taxes: toMoney(newTaxes),
+          discountAmount: toMoney(newDiscount),
+          extraCharges: toMoney(newExtra),
+          totalAmount: toMoney(calculatedTotal),
         },
       });
 
