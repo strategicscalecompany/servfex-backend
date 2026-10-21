@@ -138,16 +138,16 @@ export const authenticate = async (
       select: AUTH_USER_SELECT,
     });
 
-    const verifiedEmail = decodedToken.email_verified
-      ? decodedToken.email?.toLowerCase().trim()
-      : undefined;
-    const allowlistedAdmin = isAllowlistedSuperAdminEmail(verifiedEmail);
+    const tokenEmail = decodedToken.email?.toLowerCase().trim();
+    const allowlistedAdmin = isAllowlistedSuperAdminEmail(tokenEmail);
+    const linkableEmail =
+      tokenEmail && (decodedToken.email_verified || allowlistedAdmin) ? tokenEmail : undefined;
 
-    // Auto-link verified Google email if user exists
-    if (!user && verifiedEmail) {
+    // Auto-link Google email if the ServFex user already exists
+    if (!user && linkableEmail) {
       const emailMatch = await prisma.user.findFirst({
         where: {
-          email: verifiedEmail,
+          email: linkableEmail,
           deletedAt: null,
         },
       });
@@ -179,41 +179,87 @@ export const authenticate = async (
       logger.info({ email: user.email, firebaseUid: decodedToken.uid }, 'Promoted allowlisted email to SUPER_ADMIN');
     }
 
-    if (!user && allowlistedAdmin && verifiedEmail) {
+    if (!user && allowlistedAdmin && linkableEmail) {
       const name =
-        (decodedToken as { name?: string }).name || verifiedEmail.split('@')[0];
-      user = await prisma.user.create({
-        data: {
-          email: verifiedEmail,
-          firebaseUid: decodedToken.uid,
-          name,
-          role: 'SUPER_ADMIN',
-          status: 'ACTIVE',
-          isVerified: true,
-        },
-        select: AUTH_USER_SELECT,
-      });
-      logger.info({ userId: user.id, email: user.email }, 'Provisioned allowlisted Super Admin from Google login');
+        (decodedToken as { name?: string }).name || linkableEmail.split('@')[0];
+      try {
+        user = await prisma.user.create({
+          data: {
+            email: linkableEmail,
+            firebaseUid: decodedToken.uid,
+            name,
+            role: 'SUPER_ADMIN',
+            status: 'ACTIVE',
+            isVerified: true,
+          },
+          select: AUTH_USER_SELECT,
+        });
+        logger.info({ userId: user.id, email: user.email }, 'Provisioned allowlisted Super Admin from Google login');
+      } catch (createErr) {
+        if (createErr instanceof Prisma.PrismaClientKnownRequestError && createErr.code === 'P2002') {
+          const existing = await prisma.user.findFirst({
+            where: { email: linkableEmail, deletedAt: null },
+          });
+          if (existing) {
+            user = await prisma.user.update({
+              where: { id: existing.id },
+              data: {
+                firebaseUid: decodedToken.uid,
+                role: 'SUPER_ADMIN',
+                status: 'ACTIVE',
+                isVerified: true,
+              },
+              select: AUTH_USER_SELECT,
+            });
+          } else {
+            throw createErr;
+          }
+        } else {
+          throw createErr;
+        }
+      }
     }
 
     // Auto-provision Customer if authenticating via verified Firebase Google/Phone and not yet in DB
     if (!user && (decodedToken.email || decodedToken.phone_number)) {
       const email = decodedToken.email || `${decodedToken.uid}@phone.servfex.com`;
       const name = (decodedToken as any).name || (decodedToken.email ? decodedToken.email.split('@')[0] : 'Customer');
-      user = await prisma.user.create({
-        data: {
-          email: email.toLowerCase().trim(),
-          firebaseUid: decodedToken.uid,
-          phone: decodedToken.phone_number || null,
-          name,
-          role: 'CUSTOMER',
-          status: 'ACTIVE',
-          isVerified: true,
-          customerProfile: { create: {} },
-        },
-        select: AUTH_USER_SELECT,
-      });
-      logger.info({ userId: user.id, email: user.email }, 'Auto-provisioned customer from verified Firebase token');
+      try {
+        user = await prisma.user.create({
+          data: {
+            email: email.toLowerCase().trim(),
+            firebaseUid: decodedToken.uid,
+            phone: decodedToken.phone_number || null,
+            name,
+            role: 'CUSTOMER',
+            status: 'ACTIVE',
+            isVerified: true,
+            customerProfile: { create: {} },
+          },
+          select: AUTH_USER_SELECT,
+        });
+        logger.info({ userId: user.id, email: user.email }, 'Auto-provisioned customer from verified Firebase token');
+      } catch (createErr) {
+        if (createErr instanceof Prisma.PrismaClientKnownRequestError && createErr.code === 'P2002') {
+          const existing = await prisma.user.findFirst({
+            where: {
+              email: email.toLowerCase().trim(),
+              deletedAt: null,
+            },
+          });
+          if (existing) {
+            user = await prisma.user.update({
+              where: { id: existing.id },
+              data: { firebaseUid: decodedToken.uid, isVerified: true },
+              select: AUTH_USER_SELECT,
+            });
+          } else {
+            throw createErr;
+          }
+        } else {
+          throw createErr;
+        }
+      }
     }
 
     if (!user) {
@@ -342,10 +388,12 @@ export const requireSuperAdmin = async (
       select: AUTH_USER_SELECT,
     });
 
-    const verifiedAdminEmail = decodedToken.email_verified
-      ? decodedToken.email?.toLowerCase().trim()
-      : undefined;
-    const allowlistedAdmin = isAllowlistedSuperAdminEmail(verifiedAdminEmail);
+    const adminTokenEmail = decodedToken.email?.toLowerCase().trim();
+    const allowlistedAdmin = isAllowlistedSuperAdminEmail(adminTokenEmail);
+    const verifiedAdminEmail =
+      adminTokenEmail && (decodedToken.email_verified || allowlistedAdmin)
+        ? adminTokenEmail
+        : undefined;
 
     if (!adminUser && verifiedAdminEmail) {
       const emailMatch = await prisma.user.findFirst({

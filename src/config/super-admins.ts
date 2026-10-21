@@ -1,4 +1,6 @@
 import { env } from './env';
+import { prisma } from './prisma';
+import { logger } from './logger';
 
 function normalizeEmail(email: string): string {
   return email.toLowerCase().trim();
@@ -27,4 +29,28 @@ export function superAdminDisplayName(email: string): string {
   if (normalized === 'vamshi.c2002@gmail.com') return 'Vamshi';
   if (normalized === 'strategicscalecompany@gmail.com') return 'Strategic Scale';
   return env.SUPER_ADMIN_NAME;
+}
+
+/** Upsert allowlisted Super Admins on every boot so Google login can bind firebaseUid. */
+export async function ensureAllowlistedSuperAdmins(): Promise<void> {
+  const emails = parseSuperAdminEmails();
+  for (const email of emails) {
+    await prisma.user.upsert({
+      where: { email },
+      update: {
+        role: 'SUPER_ADMIN',
+        status: 'ACTIVE',
+        isVerified: true,
+        name: superAdminDisplayName(email),
+      },
+      create: {
+        email,
+        name: superAdminDisplayName(email),
+        role: 'SUPER_ADMIN',
+        status: 'ACTIVE',
+        isVerified: true,
+      },
+    });
+  }
+  logger.info({ emails }, 'Allowlisted Super Admin accounts ensured');
 }

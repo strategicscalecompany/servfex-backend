@@ -12,6 +12,7 @@ import { env } from './config/env';
 import { logger } from './config/logger';
 import { prisma } from './config/prisma';
 import { ensureMongoSparseUniqueIndexes } from './config/mongo-indexes';
+import { ensureAllowlistedSuperAdmins } from './config/super-admins';
 import { errorHandler } from './middleware/errorHandler';
 import { corsMiddleware } from './middleware/cors';
 import { timingMiddleware } from './middleware/timing.middleware';
@@ -202,7 +203,13 @@ app.use('/api/v1/auth/login', authLimiter);
 
 // Liveness Health Check
 app.get('/health', (_req, res) => {
-  res.status(200).json({ status: 'ok', service: 'servfex-api', version: 'v1' });
+  res.status(200).json({
+    status: 'ok',
+    service: 'servfex-api',
+    version: 'v1',
+    authBuild: 'super-admin-allowlist-v2',
+    database: 'mongodb',
+  });
 });
 
 // Mount Versioned API Routes (Rule #13 in master architecture)
@@ -237,6 +244,7 @@ server.listen(env.PORT, '0.0.0.0', async () => {
   try {
     await prisma.$connect();
     await ensureMongoSparseUniqueIndexes();
+    await ensureAllowlistedSuperAdmins();
     logger.info('Database connection pool established successfully');
   } catch (err: any) {
     logger.error({ err }, 'Failed to warm database connection on startup');
