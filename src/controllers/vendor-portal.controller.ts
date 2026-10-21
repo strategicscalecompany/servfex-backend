@@ -1356,76 +1356,80 @@ export const completeOrder = async (req: Request, res: Response): Promise<void> 
       return;
     }
 
-    const updated = await prisma.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT id FROM "Booking" WHERE id = ${id} FOR UPDATE`;
-      const current = await tx.booking.findUnique({ where: { id } });
-      if (!current) throw new Error('Order not found');
-      if (
-        current.status === 'AWAITING_CUSTOMER_CONFIRMATION' ||
-        current.status === 'AWAITING_PAYMENT' ||
-        current.status === 'COMPLETED'
-      ) {
-        return tx.booking.findUnique({
-          where: { id },
-          include: {
-            customer: { include: { user: { select: SAFE_USER_SELECT } } },
-            service: { select: { id: true, name: true } },
-            address: true,
-            employee: { include: { user: { select: { name: true, phone: true } } } },
+    try {
+      await prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM "Booking" WHERE id = ${id} FOR UPDATE`;
+        const current = await tx.booking.findUnique({ where: { id } });
+        if (!current) throw Object.assign(new Error('Order not found'), { code: 'NOT_FOUND' });
+        if (
+          current.status === 'AWAITING_CUSTOMER_CONFIRMATION' ||
+          current.status === 'AWAITING_PAYMENT' ||
+          current.status === 'COMPLETED'
+        ) {
+          return;
+        }
+        if (!(COMPLETABLE_JOB_STATUSES as readonly string[]).includes(current.status)) {
+          throw Object.assign(new Error(`Cannot complete order in ${current.status} status.`), { code: 'BAD_REQUEST' });
+        }
+        if (!SKIP_TRAVEL_AND_START_OTP && current.status !== 'IN_PROGRESS') {
+          throw Object.assign(new Error(`Cannot complete order in ${current.status} status.`), { code: 'BAD_REQUEST' });
+        }
+        if (!SKIP_TRAVEL_AND_START_OTP && !current.qrVerifiedAt) {
+          throw Object.assign(new Error('Cannot complete order without verified start OTP'), { code: 'BAD_REQUEST' });
+        }
+        if (!hasRequiredCompletionPhotos(current.completionPhotoUrls)) {
+          throw Object.assign(
+            new Error(`Upload at least ${MIN_COMPLETION_PHOTOS} completion photographs before finishing this job.`),
+            { code: 'COMPLETION_PHOTOS_REQUIRED' }
+          );
+        }
+
+        const flipped = await tx.booking.updateMany({
+          where: {
+            id,
+            status: { in: [...COMPLETABLE_JOB_STATUSES] as BookingStatus[] },
+          },
+          data: {
+            status: 'AWAITING_CUSTOMER_CONFIRMATION',
+            completionRequestedAt: new Date(),
           },
         });
-      }
-      if (!(COMPLETABLE_JOB_STATUSES as readonly string[]).includes(current.status)) {
-        throw Object.assign(new Error(`Cannot complete order in ${current.status} status.`), { code: 'BAD_REQUEST' });
-      }
-      if (!SKIP_TRAVEL_AND_START_OTP && current.status !== 'IN_PROGRESS') {
-        throw Object.assign(new Error(`Cannot complete order in ${current.status} status.`), { code: 'BAD_REQUEST' });
-      }
-      if (!SKIP_TRAVEL_AND_START_OTP && !current.qrVerifiedAt) {
-        throw Object.assign(new Error('Cannot complete order without verified start OTP'), { code: 'BAD_REQUEST' });
-      }
-      if (!hasRequiredCompletionPhotos(current.completionPhotoUrls)) {
-        throw Object.assign(
-          new Error(`Upload at least ${MIN_COMPLETION_PHOTOS} completion photographs before finishing this job.`),
-          { code: 'COMPLETION_PHOTOS_REQUIRED' }
-        );
-      }
+        if (flipped.count !== 1) {
+          throw Object.assign(new Error('Completion changed while submitting. Please refresh.'), { code: 'ASSIGNMENT_CONFLICT' });
+        }
 
-      const flipped = await tx.booking.updateMany({
-        where: {
-          id,
-          status: { in: [...COMPLETABLE_JOB_STATUSES] as BookingStatus[] },
-          employeeId: user?.employeeProfile?.id || booking.employeeId,
-        },
-        data: {
-          status: 'AWAITING_CUSTOMER_CONFIRMATION',
-          completionRequestedAt: new Date(),
-        },
-      });
-      if (flipped.count !== 1) {
-        throw Object.assign(new Error('Completion changed while submitting. Please refresh.'), { code: 'ASSIGNMENT_CONFLICT' });
+        await tx.bookingStatusHistory.create({
+          data: {
+            bookingId: id,
+            oldStatus: current.status,
+            newStatus: 'AWAITING_CUSTOMER_CONFIRMATION',
+            changedBy: userId,
+            changedByRole: (user?.role as any) || 'EMPLOYEE',
+            reason: completionReason || 'Technician completed service delivery. Awaiting customer confirmation.',
+          },
+        });
+      }, { maxWait: 20_000, timeout: 45_000 });
+    } catch (err: any) {
+      if (err.code === 'COMPLETION_PHOTOS_REQUIRED' || err.code === 'BAD_REQUEST' || err.code === 'ASSIGNMENT_CONFLICT' || err.code === 'NOT_FOUND') {
+        sendError(res, err.code, err.message, err.code === 'ASSIGNMENT_CONFLICT' ? 409 : err.code === 'NOT_FOUND' ? 404 : 400);
+        return;
       }
+      if (err.code === 'P2028' || err.code === 'P2034' || /transaction/i.test(String(err.message || ''))) {
+        sendError(res, 'TIMEOUT', 'Completion timed out. Photographs are already saved — tap Submit again.', 503);
+        return;
+      }
+      sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
+      return;
+    }
 
-      await tx.bookingStatusHistory.create({
-        data: {
-          bookingId: id,
-          oldStatus: current.status,
-          newStatus: 'AWAITING_CUSTOMER_CONFIRMATION',
-          changedBy: userId,
-          changedByRole: (user?.role as any) || 'EMPLOYEE',
-          reason: completionReason || 'Technician completed service delivery. Awaiting customer confirmation.',
-        },
-      });
-
-      return tx.booking.findUnique({
-        where: { id },
-        include: {
-          customer: { include: { user: { select: SAFE_USER_SELECT } } },
-          service: { select: { id: true, name: true } },
-          address: true,
-          employee: { include: { user: { select: { name: true, phone: true } } } },
-        },
-      });
+    const updated = await prisma.booking.findUnique({
+      where: { id },
+      include: {
+        customer: { include: { user: { select: SAFE_USER_SELECT } } },
+        service: { select: { id: true, name: true } },
+        address: true,
+        employee: { include: { user: { select: { name: true, phone: true } } } },
+      },
     });
 
     void emitBookingRefresh(id);
