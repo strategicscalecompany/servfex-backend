@@ -36,9 +36,18 @@ const server = http.createServer(app);
 // ERR_ERL_UNEXPECTED_X_FORWARDED_FOR which crashes the request pipeline before CORS headers are sent.
 app.set('trust proxy', 1);
 
-// Initialize Socket.IO for real-time live admin booking updates
+// Serve Socket.IO under /api/socket.io so nginx configs that only reverse-proxy /api still work.
 export const io = new SocketIOServer(server, {
-  cors: { origin: '*' },
+  path: '/api/socket.io',
+  cors: {
+    origin: true,
+    credentials: true,
+    methods: ['GET', 'POST'],
+  },
+  transports: ['websocket', 'polling'],
+  pingInterval: 25000,
+  pingTimeout: 20000,
+  allowEIO3: true,
 });
 
 // Authenticate every socket from its handshake token. PostgreSQL stays the authority on role/status.
