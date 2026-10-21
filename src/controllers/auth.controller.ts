@@ -164,8 +164,8 @@ export const getCurrentUser = async (
       return;
     }
 
-    const user = await prisma.user.findFirst({
-      where: { id: req.user.userId, deletedAt: null },
+    const user = await prisma.user.findUnique({
+      where: { id: req.user.userId },
       select: {
         id: true,
         firebaseUid: true,
@@ -178,6 +178,7 @@ export const getCurrentUser = async (
         isVerified: true,
         createdAt: true,
         lastLoginAt: true,
+        deletedAt: true,
         customerProfile: true,
         vendorProfile: true,
         employeeProfile: true,
@@ -185,7 +186,7 @@ export const getCurrentUser = async (
       },
     });
 
-    if (!user) {
+    if (!user || user.deletedAt) {
       sendError(res, 'NOT_FOUND', 'User profile not found in ServFex database', 404);
       return;
     }
@@ -198,9 +199,11 @@ export const getCurrentUser = async (
       })
       .catch((err) => logger.warn({ err }, 'Failed to update lastLoginAt'));
 
+    const { deletedAt: _deletedAt, ...publicUser } = user;
+
     sendSuccess(res, {
       user: {
-        ...user,
+        ...publicUser,
         expertKind: user.employeeProfile?.expertKind || null,
         testingWorkflowEnabled: isTestingWorkflowEnabled(),
       },

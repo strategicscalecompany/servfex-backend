@@ -14,6 +14,16 @@ const AUTH_USER_SELECT = {
   status: true,
 } as const;
 
+const AUTH_LOOKUP_SELECT = {
+  ...AUTH_USER_SELECT,
+  firebaseUid: true,
+  deletedAt: true,
+} as const;
+
+function isSoftDeleted(user?: { deletedAt?: Date | null } | null): boolean {
+  return Boolean(user?.deletedAt);
+}
+
 function isDatabaseError(err: unknown): boolean {
   return (
     err instanceof Prisma.PrismaClientKnownRequestError ||
@@ -85,18 +95,12 @@ export const authenticate = async (
     // 1. Check for backend JWT access token first
     try {
       const jwtPayload = verifyAccessToken(token);
-      const user = await prisma.user.findFirst({
-        where: { id: jwtPayload.userId, deletedAt: null },
-        select: {
-          id: true,
-          email: true,
-          role: true,
-          status: true,
-          firebaseUid: true,
-        },
+      const user = await prisma.user.findUnique({
+        where: { id: jwtPayload.userId },
+        select: AUTH_LOOKUP_SELECT,
       });
 
-      if (user) {
+      if (user && !isSoftDeleted(user)) {
         if (user.status === 'SUSPENDED') {
           sendError(res, 'ACCOUNT_SUSPENDED', 'Your ServFex account has been suspended.', 403);
           return;
@@ -134,9 +138,10 @@ export const authenticate = async (
 
     // MongoDB is the sole authority for ServFex user identity & role
     let user = await prisma.user.findFirst({
-      where: { firebaseUid: decodedToken.uid, deletedAt: null },
-      select: AUTH_USER_SELECT,
+      where: { firebaseUid: decodedToken.uid },
+      select: AUTH_LOOKUP_SELECT,
     });
+    if (isSoftDeleted(user)) user = null;
 
     const tokenEmail = decodedToken.email?.toLowerCase().trim();
     const allowlistedAdmin = isAllowlistedSuperAdminEmail(tokenEmail);
@@ -145,12 +150,13 @@ export const authenticate = async (
 
     // Auto-link Google email if the ServFex user already exists
     if (!user && linkableEmail) {
-      const emailMatch = await prisma.user.findFirst({
-        where: {
-          email: linkableEmail,
-          deletedAt: null,
-        },
+      const emailMatch = await prisma.user.findUnique({
+        where: { email: linkableEmail },
       });
+      if (emailMatch && isSoftDeleted(emailMatch)) {
+        sendError(res, 'UNAUTHORIZED', 'This ServFex account has been deleted.', 401);
+        return;
+      }
 
       if (emailMatch) {
         user = await prisma.user.update({
@@ -197,10 +203,10 @@ export const authenticate = async (
         logger.info({ userId: user.id, email: user.email }, 'Provisioned allowlisted Super Admin from Google login');
       } catch (createErr) {
         if (createErr instanceof Prisma.PrismaClientKnownRequestError && createErr.code === 'P2002') {
-          const existing = await prisma.user.findFirst({
-            where: { email: linkableEmail, deletedAt: null },
+          const existing = await prisma.user.findUnique({
+            where: { email: linkableEmail },
           });
-          if (existing) {
+          if (existing && !isSoftDeleted(existing)) {
             user = await prisma.user.update({
               where: { id: existing.id },
               data: {
@@ -241,13 +247,10 @@ export const authenticate = async (
         logger.info({ userId: user.id, email: user.email }, 'Auto-provisioned customer from verified Firebase token');
       } catch (createErr) {
         if (createErr instanceof Prisma.PrismaClientKnownRequestError && createErr.code === 'P2002') {
-          const existing = await prisma.user.findFirst({
-            where: {
-              email: email.toLowerCase().trim(),
-              deletedAt: null,
-            },
+          const existing = await prisma.user.findUnique({
+            where: { email: email.toLowerCase().trim() },
           });
-          if (existing) {
+          if (existing && !isSoftDeleted(existing)) {
             user = await prisma.user.update({
               where: { id: existing.id },
               data: { firebaseUid: decodedToken.uid, isVerified: true },
@@ -329,18 +332,12 @@ export const requireSuperAdmin = async (
     // Check for backend JWT access token for SUPER_ADMIN first
     try {
       const jwtPayload = verifyAccessToken(token);
-      const adminUser = await prisma.user.findFirst({
-        where: { id: jwtPayload.userId, deletedAt: null },
-        select: {
-          id: true,
-          email: true,
-          role: true,
-          status: true,
-          firebaseUid: true,
-        },
+      const adminUser = await prisma.user.findUnique({
+        where: { id: jwtPayload.userId },
+        select: AUTH_LOOKUP_SELECT,
       });
 
-      if (adminUser) {
+      if (adminUser && !isSoftDeleted(adminUser)) {
         if (adminUser.role !== 'SUPER_ADMIN') {
           sendError(res, 'FORBIDDEN', 'Access denied: This endpoint requires SUPER_ADMIN authority.', 403);
           return;
@@ -381,12 +378,10 @@ export const requireSuperAdmin = async (
 
     // 2. Query MongoDB live (no caching) to verify SUPER_ADMIN role & active status
     let adminUser = await prisma.user.findFirst({
-      where: {
-        firebaseUid: decodedToken.uid,
-        deletedAt: null,
-      },
-      select: AUTH_USER_SELECT,
+      where: { firebaseUid: decodedToken.uid },
+      select: AUTH_LOOKUP_SELECT,
     });
+    if (isSoftDeleted(adminUser)) adminUser = null;
 
     const adminTokenEmail = decodedToken.email?.toLowerCase().trim();
     const allowlistedAdmin = isAllowlistedSuperAdminEmail(adminTokenEmail);
@@ -396,13 +391,13 @@ export const requireSuperAdmin = async (
         : undefined;
 
     if (!adminUser && verifiedAdminEmail) {
-      const emailMatch = await prisma.user.findFirst({
-        where: {
-          email: verifiedAdminEmail,
-          deletedAt: null,
-          ...(allowlistedAdmin ? {} : { role: 'SUPER_ADMIN' }),
-        },
+      const emailMatch = await prisma.user.findUnique({
+        where: { email: verifiedAdminEmail },
       });
+      if (emailMatch && isSoftDeleted(emailMatch)) {
+        sendError(res, 'UNAUTHORIZED', 'This ServFex account has been deleted.', 401);
+        return;
+      }
 
       if (emailMatch && (emailMatch.role === 'SUPER_ADMIN' || allowlistedAdmin)) {
         adminUser = await prisma.user.update({
