@@ -12,6 +12,7 @@ import { env } from './config/env';
 import { logger } from './config/logger';
 import { prisma } from './config/prisma';
 import { errorHandler } from './middleware/errorHandler';
+import { corsMiddleware } from './middleware/cors';
 import { timingMiddleware } from './middleware/timing.middleware';
 import { verifyAccessToken } from './utils/token';
 import { getFirebaseAuth, isFirebaseConfigured } from './config/firebase';
@@ -122,48 +123,20 @@ io.on('connection', (socket) => {
 });
 
 
-// Universal permissive CORS middleware — works across all environments, proxies, and browsers.
-// Handles OPTIONS preflight immediately with 204 and dynamically echoes requested headers.
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  if (origin) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Vary', 'Origin');
-    res.setHeader('Access-Control-Allow-Credentials', 'true');
-  } else {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-  }
-
-  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS');
-
-  // Allow whatever headers the browser requested
-  const reqHeaders = req.headers['access-control-request-headers'];
-  if (reqHeaders) {
-    res.setHeader('Access-Control-Allow-Headers', reqHeaders);
-  } else {
-    res.setHeader('Access-Control-Allow-Headers', '*');
-  }
-
-  res.setHeader('Access-Control-Expose-Headers', '*');
-  res.setHeader('Access-Control-Max-Age', '86400'); // Cache preflight for 24 hours
-
-  if (req.method === 'OPTIONS') {
-    return res.status(204).end();
-  }
-  next();
-});
-
-// Explicit OPTIONS wildcard handler for any router/path
-app.options('*', (_req, res) => {
-  res.status(204).end();
-});
+// CORS must run first and re-apply on writeHead so GET /admin/services (and every other
+// response) always has a spec-valid Access-Control-Allow-Origin. Wildcards are invalid
+// when Access-Control-Allow-Credentials is true.
+app.use(corsMiddleware);
 
 // Security HTTP Headers (Rule #12 in SECURITY_RULES.md)
-// crossOriginResourcePolicy set to 'cross-origin' so CORS-allowed resources aren't blocked
+// This is a JSON API, not a document — disable document-only policies that confuse CORS.
 app.use(
   helmet({
-    crossOriginResourcePolicy: { policy: 'cross-origin' },
+    contentSecurityPolicy: false,
+    crossOriginEmbedderPolicy: false,
     crossOriginOpenerPolicy: false,
+    originAgentCluster: false,
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
   })
 );
 
@@ -199,6 +172,7 @@ const apiLimiter = rateLimit({
   max: 300, // Limit each IP to 300 requests per 15 mins
   standardHeaders: true,
   legacyHeaders: false,
+  skip: (req) => req.method === 'OPTIONS',
   message: {
     success: false,
     error: {

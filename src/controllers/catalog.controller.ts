@@ -24,7 +24,7 @@ export const getCatalogCategories = async (_req: Request, res: Response): Promis
     const cacheKey = 'categories:all';
     const cached = catalogMemoryCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) {
-      res.setHeader('Cache-Control', 'public, max-age=60, stale-while-revalidate=120');
+      res.setHeader('Cache-Control', 'private, max-age=60, stale-while-revalidate=120');
       sendSuccess(res, cached.data, 200);
       return;
     }
@@ -74,7 +74,7 @@ export const getCatalogCategories = async (_req: Request, res: Response): Promis
     const resultData = { categories: sanitizedCategories };
     catalogMemoryCache.set(cacheKey, { data: resultData, expiresAt: Date.now() + CACHE_TTL_MS });
 
-    res.setHeader('Cache-Control', 'public, max-age=60, stale-while-revalidate=120');
+    res.setHeader('Cache-Control', 'private, max-age=60, stale-while-revalidate=120');
     sendSuccess(res, resultData, 200);
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
@@ -99,7 +99,7 @@ export const getCatalogServices = async (req: Request, res: Response): Promise<v
     const cacheKey = `services:${categoryId || ''}:${subCategoryId || ''}:${categorySlug || ''}:${search || ''}:${isPopular}:${page}:${limit}`;
     const cached = catalogMemoryCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) {
-      res.setHeader('Cache-Control', 'public, max-age=60, stale-while-revalidate=120');
+      res.setHeader('Cache-Control', 'private, max-age=60, stale-while-revalidate=120');
       sendSuccess(res, cached.data, 200, cached.meta);
       return;
     }
@@ -177,7 +177,7 @@ export const getCatalogServices = async (req: Request, res: Response): Promise<v
 
     catalogMemoryCache.set(cacheKey, { data: resultData, meta, expiresAt: Date.now() + CACHE_TTL_MS });
 
-    res.setHeader('Cache-Control', 'public, max-age=60, stale-while-revalidate=120');
+    res.setHeader('Cache-Control', 'private, max-age=60, stale-while-revalidate=120');
     sendSuccess(res, resultData, 200, meta);
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
@@ -195,7 +195,7 @@ export const getCatalogServiceById = async (req: Request, res: Response): Promis
     const cacheKey = `service:${id}`;
     const cached = catalogMemoryCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) {
-      res.setHeader('Cache-Control', 'public, max-age=60, stale-while-revalidate=120');
+      res.setHeader('Cache-Control', 'private, max-age=60, stale-while-revalidate=120');
       sendSuccess(res, cached.data, 200);
       return;
     }
@@ -240,7 +240,7 @@ export const getCatalogServiceById = async (req: Request, res: Response): Promis
     const resultData = { service };
     catalogMemoryCache.set(cacheKey, { data: resultData, expiresAt: Date.now() + CACHE_TTL_MS });
 
-    res.setHeader('Cache-Control', 'public, max-age=60, stale-while-revalidate=120');
+    res.setHeader('Cache-Control', 'private, max-age=60, stale-while-revalidate=120');
     sendSuccess(res, resultData, 200);
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
@@ -258,7 +258,7 @@ export const getPopularServices = async (req: Request, res: Response): Promise<v
     const cacheKey = `services:popular:${limit}`;
     const cached = catalogMemoryCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) {
-      res.setHeader('Cache-Control', 'public, max-age=60, stale-while-revalidate=120');
+      res.setHeader('Cache-Control', 'private, max-age=60, stale-while-revalidate=120');
       sendSuccess(res, cached.data, 200);
       return;
     }
@@ -300,7 +300,7 @@ export const getPopularServices = async (req: Request, res: Response): Promise<v
     const resultData = { services: sanitizedServices };
     catalogMemoryCache.set(cacheKey, { data: resultData, expiresAt: Date.now() + CACHE_TTL_MS });
 
-    res.setHeader('Cache-Control', 'public, max-age=60, stale-while-revalidate=120');
+    res.setHeader('Cache-Control', 'private, max-age=60, stale-while-revalidate=120');
     sendSuccess(res, resultData, 200);
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);

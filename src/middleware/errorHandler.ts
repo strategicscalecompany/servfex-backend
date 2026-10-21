@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from 'express';
 import { logger } from '../config/logger';
 import { env } from '../config/env';
 import { sendError } from '../utils/response';
+import { applyCorsHeaders } from './cors';
 
 export const errorHandler = (
   err: any,
@@ -9,12 +10,7 @@ export const errorHandler = (
   res: Response,
   _next: NextFunction
 ): void => {
-  const origin = req.headers.origin;
-  if (origin && !res.getHeader('Access-Control-Allow-Origin')) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Vary', 'Origin');
-    res.setHeader('Access-Control-Allow-Credentials', 'true');
-  }
+  applyCorsHeaders(req, res);
 
   const isPayloadTooLarge =
     err.type === 'entity.too.large' || err.status === 413 || err.statusCode === 413;
