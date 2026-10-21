@@ -4,13 +4,13 @@ import { env } from './env';
  * Temporary Expert testing workflow.
  *
  * When enabled (default during the current testing stage):
- *  - Auto-dispatch / offer-expiry is isolated (code remains, connections are skipped)
- *  - Employees are classified as SERVICE_PROFESSIONAL or SALES_MANAGER
  *  - Sales Manager bookings stay PENDING for the Provider to assign
- *  - Service Professional completion requires 4 hosted photographs
+ *  - Sales Managers cannot accept/complete service jobs
+ *  - Service Professionals use the original swipe-accept / swipe-complete flow
+ *  - Completing a job always requires 4 hosted photographs (original SP rule)
  *
- * Restore the original workflow by setting EXPERT_TESTING_WORKFLOW_ENABLED=false.
- * No original dispatch, assignment, or completion code is deleted.
+ * Restore fully original auto-dispatch for Sales Manager bookings by setting
+ * EXPERT_TESTING_WORKFLOW_ENABLED=false. No original dispatch code is deleted.
  */
 export const MIN_COMPLETION_PHOTOS = 4;
 

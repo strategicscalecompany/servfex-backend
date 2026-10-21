@@ -82,9 +82,8 @@ export async function armPendingBookingsOnBoot(clock: () => Date = () => new Dat
 export async function startDispatchWorker(): Promise<void> {
   if (isTestingWorkflowEnabled()) {
     logger.info(
-      'Dispatch worker isolated by EXPERT_TESTING_WORKFLOW_ENABLED (original worker code is unchanged)'
+      'Dispatch worker running; Sales Manager bookings stay isolated for Provider assignment'
     );
-    return;
   }
   if (!env.DISPATCH_WORKER_ENABLED) {
     logger.info('Dispatch worker disabled by environment configuration');

@@ -157,6 +157,7 @@ const BOOKING_FOR_DISPATCH = {
   dispatchDueAt: true,
   dispatchAttempts: true,
   assignmentMethod: true,
+  bookingSource: true,
   service: { select: { name: true } },
   customer: { select: { userId: true } },
   vendor: { select: { userId: true, companyName: true, warehouseName: true } },
@@ -446,13 +447,6 @@ export async function processBookingDispatch(
   bookingId: string,
   clock: () => Date = () => new Date()
 ): Promise<DispatchResult> {
-  // Isolate auto-dispatch without deleting the worker, scheduler, or ranking rules.
-  // Restore by setting EXPERT_TESTING_WORKFLOW_ENABLED=false.
-  if (isTestingWorkflowEnabled()) {
-    logger.info({ bookingId }, 'Auto-dispatch skipped: temporary expert testing workflow is enabled');
-    return 'SKIPPED_TESTING_WORKFLOW';
-  }
-
   let result: DispatchResult = 'SKIPPED_STATE_CHANGED';
   const effects: Effects = {};
 
@@ -472,6 +466,11 @@ export async function processBookingDispatch(
     }
     if (!booking.dispatchDueAt || booking.dispatchDueAt.getTime() > now.getTime()) {
       result = 'SKIPPED_NOT_DUE';
+      return;
+    }
+    if (isTestingWorkflowEnabled() && booking.bookingSource === 'SALES_MANAGER') {
+      logger.info({ bookingId }, 'Auto-dispatch skipped for Sales Manager booking (Provider assigns)');
+      result = 'SKIPPED_TESTING_WORKFLOW';
       return;
     }
     if (booking.status !== 'PENDING' && booking.status !== 'ASSIGNED') {
@@ -748,9 +747,12 @@ export async function rejectAssignment(userId: string, bookingId: string, reason
   if (!outcome.released) return outcome;
 
   await runEffects(effects);
-  if (isTestingWorkflowEnabled()) {
-    // Original auto re-dispatch stays in this function but is isolated while testing.
-    logger.info({ bookingId }, 'Rejection left booking PENDING for Provider assignment (testing workflow)');
+  const rejected = await prisma.booking.findUnique({
+    where: { id: bookingId },
+    select: { bookingSource: true },
+  });
+  if (isTestingWorkflowEnabled() && rejected?.bookingSource === 'SALES_MANAGER') {
+    logger.info({ bookingId }, 'Rejection left Sales Manager booking PENDING for Provider assignment');
     return outcome;
   }
   // Re-offer right away; if this fails the sweeper retries because dispatchDueAt is already due.

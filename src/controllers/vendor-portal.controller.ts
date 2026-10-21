@@ -796,10 +796,8 @@ export const getVendorOrders = async (req: Request, res: Response): Promise<void
           vendorId: user.employeeProfile.vendorId,
           bookingSource: 'SALES_MANAGER',
         };
-      } else if (isTestingWorkflowEnabled()) {
-        // Service Professionals only see jobs assigned to them (Provider-controlled assignment).
-        where = { employeeId: user.employeeProfile.id };
       } else {
+        // Original Service Professional flow: assigned jobs plus unassigned hub jobs to swipe-accept.
         where.OR = [
           { employeeId: user.employeeProfile.id },
           {
@@ -870,8 +868,6 @@ export const getVendorOrderById = async (req: Request, res: Response): Promise<v
       if (isTestingWorkflowEnabled() && isSalesManager) {
         where.vendorId = user.employeeProfile.vendorId;
         where.bookingSource = 'SALES_MANAGER';
-      } else if (isTestingWorkflowEnabled()) {
-        where.employeeId = user.employeeProfile.id;
       } else {
         where.OR = [
           { employeeId: user.employeeProfile.id },
@@ -962,16 +958,13 @@ export const updateOrderStatus = async (req: Request, res: Response): Promise<vo
         sendError(res, 'FORBIDDEN', 'Sales Managers cannot accept or complete service jobs', 403);
         return;
       }
-      if (
-        isTestingWorkflowEnabled() &&
-        (status === 'COMPLETED' || status === 'AWAITING_CUSTOMER_CONFIRMATION' || status === 'IN_PROGRESS')
-      ) {
+      if (status === 'COMPLETED' || status === 'AWAITING_CUSTOMER_CONFIRMATION' || status === 'IN_PROGRESS') {
         sendError(
           res,
           'INVALID_TRANSITION',
           status === 'IN_PROGRESS'
             ? 'Use the start OTP endpoint to begin work'
-            : 'Use the completion endpoint after uploading the required photographs',
+            : 'Swipe to complete and upload at least 4 photographs',
           400
         );
         return;
@@ -1345,7 +1338,7 @@ export const completeOrder = async (req: Request, res: Response): Promise<void> 
       return;
     }
 
-    if (isTestingWorkflowEnabled() && !hasRequiredCompletionPhotos(booking.completionPhotoUrls)) {
+    if (!hasRequiredCompletionPhotos(booking.completionPhotoUrls)) {
       sendError(
         res,
         'COMPLETION_PHOTOS_REQUIRED',
@@ -1377,7 +1370,7 @@ export const completeOrder = async (req: Request, res: Response): Promise<void> 
       if (current.status !== 'IN_PROGRESS') {
         throw Object.assign(new Error(`Cannot complete order in ${current.status} status.`), { code: 'BAD_REQUEST' });
       }
-      if (isTestingWorkflowEnabled() && !hasRequiredCompletionPhotos(current.completionPhotoUrls)) {
+      if (!hasRequiredCompletionPhotos(current.completionPhotoUrls)) {
         throw Object.assign(
           new Error(`Upload at least ${MIN_COMPLETION_PHOTOS} completion photographs before finishing this job.`),
           { code: 'COMPLETION_PHOTOS_REQUIRED' }
