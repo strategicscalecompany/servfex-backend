@@ -16,12 +16,17 @@ export const errorHandler = (
     res.setHeader('Access-Control-Allow-Credentials', 'true');
   }
 
-  const statusCode = err.statusCode || 500;
-  const errorCode = err.code || 'INTERNAL_SERVER_ERROR';
-  
-  // Safe production error message
-  const message =
-    env.NODE_ENV === 'production' && statusCode === 500
+  const isPayloadTooLarge =
+    err.type === 'entity.too.large' || err.status === 413 || err.statusCode === 413;
+
+  const statusCode = isPayloadTooLarge ? 413 : err.statusCode || err.status || 500;
+  const errorCode = isPayloadTooLarge
+    ? 'PAYLOAD_TOO_LARGE'
+    : err.code || 'INTERNAL_SERVER_ERROR';
+
+  const message = isPayloadTooLarge
+    ? 'The uploaded files are too large for a single request. Attach documents one at a time — up to 30 files are supported.'
+    : env.NODE_ENV === 'production' && statusCode === 500
       ? 'An unexpected internal error occurred. Please try again later.'
       : err.message || 'Internal server error';
 

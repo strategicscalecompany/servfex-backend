@@ -10,11 +10,31 @@ export const uploadImageSchema = z.object({
   }),
 });
 
+const ALLOWED_UPLOAD_FOLDERS = new Set([
+  'servfex/catalog',
+  'servfex/avatars',
+  'servfex/warehouses',
+  'servfex/documents',
+  'servfex/categories',
+  'servfex/services/icons',
+  'servfex/services/banners',
+  'servfex/services/videos',
+  'servfex/packages/banners',
+  'servfex/packages/icons',
+  'servfex/packages/steps',
+  'servfex/packages/cards',
+]);
+
 export const uploadImage = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const { image, folder } = req.body;
+    const targetFolder = ALLOWED_UPLOAD_FOLDERS.has(folder) ? folder : 'servfex/catalog';
 
-    const secureUrl = await uploadToCloudinary(image, folder);
+    const secureUrl = await uploadToCloudinary(image, targetFolder);
+    if (!secureUrl || secureUrl.startsWith('data:')) {
+      sendError(res, 'IMAGE_UPLOAD_FAILED', 'Could not host this file. Try a smaller PDF or image.', 400);
+      return;
+    }
 
     sendSuccess(res, {
       url: secureUrl,

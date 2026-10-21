@@ -6,8 +6,10 @@ import { hashPassword } from '../utils/password';
 import { logAuditEvent } from '../utils/audit';
 import { Prisma, DocumentType, KycStatus } from '@prisma/client';
 import { getFirebaseAuth } from '../config/firebase';
-import { uploadToCloudinary } from '../utils/cloudinary';
+import { resolveHostedUrl } from '../utils/cloudinary';
 import { sendProviderWelcomeEmail } from '../services/email.service';
+
+const MAX_ONBOARDING_DOCUMENTS = 30;
 
 export const listVendorsQuerySchema = z.object({
   query: z.object({
@@ -46,9 +48,10 @@ export const createVendorSchema = z.object({
         z.object({
           type: z.enum(['GOVERNMENT_ID', 'TRADE_LICENSE', 'TAX_DOCUMENT', 'CERTIFICATE', 'OTHER']).optional().default('OTHER'),
           title: z.string().optional().default('Verification Document'),
-          fileUrl: z.string(),
+          fileUrl: z.string().min(5, 'Document file is required'),
         })
       )
+      .max(MAX_ONBOARDING_DOCUMENTS, `You can attach up to ${MAX_ONBOARDING_DOCUMENTS} verification documents`)
       .optional(),
   }),
 });
@@ -261,39 +264,21 @@ export const createVendor = async (req: Request, res: Response, next: NextFuncti
     }
 
     // 1. Process partner image upload if provided (base64 or remote URL)
-    let uploadedPartnerImage: string | null = null;
-    if (partnerImage && (partnerImage.startsWith('data:') || partnerImage.startsWith('http'))) {
-      try {
-        uploadedPartnerImage = await uploadToCloudinary(partnerImage, 'servfex/avatars');
-      } catch (err) {
-        console.warn('[Partner] Partner photo upload warning, keeping original:', err);
-        uploadedPartnerImage = partnerImage;
-      }
-    }
+    const uploadedPartnerImage = await resolveHostedUrl(partnerImage, 'servfex/avatars');
 
     // 2. Process warehouse image upload if provided
-    let uploadedWarehouseImage: string | null = null;
-    if (warehouseImage && (warehouseImage.startsWith('data:') || warehouseImage.startsWith('http'))) {
-      try {
-        uploadedWarehouseImage = await uploadToCloudinary(warehouseImage, 'servfex/warehouses');
-      } catch (err) {
-        console.warn('[Partner] Warehouse image upload warning, keeping original:', err);
-        uploadedWarehouseImage = warehouseImage;
-      }
-    }
+    const uploadedWarehouseImage = await resolveHostedUrl(warehouseImage, 'servfex/warehouses');
 
-    // 3. Process documents upload if provided
+    // 3. Process documents one-by-one so a large set does not fail the whole onboard
     const processedDocuments: Array<{ title: string; type: DocumentType; fileUrl: string }> = [];
+    const failedDocuments: string[] = [];
     if (Array.isArray(documents) && documents.length > 0) {
       for (const doc of documents) {
         if (!doc.fileUrl) continue;
-        let uploadedUrl = doc.fileUrl;
-        if (doc.fileUrl.startsWith('data:') || doc.fileUrl.startsWith('http')) {
-          try {
-            uploadedUrl = await uploadToCloudinary(doc.fileUrl, 'servfex/documents');
-          } catch (docErr) {
-            console.warn('[Partner] Document upload warning:', docErr);
-          }
+        const uploadedUrl = await resolveHostedUrl(doc.fileUrl, 'servfex/documents');
+        if (!uploadedUrl) {
+          failedDocuments.push(doc.title?.trim() || 'Verification Document');
+          continue;
         }
         processedDocuments.push({
           title: doc.title?.trim() || 'Verification Document',
@@ -301,6 +286,20 @@ export const createVendor = async (req: Request, res: Response, next: NextFuncti
           fileUrl: uploadedUrl,
         });
       }
+    }
+
+    if (documents?.length > 0 && processedDocuments.length === 0) {
+      sendError(
+        res,
+        'DOCUMENT_UPLOAD_FAILED',
+        'None of the verification documents could be stored. Please attach them again and retry.',
+        400
+      );
+      return;
+    }
+
+    if (failedDocuments.length > 0) {
+      console.warn('[Partner] Skipped documents that failed to host:', failedDocuments);
     }
 
     // 4. If user already exists in Firebase, grab their UID; if password provided, provision Firebase account
@@ -478,7 +477,7 @@ export const createVendor = async (req: Request, res: Response, next: NextFuncti
       });
 
       return vendorProfile;
-    });
+    }, { maxWait: 15000, timeout: 30000 });
 
     // Send ServFex Provider Welcome Email with Hub location details and credentials
     sendProviderWelcomeEmail({
@@ -784,12 +783,18 @@ export const addVendorDocument = async (req: Request, res: Response, next: NextF
       return;
     }
 
+    const hostedUrl = await resolveHostedUrl(fileUrl, 'servfex/documents');
+    if (!hostedUrl) {
+      sendError(res, 'DOCUMENT_UPLOAD_FAILED', 'Could not store this document. Try a smaller file or a different format (PDF, PNG, JPG, WebP).', 400);
+      return;
+    }
+
     const document = await prisma.document.create({
       data: {
         userId: vendor.userId,
         type: type as DocumentType,
         title: title.trim(),
-        fileUrl,
+        fileUrl: hostedUrl,
         verificationStatus: (verificationStatus as KycStatus) || 'APPROVED',
         verifiedAt: verificationStatus === 'APPROVED' ? new Date() : null,
       },

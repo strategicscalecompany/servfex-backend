@@ -21,6 +21,7 @@ import {
   LocationViewerRole,
 } from '../services/dispatch.rules';
 import { generateStartOtp, isValidStartOtp, normalizeStartOtp, stripStartOtp } from '../utils/start-otp';
+import { resolveHostedUrl } from '../utils/cloudinary';
 
 // -------------------------------------------------------------
 // Validation Schemas
@@ -54,7 +55,7 @@ export const updateVendorProfileSchema = z.object({
 export const uploadDocumentSchema = z.object({
   type: z.enum(['GOVERNMENT_ID', 'TRADE_LICENSE', 'TAX_DOCUMENT', 'CERTIFICATE', 'OTHER']),
   title: z.string().min(2, 'Document title is required'),
-  fileUrl: z.string().url('Valid file URL is required'),
+  fileUrl: z.string().min(5, 'File URL or document data is required'),
 });
 
 export const vendorServiceSchema = z.object({
@@ -446,12 +447,18 @@ export const uploadVendorDocument = async (req: Request, res: Response): Promise
     const userId = req.user!.userId;
     const { type, title, fileUrl } = req.body;
 
+    const hostedUrl = await resolveHostedUrl(fileUrl, 'servfex/documents');
+    if (!hostedUrl) {
+      sendError(res, 'DOCUMENT_UPLOAD_FAILED', 'Could not store this document. Try a smaller file or a different format.', 400);
+      return;
+    }
+
     const document = await prisma.document.create({
       data: {
         userId,
         type: type as DocumentType,
         title,
-        fileUrl,
+        fileUrl: hostedUrl,
         verificationStatus: 'PENDING',
       },
     });
