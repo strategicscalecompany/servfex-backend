@@ -6,13 +6,27 @@ import { env } from './env';
  * When enabled (default during the current testing stage):
  *  - Sales Manager bookings stay PENDING for the Provider to assign
  *  - Sales Managers cannot accept/complete service jobs
- *  - Service Professionals use the original swipe-accept / swipe-complete flow
- *  - Completing a job always requires 4 hosted photographs (original SP rule)
+ *  - Service Professionals swipe-accept then swipe-complete with 4 photographs
+ *  - On-the-way / arrived / start-OTP is paused (SKIP_TRAVEL_AND_START_OTP)
  *
  * Restore fully original auto-dispatch for Sales Manager bookings by setting
  * EXPERT_TESTING_WORKFLOW_ENABLED=false. No original dispatch code is deleted.
  */
 export const MIN_COMPLETION_PHOTOS = 4;
+
+/**
+ * Temporary: skip on-the-way / arrived / start-OTP. Service Professionals
+ * swipe-accept, then swipe-complete with 4 photographs.
+ * Set to false to restore travel + OTP without deleting that code.
+ */
+export const SKIP_TRAVEL_AND_START_OTP = true;
+
+export const COMPLETABLE_JOB_STATUSES = [
+  'ACCEPTED',
+  'ON_THE_WAY',
+  'ARRIVED',
+  'IN_PROGRESS',
+] as const;
 
 export function isTestingWorkflowEnabled(): boolean {
   return env.EXPERT_TESTING_WORKFLOW_ENABLED === true;

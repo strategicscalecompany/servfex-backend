@@ -23,11 +23,13 @@ import {
 import { generateStartOtp, isValidStartOtp, normalizeStartOtp, stripStartOtp } from '../utils/start-otp';
 import { estimatePayloadBytes, MAX_DOCUMENT_BYTES, resolveHostedUrl } from '../utils/cloudinary';
 import {
+  COMPLETABLE_JOB_STATUSES,
   countValidCompletionPhotos,
   getTestingWorkflowSnapshot,
   hasRequiredCompletionPhotos,
   isTestingWorkflowEnabled,
   MIN_COMPLETION_PHOTOS,
+  SKIP_TRAVEL_AND_START_OTP,
   uniqueHostedImageUrls,
 } from '../config/testing-workflow';
 
@@ -1240,7 +1242,7 @@ export const uploadOrderCompletionPhotos = async (req: Request, res: Response): 
       sendError(res, 'NOT_FOUND', 'Order not found or not assigned to you', 404);
       return;
     }
-    if (!['IN_PROGRESS', 'ARRIVED'].includes(booking.status)) {
+    if (!(COMPLETABLE_JOB_STATUSES as readonly string[]).includes(booking.status)) {
       sendError(res, 'BAD_REQUEST', `Cannot upload completion photographs while the job is ${booking.status}`, 400);
       return;
     }
@@ -1328,14 +1330,20 @@ export const completeOrder = async (req: Request, res: Response): Promise<void> 
       return;
     }
 
-    if (booking.status !== 'IN_PROGRESS') {
-      sendError(res, 'BAD_REQUEST', `Cannot complete order in ${booking.status} status. Job must be IN_PROGRESS.`, 400);
+    if (!(COMPLETABLE_JOB_STATUSES as readonly string[]).includes(booking.status)) {
+      sendError(res, 'BAD_REQUEST', `Cannot complete order in ${booking.status} status.`, 400);
       return;
     }
 
-    if (!booking.qrVerifiedAt) {
-      sendError(res, 'BAD_REQUEST', 'Cannot complete order without verified start OTP', 400);
-      return;
+    if (!SKIP_TRAVEL_AND_START_OTP) {
+      if (booking.status !== 'IN_PROGRESS') {
+        sendError(res, 'BAD_REQUEST', `Cannot complete order in ${booking.status} status. Job must be IN_PROGRESS.`, 400);
+        return;
+      }
+      if (!booking.qrVerifiedAt) {
+        sendError(res, 'BAD_REQUEST', 'Cannot complete order without verified start OTP', 400);
+        return;
+      }
     }
 
     if (!hasRequiredCompletionPhotos(booking.completionPhotoUrls)) {
@@ -1367,8 +1375,14 @@ export const completeOrder = async (req: Request, res: Response): Promise<void> 
           },
         });
       }
-      if (current.status !== 'IN_PROGRESS') {
+      if (!(COMPLETABLE_JOB_STATUSES as readonly string[]).includes(current.status)) {
         throw Object.assign(new Error(`Cannot complete order in ${current.status} status.`), { code: 'BAD_REQUEST' });
+      }
+      if (!SKIP_TRAVEL_AND_START_OTP && current.status !== 'IN_PROGRESS') {
+        throw Object.assign(new Error(`Cannot complete order in ${current.status} status.`), { code: 'BAD_REQUEST' });
+      }
+      if (!SKIP_TRAVEL_AND_START_OTP && !current.qrVerifiedAt) {
+        throw Object.assign(new Error('Cannot complete order without verified start OTP'), { code: 'BAD_REQUEST' });
       }
       if (!hasRequiredCompletionPhotos(current.completionPhotoUrls)) {
         throw Object.assign(
@@ -1378,7 +1392,11 @@ export const completeOrder = async (req: Request, res: Response): Promise<void> 
       }
 
       const flipped = await tx.booking.updateMany({
-        where: { id, status: 'IN_PROGRESS', employeeId: user?.employeeProfile?.id || booking.employeeId },
+        where: {
+          id,
+          status: { in: [...COMPLETABLE_JOB_STATUSES] as BookingStatus[] },
+          employeeId: user?.employeeProfile?.id || booking.employeeId,
+        },
         data: {
           status: 'AWAITING_CUSTOMER_CONFIRMATION',
           completionRequestedAt: new Date(),
@@ -1391,7 +1409,7 @@ export const completeOrder = async (req: Request, res: Response): Promise<void> 
       await tx.bookingStatusHistory.create({
         data: {
           bookingId: id,
-          oldStatus: 'IN_PROGRESS',
+          oldStatus: current.status,
           newStatus: 'AWAITING_CUSTOMER_CONFIRMATION',
           changedBy: userId,
           changedByRole: (user?.role as any) || 'EMPLOYEE',
