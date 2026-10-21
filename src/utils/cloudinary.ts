@@ -157,4 +157,30 @@ export const resolveHostedUrl = async (
   return null;
 };
 
+export function createCloudinaryUploadSignature(folder: string): {
+  cloudName: string;
+  apiKey: string;
+  timestamp: number;
+  signature: string;
+  folder: string;
+} | null {
+  if (!isCloudinaryConfigured() || !env.CLOUDINARY_CLOUD_NAME || !env.CLOUDINARY_API_KEY || !env.CLOUDINARY_API_SECRET) {
+    return null;
+  }
+
+  const timestamp = Math.round(Date.now() / 1000);
+  const signature = cloudinary.utils.api_sign_request(
+    { timestamp, folder },
+    env.CLOUDINARY_API_SECRET
+  );
+
+  return {
+    cloudName: env.CLOUDINARY_CLOUD_NAME,
+    apiKey: env.CLOUDINARY_API_KEY,
+    timestamp,
+    signature,
+    folder,
+  };
+}
+
 export { cloudinary };

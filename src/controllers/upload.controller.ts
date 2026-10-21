@@ -1,11 +1,22 @@
 import { Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
-import { estimatePayloadBytes, MAX_DOCUMENT_BYTES, uploadToCloudinary } from '../utils/cloudinary';
+import {
+  createCloudinaryUploadSignature,
+  estimatePayloadBytes,
+  MAX_DOCUMENT_BYTES,
+  uploadToCloudinary,
+} from '../utils/cloudinary';
 import { sendSuccess, sendError } from '../utils/response';
 
 export const uploadImageSchema = z.object({
   body: z.object({
     image: z.string().min(1, 'Image data or URL is required'),
+    folder: z.string().optional().default('servfex/catalog'),
+  }),
+});
+
+export const signUploadSchema = z.object({
+  body: z.object({
     folder: z.string().optional().default('servfex/catalog'),
   }),
 });
@@ -24,6 +35,17 @@ const ALLOWED_UPLOAD_FOLDERS = new Set([
   'servfex/packages/steps',
   'servfex/packages/cards',
 ]);
+
+export const signCloudinaryUpload = async (req: Request, res: Response): Promise<void> => {
+  const folder = ALLOWED_UPLOAD_FOLDERS.has(req.body.folder) ? req.body.folder : 'servfex/catalog';
+  const signed = createCloudinaryUploadSignature(folder);
+  if (!signed) {
+    sendError(res, 'UPLOAD_NOT_CONFIGURED', 'Media hosting is not configured on the server.', 503);
+    return;
+  }
+
+  sendSuccess(res, signed);
+};
 
 export const uploadImage = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {

@@ -135,6 +135,8 @@ import {
 import {
   uploadImage,
   uploadImageSchema,
+  signCloudinaryUpload,
+  signUploadSchema,
 } from '../controllers/upload.controller';
 import {
   getSubCategories,
@@ -168,6 +170,7 @@ router.use(authenticate, requireSuperAdmin);
 // ==========================================
 router.get('/dashboard', getDashboardStats);
 router.get('/search', validate(globalSearchSchema), globalSearch);
+router.post('/upload/signature', validate(signUploadSchema), signCloudinaryUpload);
 router.post('/upload', validate(uploadImageSchema), uploadImage);
 
 // ==========================================
