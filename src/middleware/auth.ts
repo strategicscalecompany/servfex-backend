@@ -7,15 +7,11 @@ import { logger } from '../config/logger';
 import { verifyAccessToken } from '../utils/token';
 import { isAllowlistedSuperAdminEmail } from '../config/super-admins';
 
-const AUTH_USER_SELECT = {
+const AUTH_LOOKUP_SELECT = {
   id: true,
   email: true,
   role: true,
   status: true,
-} as const;
-
-const AUTH_LOOKUP_SELECT = {
-  ...AUTH_USER_SELECT,
   firebaseUid: true,
   deletedAt: true,
 } as const;
@@ -162,7 +158,7 @@ export const authenticate = async (
         user = await prisma.user.update({
           where: { id: emailMatch.id },
           data: { firebaseUid: decodedToken.uid, isVerified: true },
-          select: AUTH_USER_SELECT,
+          select: AUTH_LOOKUP_SELECT,
         });
         logger.info(
           { email: user.email, role: user.role, firebaseUid: decodedToken.uid },
@@ -180,7 +176,7 @@ export const authenticate = async (
           isVerified: true,
           firebaseUid: decodedToken.uid,
         },
-        select: AUTH_USER_SELECT,
+        select: AUTH_LOOKUP_SELECT,
       });
       logger.info({ email: user.email, firebaseUid: decodedToken.uid }, 'Promoted allowlisted email to SUPER_ADMIN');
     }
@@ -198,7 +194,7 @@ export const authenticate = async (
             status: 'ACTIVE',
             isVerified: true,
           },
-          select: AUTH_USER_SELECT,
+          select: AUTH_LOOKUP_SELECT,
         });
         logger.info({ userId: user.id, email: user.email }, 'Provisioned allowlisted Super Admin from Google login');
       } catch (createErr) {
@@ -215,7 +211,7 @@ export const authenticate = async (
                 status: 'ACTIVE',
                 isVerified: true,
               },
-              select: AUTH_USER_SELECT,
+              select: AUTH_LOOKUP_SELECT,
             });
           } else {
             throw createErr;
@@ -242,7 +238,7 @@ export const authenticate = async (
             isVerified: true,
             customerProfile: { create: {} },
           },
-          select: AUTH_USER_SELECT,
+          select: AUTH_LOOKUP_SELECT,
         });
         logger.info({ userId: user.id, email: user.email }, 'Auto-provisioned customer from verified Firebase token');
       } catch (createErr) {
@@ -254,7 +250,7 @@ export const authenticate = async (
             user = await prisma.user.update({
               where: { id: existing.id },
               data: { firebaseUid: decodedToken.uid, isVerified: true },
-              select: AUTH_USER_SELECT,
+              select: AUTH_LOOKUP_SELECT,
             });
           } else {
             throw createErr;
@@ -409,7 +405,7 @@ export const requireSuperAdmin = async (
               ? { role: 'SUPER_ADMIN', status: 'ACTIVE' }
               : {}),
           },
-          select: AUTH_USER_SELECT,
+          select: AUTH_LOOKUP_SELECT,
         });
       }
     }
@@ -427,7 +423,7 @@ export const requireSuperAdmin = async (
           isVerified: true,
           firebaseUid: decodedToken.uid,
         },
-        select: AUTH_USER_SELECT,
+        select: AUTH_LOOKUP_SELECT,
       });
     }
 
