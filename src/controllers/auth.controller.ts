@@ -79,20 +79,21 @@ export const login = async (
       return;
     }
 
-    // Verify password if hash exists, or initialize for seeded/default accounts
-    if (user.passwordHash) {
-      const isValid = await verifyPassword(password, user.passwordHash);
-      if (!isValid) {
-        sendError(res, 'INVALID_CREDENTIALS', 'Invalid email or password', 401);
-        return;
-      }
-    } else {
-      // Initialize password hash on first valid login for pre-seeded users
-      const hashedPassword = await hashPassword(password);
-      await prisma.user.update({
-        where: { id: user.id },
-        data: { passwordHash: hashedPassword },
-      });
+    // Explicitly reject password login if account has no password set (e.g. OAuth or Phone OTP accounts)
+    if (!user.passwordHash) {
+      sendError(
+        res,
+        'INVALID_CREDENTIALS',
+        'Invalid email or password. If you signed in with another method, please use that method or reset your password.',
+        401
+      );
+      return;
+    }
+
+    const isValid = await verifyPassword(password, user.passwordHash);
+    if (!isValid) {
+      sendError(res, 'INVALID_CREDENTIALS', 'Invalid email or password', 401);
+      return;
     }
 
     // Update lastLoginAt
