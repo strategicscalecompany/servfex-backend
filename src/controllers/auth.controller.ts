@@ -70,7 +70,7 @@ export const login = async (
     });
 
     if (!user) {
-      sendError(res, 'INVALID_CREDENTIALS', `Invalid email or password for ${role || 'this'} account`, 401);
+      sendError(res, 'INVALID_CREDENTIALS', 'Invalid email or password', 401);
       return;
     }
 
@@ -80,13 +80,9 @@ export const login = async (
     }
 
     // Explicitly reject password login if account has no password set (e.g. OAuth or Phone OTP accounts)
+    // Return standard generic error to prevent account enumeration.
     if (!user.passwordHash) {
-      sendError(
-        res,
-        'INVALID_CREDENTIALS',
-        'Invalid email or password. If you signed in with another method, please use that method or reset your password.',
-        401
-      );
+      sendError(res, 'INVALID_CREDENTIALS', 'Invalid email or password', 401);
       return;
     }
 
