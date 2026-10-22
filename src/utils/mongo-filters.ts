@@ -5,22 +5,29 @@
  */
 const UNSET_DELETED_AT = { isSet: false };
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== 'object') return false;
+  if (value instanceof Date || value instanceof RegExp || Array.isArray(value)) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
 function isNullEqualsFilter(value: unknown): boolean {
   if (value === null) return true;
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  const keys = Object.keys(value as Record<string, unknown>);
-  return keys.length === 1 && keys[0] === 'equals' && (value as { equals: unknown }).equals === null;
+  if (!isPlainObject(value)) return false;
+  const keys = Object.keys(value);
+  return keys.length === 1 && keys[0] === 'equals' && value.equals === null;
 }
 
 function rewriteDeletedAtFilter(node: unknown): unknown {
   if (Array.isArray(node)) {
     return node.map(rewriteDeletedAtFilter);
   }
-  if (!node || typeof node !== 'object') {
+  if (!isPlainObject(node)) {
     return node;
   }
 
-  const input = node as Record<string, unknown>;
+  const input = node;
   const output: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(input)) {
     if (key === 'deletedAt' && isNullEqualsFilter(value)) {
@@ -36,11 +43,11 @@ function rewriteWhereKeys(node: unknown): unknown {
   if (Array.isArray(node)) {
     return node.map(rewriteWhereKeys);
   }
-  if (!node || typeof node !== 'object') {
+  if (!isPlainObject(node)) {
     return node;
   }
 
-  const input = node as Record<string, unknown>;
+  const input = node;
   const output: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(input)) {
     if (key === 'where') {
@@ -53,7 +60,7 @@ function rewriteWhereKeys(node: unknown): unknown {
 }
 
 export function rewriteMongoNotDeletedArgs<T>(args: T): T {
-  if (!args || typeof args !== 'object') {
+  if (!isPlainObject(args)) {
     return args;
   }
   return rewriteWhereKeys(args) as T;

@@ -205,7 +205,7 @@ const ORDER_LIST_INCLUDE = {
       addressLine2: true,
       city: true,
       state: true,
-      pincode: true,
+      postalCode: true,
       landmark: true,
       latitude: true,
       longitude: true,
