@@ -1,32 +1,17 @@
 import { env } from './env';
 
 /**
- * Temporary Expert testing workflow.
+ * Expert workflow flags.
  *
- * When enabled (default during the current testing stage):
- *  - Sales Manager bookings stay PENDING for the Provider to assign
- *  - Sales Managers cannot accept/complete service jobs
- *  - Service Professionals swipe-accept then swipe-complete with 4 photographs
- *  - On-the-way / arrived / start-OTP is paused (SKIP_TRAVEL_AND_START_OTP)
+ * Job execution is the original Urban Company flow:
+ * accept → on the way → arrived → 4-digit start OTP → IN_PROGRESS → complete.
  *
- * Restore fully original auto-dispatch for Sales Manager bookings by setting
- * EXPERT_TESTING_WORKFLOW_ENABLED=false. No original dispatch code is deleted.
+ * EXPERT_TESTING_WORKFLOW_ENABLED only isolates Sales Manager auto-dispatch.
+ * Set it to false to restore original auto-dispatch for those bookings too.
  */
 export const MIN_COMPLETION_PHOTOS = 4;
 
-/**
- * Temporary: skip on-the-way / arrived / start-OTP. Service Professionals
- * swipe-accept, then swipe-complete with 4 photographs.
- * Set to false to restore travel + OTP without deleting that code.
- */
-export const SKIP_TRAVEL_AND_START_OTP = true;
-
-export const COMPLETABLE_JOB_STATUSES = [
-  'ACCEPTED',
-  'ON_THE_WAY',
-  'ARRIVED',
-  'IN_PROGRESS',
-] as const;
+export const COMPLETABLE_JOB_STATUSES = ['IN_PROGRESS'] as const;
 
 export function isTestingWorkflowEnabled(): boolean {
   return env.EXPERT_TESTING_WORKFLOW_ENABLED === true;

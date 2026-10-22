@@ -34,7 +34,7 @@ The original functions, worker, scheduler, and ranking rules stay in place.
 - `Booking.completionPhotoUrls`
 - `BookingSource.SALES_MANAGER`
 - Sales Manager portal (Visits + Bookings) in the vendor app
-- Service Professional completion requires **4 hosted photographs** plus the existing left-to-right swipe
+- Service Professional job flow is original: on the way → arrived → 4-digit start OTP → complete with **4 hosted photographs**
 - Provider assignment only to Service Professionals
 
 ## Restore original workflow

@@ -30,7 +30,6 @@ import {
   hasRequiredCompletionPhotos,
   isTestingWorkflowEnabled,
   MIN_COMPLETION_PHOTOS,
-  SKIP_TRAVEL_AND_START_OTP,
   uniqueHostedImageUrls,
 } from '../config/testing-workflow';
 
@@ -1307,15 +1306,13 @@ export const completeOrder = async (req: Request, res: Response): Promise<void> 
       return;
     }
 
-    if (!SKIP_TRAVEL_AND_START_OTP) {
-      if (booking.status !== 'IN_PROGRESS') {
-        sendError(res, 'BAD_REQUEST', `Cannot complete order in ${booking.status} status. Job must be IN_PROGRESS.`, 400);
-        return;
-      }
-      if (!booking.qrVerifiedAt) {
-        sendError(res, 'BAD_REQUEST', 'Cannot complete order without verified start OTP', 400);
-        return;
-      }
+    if (booking.status !== 'IN_PROGRESS') {
+      sendError(res, 'BAD_REQUEST', `Cannot complete order in ${booking.status} status. Job must be IN_PROGRESS.`, 400);
+      return;
+    }
+    if (!booking.qrVerifiedAt) {
+      sendError(res, 'BAD_REQUEST', 'Cannot complete order without verified start OTP', 400);
+      return;
     }
 
     if (!hasRequiredCompletionPhotos(booking.completionPhotoUrls)) {
@@ -1342,10 +1339,10 @@ export const completeOrder = async (req: Request, res: Response): Promise<void> 
         if (!(COMPLETABLE_JOB_STATUSES as readonly string[]).includes(current.status)) {
           throw Object.assign(new Error(`Cannot complete order in ${current.status} status.`), { code: 'BAD_REQUEST' });
         }
-        if (!SKIP_TRAVEL_AND_START_OTP && current.status !== 'IN_PROGRESS') {
+        if (current.status !== 'IN_PROGRESS') {
           throw Object.assign(new Error(`Cannot complete order in ${current.status} status.`), { code: 'BAD_REQUEST' });
         }
-        if (!SKIP_TRAVEL_AND_START_OTP && !current.qrVerifiedAt) {
+        if (!current.qrVerifiedAt) {
           throw Object.assign(new Error('Cannot complete order without verified start OTP'), { code: 'BAD_REQUEST' });
         }
         if (!hasRequiredCompletionPhotos(current.completionPhotoUrls)) {

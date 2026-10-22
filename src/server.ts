@@ -218,7 +218,7 @@ app.get('/health', (_req, res) => {
     status: 'ok',
     service: 'servfex-api',
     version: 'v1',
-    authBuild: 'super-admin-allowlist-v6',
+    authBuild: 'original-job-flow-v7',
     database: 'mongodb',
   });
 });
