@@ -1,8 +1,17 @@
 import { Router, Request, Response } from 'express';
 import { env } from '../config/env';
 import { logger } from '../config/logger';
+import { authenticate } from '../middleware/auth';
 
 const router = Router();
+
+// Protect all Geo endpoints from unauthenticated access (Finding F-08)
+router.use(authenticate);
+
+// Configurable bounded timeout for all outgoing geo queries (Google Maps & OSM)
+const GEO_FETCH_TIMEOUT_MS = 5000;
+const MAX_REDIRECT_HOPS = 3;
+const MAX_BODY_BYTES = 65536; // 64 KB max body reading for meta tag inspection
 
 // In-memory bounded cache for high-frequency geocoding queries
 interface GeoCacheEntry {
@@ -30,12 +39,121 @@ const setCachedGeo = (key: string, data: any, ttlMs = GEO_CACHE_TTL_MS): void =>
   geoCache.set(key, { data, expiresAt: Date.now() + ttlMs });
 };
 
+// Exact allowlist for Google Maps domains (SSRF prevention)
+const ALLOWED_GOOGLE_MAPS_HOSTS = new Set([
+  'maps.google.com',
+  'maps.app.goo.gl',
+  'goo.gl',
+  'www.google.com',
+  'google.com',
+  'www.google.co.in',
+  'google.co.in',
+  'maps.google.co.in',
+]);
+
+/**
+ * Validates that an incoming URL strictly targets legitimate Google Maps domains.
+ * Rejects private IPs, loopback, non-HTTPS protocols, embedded credentials, and arbitrary ports.
+ */
+function validateGoogleMapsUrl(rawUrl: string): { valid: boolean; error?: string; url?: URL } {
+  try {
+    const parsed = new URL(rawUrl);
+
+    // 1. Require strictly HTTPS
+    if (parsed.protocol !== 'https:') {
+      return { valid: false, error: 'Only HTTPS Google Maps URLs are permitted' };
+    }
+
+    // 2. Reject credentials in URL (user:pass@...)
+    if (parsed.username || parsed.password) {
+      return { valid: false, error: 'Embedded credentials are not permitted in URLs' };
+    }
+
+    // 3. Reject non-standard ports
+    if (parsed.port && parsed.port !== '443') {
+      return { valid: false, error: 'Non-standard ports are not permitted' };
+    }
+
+    // Normalize hostname: lowercase and strip trailing dots
+    const host = parsed.hostname.toLowerCase().replace(/\.+$/, '');
+
+    // 4. Reject IP addresses (IPv4, decimal/hex/octal representations, IPv6), localhost, and link-local destinations
+    if (
+      host === 'localhost' ||
+      /^(\d{1,3}\.){3}\d{1,3}$/.test(host) ||
+      host.startsWith('[') ||
+      host.endsWith(']') ||
+      host.includes(':') ||
+      /^\d+$/.test(host) ||
+      /^0x[0-9a-f]+$/i.test(host)
+    ) {
+      return { valid: false, error: 'IP addresses and localhost are not permitted' };
+    }
+
+    // 5. Hostname must match the exact allowlist
+    if (!ALLOWED_GOOGLE_MAPS_HOSTS.has(host)) {
+      return { valid: false, error: 'Domain is not an approved Google Maps host' };
+    }
+
+    // 6. For broad Google domains, pathname must begin with /maps, /search, or /place
+    if (
+      (host === 'google.com' || host === 'www.google.com' || host === 'google.co.in' || host === 'www.google.co.in') &&
+      !parsed.pathname.startsWith('/maps') &&
+      !parsed.pathname.startsWith('/search') &&
+      !parsed.pathname.startsWith('/place')
+    ) {
+      return { valid: false, error: 'Google URL path must point to maps, search, or place' };
+    }
+
+    // 7. For goo.gl, path should point to /maps (unless maps.app.goo.gl)
+    if (host === 'goo.gl' && !parsed.pathname.startsWith('/maps')) {
+      return { valid: false, error: 'goo.gl link must point to /maps' };
+    }
+
+    return { valid: true, url: parsed };
+  } catch {
+    return { valid: false, error: 'Malformed URL' };
+  }
+}
+
+/**
+ * Safely reads at most maxBytes from a response body stream.
+ * Cancels the reader immediately if maxBytes is reached to prevent memory exhaustion or hanging streams.
+ */
+async function readBoundedText(res: any, maxBytes: number = MAX_BODY_BYTES): Promise<string> {
+  if (!res.body) return '';
+  if (typeof res.body.getReader === 'function') {
+    const reader = res.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let totalBytes = 0;
+    try {
+      while (totalBytes < maxBytes) {
+        const { done, value } = await reader.read();
+        if (done || !value) break;
+        const take = Math.min(value.byteLength, maxBytes - totalBytes);
+        chunks.push(value.subarray(0, take));
+        totalBytes += take;
+        if (totalBytes >= maxBytes) {
+          await reader.cancel().catch(() => {});
+          break;
+        }
+      }
+    } catch (err) {
+      await reader.cancel().catch(() => {});
+      throw err;
+    }
+    return Buffer.concat(chunks).toString('utf8');
+  }
+  const text = await res.text();
+  return text.slice(0, maxBytes);
+}
+
 /**
  * GET /api/v1/geo/geocode
  * Search locations using Google Maps Geocoding API (with fallback format)
  */
 router.get('/geocode', async (req: Request, res: Response): Promise<void> => {
-  const query = req.query.query as string || req.query.address as string;
+  const query = (req.query.query as string) || (req.query.address as string);
   if (!query || !query.trim()) {
     res.status(400).json({ success: false, error: { code: 'INVALID_QUERY', message: 'Address query is required' } });
     return;
@@ -58,7 +176,9 @@ router.get('/geocode', async (req: Request, res: Response): Promise<void> => {
 
   try {
     const url = `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(query.trim())}&region=in&key=${apiKey}`;
-    const response = await fetch(url);
+    const response = await fetch(url, {
+      signal: AbortSignal.timeout(GEO_FETCH_TIMEOUT_MS),
+    });
     const data = await response.json();
 
     if (data.status === 'OK' && data.results) {
@@ -78,8 +198,12 @@ router.get('/geocode', async (req: Request, res: Response): Promise<void> => {
 
     res.status(200).json({ success: true, data: [], status: data.status, message: data.error_message });
   } catch (err: any) {
+    if (err?.name === 'TimeoutError' || err?.name === 'AbortError') {
+      res.status(504).json({ success: false, error: { code: 'UPSTREAM_TIMEOUT', message: 'Geocoding service timed out' } });
+      return;
+    }
     logger.error({ err }, 'Google Maps Geocode proxy error');
-    res.status(500).json({ success: false, error: { code: 'GEOCODE_ERROR', message: err.message || 'Geocoding failed' } });
+    res.status(500).json({ success: false, error: { code: 'GEOCODE_ERROR', message: 'Geocoding failed' } });
   }
 });
 
@@ -120,7 +244,9 @@ router.get('/reverse', async (req: Request, res: Response): Promise<void> => {
 
   try {
     const url = `https://maps.googleapis.com/maps/api/geocode/json?latlng=${latNum},${lngNum}&key=${apiKey}`;
-    const response = await fetch(url);
+    const response = await fetch(url, {
+      signal: AbortSignal.timeout(GEO_FETCH_TIMEOUT_MS),
+    });
     const data = await response.json();
 
     if (data.status === 'OK' && data.results && data.results.length > 0) {
@@ -144,8 +270,12 @@ router.get('/reverse', async (req: Request, res: Response): Promise<void> => {
 
     res.status(200).json({ success: true, data: null, status: data.status, message: data.error_message });
   } catch (err: any) {
+    if (err?.name === 'TimeoutError' || err?.name === 'AbortError') {
+      res.status(504).json({ success: false, error: { code: 'UPSTREAM_TIMEOUT', message: 'Geocoding service timed out' } });
+      return;
+    }
     logger.error({ err }, 'Google Maps Reverse Geocode proxy error');
-    res.status(500).json({ success: false, error: { code: 'REVERSE_GEOCODE_ERROR', message: err.message || 'Reverse geocoding failed' } });
+    res.status(500).json({ success: false, error: { code: 'REVERSE_GEOCODE_ERROR', message: 'Reverse geocoding failed' } });
   }
 });
 
@@ -154,13 +284,17 @@ router.get('/reverse', async (req: Request, res: Response): Promise<void> => {
  * Resolves any Google Maps URL (short links, place links, coordinate links) to exact lat, lng, and formatted address
  */
 router.post('/resolve-maps-url', async (req: Request, res: Response): Promise<void> => {
-  const rawInput = req.body.url;
+  const rawInput = req.body?.url;
   if (!rawInput || typeof rawInput !== 'string' || !rawInput.trim()) {
     res.status(400).json({ success: false, error: { code: 'INVALID_URL', message: 'Google Maps location URL or coordinates are required' } });
     return;
   }
 
   const cleanInput = rawInput.trim();
+
+  // Create an overall request deadline controller to strictly bound total execution across redirects and geocoding
+  const overallController = new AbortController();
+  const overallTimer = setTimeout(() => overallController.abort(), GEO_FETCH_TIMEOUT_MS);
 
   try {
     let lat: number | null = null;
@@ -177,40 +311,93 @@ router.post('/resolve-maps-url', async (req: Request, res: Response): Promise<vo
 
     if (lat === null || lng === null) {
       const urlMatch = cleanInput.match(/https?:\/\/[^\s"'<>]+/i);
-      const targetUrl = urlMatch ? urlMatch[0] : cleanInput;
-      resolvedUrl = targetUrl;
+      if (!urlMatch) {
+        res.status(400).json({
+          success: false,
+          error: { code: 'INVALID_URL', message: 'A valid Google Maps HTTPS URL or coordinate pair is required' },
+        });
+        return;
+      }
+
+      const initialUrl = urlMatch[0];
+      const initialValidation = validateGoogleMapsUrl(initialUrl);
+      if (!initialValidation.valid) {
+        res.status(400).json({
+          success: false,
+          error: { code: 'INVALID_URL', message: initialValidation.error || 'Disallowed destination URL' },
+        });
+        return;
+      }
+
+      resolvedUrl = initialUrl;
       let htmlBody = '';
+      let currentHopUrl = initialUrl;
+      const visitedHops = new Set<string>();
+      let hops = 0;
 
-      // Follow redirect if short link (e.g. maps.app.goo.gl or goo.gl/maps)
-      if (targetUrl.includes('goo.gl') || targetUrl.includes('maps.app.goo.gl')) {
-        try {
-          // Check manual redirect first to get clean Location header
-          const manualResp = await fetch(targetUrl, {
-            method: 'GET',
-            redirect: 'manual',
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            },
-          });
-          const locationHeader = manualResp.headers.get('location');
-          if (locationHeader) {
-            resolvedUrl = locationHeader;
-          }
+      // Follow redirect manually only for approved short link domains (maps.app.goo.gl or goo.gl)
+      const isShortLink =
+        initialValidation.url?.hostname.toLowerCase().replace(/\.+$/, '') === 'maps.app.goo.gl' ||
+        initialValidation.url?.hostname.toLowerCase().replace(/\.+$/, '') === 'goo.gl';
 
-          // Follow redirect all the way
-          const headResp = await fetch(targetUrl, {
-            method: 'GET',
-            redirect: 'follow',
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            },
-          });
-          if (headResp.url) {
-            resolvedUrl = headResp.url;
+      if (isShortLink) {
+        while (hops < MAX_REDIRECT_HOPS) {
+          visitedHops.add(currentHopUrl);
+          hops++;
+
+          try {
+            const hopResp = await fetch(currentHopUrl, {
+              method: 'GET',
+              redirect: 'manual',
+              headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+              },
+              signal: overallController.signal,
+            });
+
+            if (hopResp.status >= 300 && hopResp.status < 400) {
+              const loc = hopResp.headers.get('location');
+              if (!loc) break;
+
+              let nextUrlStr: string;
+              try {
+                nextUrlStr = new URL(loc, currentHopUrl).toString();
+              } catch {
+                res.status(400).json({ success: false, error: { code: 'INVALID_URL', message: 'Redirect location header is malformed' } });
+                return;
+              }
+
+              const nextValidation = validateGoogleMapsUrl(nextUrlStr);
+              if (!nextValidation.valid) {
+                res.status(400).json({
+                  success: false,
+                  error: { code: 'INVALID_URL', message: `Disallowed redirect destination: ${nextValidation.error}` },
+                });
+                return;
+              }
+
+              if (visitedHops.has(nextUrlStr)) {
+                res.status(400).json({ success: false, error: { code: 'INVALID_URL', message: 'Redirect loop detected' } });
+                return;
+              }
+
+              currentHopUrl = nextUrlStr;
+              resolvedUrl = nextUrlStr;
+            } else if (hopResp.status === 200) {
+              // Bounded body read (max 64KB) to prevent memory exhaustion DoS
+              htmlBody = await readBoundedText(hopResp, MAX_BODY_BYTES);
+              break;
+            } else {
+              break;
+            }
+          } catch (redirectErr: any) {
+            if (redirectErr?.name === 'TimeoutError' || redirectErr?.name === 'AbortError' || overallController.signal.aborted) {
+              res.status(504).json({ success: false, error: { code: 'UPSTREAM_TIMEOUT', message: 'Short link resolution timed out' } });
+              return;
+            }
+            logger.warn({ redirectErr }, 'Failed to follow short link redirect');
+            break;
           }
-          htmlBody = await headResp.text();
-        } catch (redirectErr) {
-          logger.warn({ redirectErr }, 'Failed to follow short link redirect');
         }
       }
 
@@ -219,8 +406,8 @@ router.post('/resolve-maps-url', async (req: Request, res: Response): Promise<vo
         resolvedUrl,
         decodeURIComponent(resolvedUrl),
         decodeURIComponent(resolvedUrl.replace(/\+/g, ' ')),
-        targetUrl,
-        decodeURIComponent(targetUrl),
+        initialUrl,
+        decodeURIComponent(initialUrl),
       ];
 
       for (const u of urlsToTest) {
@@ -291,19 +478,25 @@ router.post('/resolve-maps-url', async (req: Request, res: Response): Promise<vo
         }
       }
 
-      // If coordinates still not found and placeName is known, geocode the placeName
+      // If coordinates still not found and placeName is known, geocode the placeName with timeout
       if ((lat === null || lng === null) && placeName) {
         const apiKey = env.GOOGLE_MAPS_API_KEY;
         if (apiKey) {
           try {
             const geoUrl = `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(placeName)}&region=in&key=${apiKey}`;
-            const geoResp = await fetch(geoUrl);
+            const geoResp = await fetch(geoUrl, {
+              signal: overallController.signal,
+            });
             const geoData = await geoResp.json();
             if (geoData.status === 'OK' && geoData.results?.[0]) {
               lat = geoData.results[0].geometry.location.lat;
               lng = geoData.results[0].geometry.location.lng;
             }
-          } catch (geoErr) {
+          } catch (geoErr: any) {
+            if (geoErr?.name === 'TimeoutError' || geoErr?.name === 'AbortError' || overallController.signal.aborted) {
+              res.status(504).json({ success: false, error: { code: 'UPSTREAM_TIMEOUT', message: 'Geocoding service timed out' } });
+              return;
+            }
             logger.warn({ geoErr }, 'Geocode place name failed');
           }
         }
@@ -327,7 +520,9 @@ router.post('/resolve-maps-url', async (req: Request, res: Response): Promise<vo
     if (apiKey) {
       try {
         const revUrl = `https://maps.googleapis.com/maps/api/geocode/json?latlng=${lat},${lng}&key=${apiKey}`;
-        const revResp = await fetch(revUrl);
+        const revResp = await fetch(revUrl, {
+          signal: overallController.signal,
+        });
         const revData = await revResp.json();
         if (revData.status === 'OK' && revData.results?.[0]) {
           formattedAddress = revData.results[0].formatted_address;
@@ -343,18 +538,29 @@ router.post('/resolve-maps-url', async (req: Request, res: Response): Promise<vo
             }
           }
         }
-      } catch (revErr) {
+      } catch (revErr: any) {
+        if (revErr?.name === 'TimeoutError' || revErr?.name === 'AbortError' || overallController.signal.aborted) {
+          res.status(504).json({ success: false, error: { code: 'UPSTREAM_TIMEOUT', message: 'Geocoding service timed out' } });
+          return;
+        }
         logger.warn({ revErr }, 'Reverse geocode failed');
       }
     } else {
       try {
         const nomRevUrl = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json`;
-        const nomRevResp = await fetch(nomRevUrl, { headers: { 'User-Agent': 'ServFex-Platform/1.0' } });
+        const nomRevResp = await fetch(nomRevUrl, {
+          headers: { 'User-Agent': 'ServFex-Platform/1.0' },
+          signal: overallController.signal,
+        });
         const nomRevData = await nomRevResp.json();
         if (nomRevData?.display_name) {
           formattedAddress = nomRevData.display_name;
         }
-      } catch (nomErr) {
+      } catch (nomErr: any) {
+        if (nomErr?.name === 'TimeoutError' || nomErr?.name === 'AbortError' || overallController.signal.aborted) {
+          res.status(504).json({ success: false, error: { code: 'UPSTREAM_TIMEOUT', message: 'Geocoding service timed out' } });
+          return;
+        }
         logger.warn({ nomErr }, 'Nominatim reverse geocode failed');
       }
     }
@@ -370,11 +576,17 @@ router.post('/resolve-maps-url', async (req: Request, res: Response): Promise<vo
       },
     });
   } catch (err: any) {
+    if (err?.name === 'TimeoutError' || err?.name === 'AbortError' || overallController.signal.aborted) {
+      res.status(504).json({ success: false, error: { code: 'UPSTREAM_TIMEOUT', message: 'Geocoding service timed out' } });
+      return;
+    }
     logger.error({ err }, 'Failed to resolve Google Maps URL');
     res.status(500).json({
       success: false,
-      error: { code: 'RESOLVE_ERROR', message: err.message || 'Failed to resolve Google Maps URL' },
+      error: { code: 'RESOLVE_ERROR', message: 'Failed to resolve Google Maps URL' },
     });
+  } finally {
+    clearTimeout(overallTimer);
   }
 });
 
