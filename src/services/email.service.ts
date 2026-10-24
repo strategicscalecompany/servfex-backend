@@ -30,8 +30,8 @@ function getTransporter(): Transporter {
 export async function sendOtpEmail(toEmail: string, otp: string): Promise<boolean> {
   const smtpPass = env.SMTP_PASS || env.SMTP_PASSWORD;
 
-  // Always log OTP in server logs for seamless verification & debugging
-  logger.info({ to: toEmail, otp }, 'ServFex Mail OTP Generated');
+  // Safe structured log without exposing the plaintext OTP
+  logger.info({ to: toEmail, otpLength: otp.length }, 'ServFex Mail OTP Generated');
 
   // If password is not yet configured, provide development fallback
   if (!smtpPass || smtpPass === 'YOUR_HOSTINGER_EMAIL_PASSWORD') {
