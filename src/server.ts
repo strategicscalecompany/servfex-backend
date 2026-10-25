@@ -34,10 +34,10 @@ import { startDispatchWorker, stopDispatchWorker } from './services/dispatch.wor
 const app = express();
 const server = http.createServer(app);
 
-// Trust the first hop from AWS/Nginx reverse proxy.
+// Trust reverse proxy hops originating strictly from loopback addresses (127.0.0.1, ::1).
 // Required for express-rate-limit to correctly read X-Forwarded-For without throwing
-// ERR_ERL_UNEXPECTED_X_FORWARDED_FOR which crashes the request pipeline before CORS headers are sent.
-app.set('trust proxy', 1);
+// ERR_ERL_UNEXPECTED_X_FORWARDED_FOR, while preventing non-loopback direct connections from spoofing client IPs.
+app.set('trust proxy', 'loopback');
 
 // Serve Socket.IO under /api/socket.io so nginx configs that only reverse-proxy /api still work.
 export const io = new SocketIOServer(server, {
@@ -250,8 +250,8 @@ app.use((_req, res) => {
 app.use(errorHandler);
 
 // Start HTTP Server
-server.listen(env.PORT, '0.0.0.0', async () => {
-  logger.info(`ServFex Super Admin API listening on port ${env.PORT} on 0.0.0.0 in ${env.NODE_ENV} mode`);
+server.listen(env.PORT, env.HOST, async () => {
+  logger.info(`ServFex Super Admin API listening on port ${env.PORT} on ${env.HOST} in ${env.NODE_ENV} mode`);
   try {
     await prisma.$connect();
     await ensureMongoSparseUniqueIndexes();
