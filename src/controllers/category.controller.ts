@@ -73,13 +73,18 @@ export const createCategory = async (req: Request, res: Response, next: NextFunc
   try {
     const { name, slug, iconUrl, description, displayOrder, isActive } = req.body;
 
-    const existing = await prisma.serviceCategory.findUnique({
-      where: { slug: slug.toLowerCase() },
+    let finalSlug = slug.toLowerCase();
+    let existing = await prisma.serviceCategory.findUnique({
+      where: { slug: finalSlug },
     });
 
-    if (existing) {
-      sendError(res, 'SLUG_EXISTS', 'A category with this slug already exists', 409);
-      return;
+    let counter = 1;
+    while (existing) {
+      finalSlug = `${slug.toLowerCase()}-${counter}`;
+      existing = await prisma.serviceCategory.findUnique({
+        where: { slug: finalSlug },
+      });
+      counter++;
     }
 
     // Upload PNG icon to Cloudinary
@@ -96,7 +101,7 @@ export const createCategory = async (req: Request, res: Response, next: NextFunc
       const cat = await tx.serviceCategory.create({
         data: {
           name,
-          slug: slug.toLowerCase(),
+          slug: finalSlug,
           iconUrl: uploadedIconUrl,
           description: description || null,
           displayOrder: displayOrder || 0,
