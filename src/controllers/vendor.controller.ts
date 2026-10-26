@@ -142,18 +142,120 @@ export const getVendors = async (req: Request, res: Response, next: NextFunction
               createdAt: true,
             },
           },
+          employees: {
+            include: {
+              user: {
+                select: {
+                  id: true,
+                  name: true,
+                  email: true,
+                  phone: true,
+                  status: true,
+                  profilePhotoUrl: true,
+                },
+              },
+            },
+          },
+          vendorServices: {
+            include: {
+              service: {
+                select: {
+                  id: true,
+                  name: true,
+                  startingPrice: true,
+                  category: {
+                    select: {
+                      id: true,
+                      name: true,
+                    },
+                  },
+                },
+              },
+            },
+          },
           _count: {
             select: {
               employees: true,
               vendorServices: true,
               bookings: true,
+              reviews: true,
             },
           },
         },
       }),
     ]);
 
-    sendSuccess(res, vendors, 200, {
+    // Calculate real booking and revenue statistics for each vendor
+    const vendorIds = vendors.map((v) => v.id);
+    const todayStr = new Date().toISOString().split('T')[0];
+
+    const vendorBookings = vendorIds.length > 0
+      ? await prisma.booking.findMany({
+          where: {
+            vendorId: { in: vendorIds },
+          },
+          select: {
+            id: true,
+            vendorId: true,
+            status: true,
+            totalAmount: true,
+            scheduledDate: true,
+            createdAt: true,
+          },
+        })
+      : [];
+
+    const statsByVendor: Record<
+      string,
+      { todayRevenue: number; todayJobsCount: number; lifetimeRevenue: number; totalJobs: number }
+    > = {};
+
+    for (const b of vendorBookings) {
+      if (!b.vendorId) continue;
+      if (!statsByVendor[b.vendorId]) {
+        statsByVendor[b.vendorId] = {
+          todayRevenue: 0,
+          todayJobsCount: 0,
+          lifetimeRevenue: 0,
+          totalJobs: 0,
+        };
+      }
+      const st = statsByVendor[b.vendorId];
+      const amount = parseFloat(b.totalAmount) || 0;
+      const isCompleted = b.status === 'COMPLETED';
+      const isToday =
+        b.scheduledDate === todayStr ||
+        (b.createdAt && b.createdAt.toISOString().split('T')[0] === todayStr);
+
+      if (isCompleted) {
+        st.lifetimeRevenue += amount;
+        st.totalJobs += 1;
+        if (isToday) {
+          st.todayRevenue += amount;
+          st.todayJobsCount += 1;
+        }
+      } else if (isToday) {
+        st.todayJobsCount += 1;
+      }
+    }
+
+    const enrichedVendors = vendors.map((v) => {
+      const st = statsByVendor[v.id] || {
+        todayRevenue: 0,
+        todayJobsCount: 0,
+        lifetimeRevenue: 0,
+        totalJobs: 0,
+      };
+      return {
+        ...v,
+        todayRevenue: st.todayRevenue,
+        todayJobsCount: st.todayJobsCount,
+        lifetimeRevenue: st.lifetimeRevenue,
+        totalCompletedJobs: st.totalJobs,
+      };
+    });
+
+    sendSuccess(res, enrichedVendors, 200, {
       page,
       limit,
       total,
