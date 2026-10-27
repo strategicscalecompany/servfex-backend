@@ -3,10 +3,12 @@ import { z } from 'zod';
 import { prisma } from '../config/prisma';
 import { sendError, sendSuccess } from '../utils/response';
 import { logAuditEvent } from '../utils/audit';
+import { uploadToCloudinary } from '../utils/cloudinary';
 
 export const createSubCategorySchema = z.object({
   body: z.object({
     name: z.string().min(2, 'Name must be at least 2 characters'),
+    iconUrl: z.string().optional(),
     displayOrder: z.number().int().optional().default(0),
     isActive: z.boolean().optional().default(true),
   }),
@@ -16,6 +18,7 @@ export const updateSubCategorySchema = z.object({
   params: z.object({ id: z.string().uuid() }),
   body: z.object({
     name: z.string().min(2).optional(),
+    iconUrl: z.string().optional().nullable(),
     displayOrder: z.number().int().optional(),
     isActive: z.boolean().optional(),
     reason: z.string().optional(),
@@ -72,7 +75,7 @@ export const getSubCategories = async (req: Request, res: Response, next: NextFu
 export const createSubCategory = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const categoryId = req.params.categoryId as string;
-    const { name, displayOrder, isActive } = req.body;
+    const { name, iconUrl, displayOrder, isActive } = req.body;
 
     const category = await prisma.serviceCategory.findUnique({
       where: { id: categoryId, deletedAt: null },
@@ -82,11 +85,22 @@ export const createSubCategory = async (req: Request, res: Response, next: NextF
       return;
     }
 
+    // Upload icon to Cloudinary if base64 or URL provided
+    let finalIconUrl: string | null = iconUrl || null;
+    if (iconUrl && (iconUrl.startsWith('data:') || iconUrl.startsWith('http'))) {
+      try {
+        finalIconUrl = await uploadToCloudinary(iconUrl, 'servfex/sub-categories');
+      } catch (uploadErr) {
+        console.error('[SubCategory] Cloudinary upload warning:', uploadErr);
+      }
+    }
+
     const subCategory = await prisma.$transaction(async (tx) => {
       const sc = await tx.serviceSubCategory.create({
         data: {
           categoryId,
           name: name.trim(),
+          iconUrl: finalIconUrl,
           displayOrder: displayOrder ?? 0,
           isActive: isActive !== undefined ? isActive : true,
         },
@@ -119,7 +133,7 @@ export const createSubCategory = async (req: Request, res: Response, next: NextF
 export const updateSubCategory = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const id = req.params.id as string;
-    const { name, displayOrder, isActive, reason } = req.body;
+    const { name, iconUrl, displayOrder, isActive, reason } = req.body;
 
     const existing = await prisma.serviceSubCategory.findUnique({ where: { id } });
     if (!existing) {
@@ -127,11 +141,29 @@ export const updateSubCategory = async (req: Request, res: Response, next: NextF
       return;
     }
 
+    // Upload icon to Cloudinary if base64 provided
+    let finalIconUrl: string | null | undefined = undefined;
+    if (iconUrl !== undefined) {
+      if (iconUrl === null) {
+        finalIconUrl = null;
+      } else if (iconUrl.startsWith('data:') || iconUrl.startsWith('http')) {
+        try {
+          finalIconUrl = await uploadToCloudinary(iconUrl, 'servfex/sub-categories');
+        } catch (uploadErr) {
+          console.error('[SubCategory] Cloudinary upload warning:', uploadErr);
+          finalIconUrl = iconUrl;
+        }
+      } else {
+        finalIconUrl = iconUrl;
+      }
+    }
+
     const updated = await prisma.$transaction(async (tx) => {
       const sc = await tx.serviceSubCategory.update({
         where: { id },
         data: {
           ...(name !== undefined ? { name: name.trim() } : {}),
+          ...(finalIconUrl !== undefined ? { iconUrl: finalIconUrl } : {}),
           ...(displayOrder !== undefined ? { displayOrder } : {}),
           ...(isActive !== undefined ? { isActive } : {}),
         },

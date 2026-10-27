@@ -330,6 +330,7 @@ model ServiceSubCategory {
   categoryId   String
   category     ServiceCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
   name         String
+  iconUrl      String?         // Cloudinary icon/logo URL
   displayOrder Int             @default(0)
   isActive     Boolean         @default(true)
   createdAt    DateTime        @default(now())
