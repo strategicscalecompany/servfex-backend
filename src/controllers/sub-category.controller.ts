@@ -57,7 +57,7 @@ export const getSubCategories = async (req: Request, res: Response, next: NextFu
     }
 
     const subCategories = await prisma.serviceSubCategory.findMany({
-      where: { categoryId, isActive: true },
+      where: { categoryId },
       orderBy: { displayOrder: 'asc' },
       include: {
         _count: {
