@@ -11,7 +11,7 @@ import { toMoney, toMoneyOrNull } from '../utils/money';
 export const listServicesQuerySchema = z.object({
   query: z.object({
     page: z.string().optional().default('1').transform((v) => Math.max(1, parseInt(v, 10))),
-    limit: z.string().optional().default('20').transform((v) => Math.min(100, Math.max(1, parseInt(v, 10)))),
+    limit: z.string().optional().default('50').transform((v) => Math.min(500, Math.max(1, parseInt(v, 10)))),
     categoryId: z.string().optional(),
     search: z.string().optional(),
     isActive: z.string().optional().transform((v) => (v === 'true' ? true : v === 'false' ? false : undefined)),
