@@ -155,6 +155,8 @@ import {
   updatePackage,
   reorderPackages,
   deletePackage,
+  createSubCategoryPackage,
+  getSubCategoryPackages,
   createPackageSchema,
   updatePackageSchema,
   reorderPackagesSchema,
@@ -248,6 +250,8 @@ router.delete('/services/:id', softDeleteService);
 // ==========================================
 router.get('/services/:serviceId/packages', getPackages);
 router.post('/services/:serviceId/packages', validate(createPackageSchema), createPackage);
+router.get('/sub-categories/:subCategoryId/packages', getSubCategoryPackages);
+router.post('/sub-categories/:subCategoryId/packages', validate(createPackageSchema), createSubCategoryPackage);
 router.patch('/packages/reorder', validate(reorderPackagesSchema), reorderPackages);
 router.get('/packages/:id', getPackageById);
 router.patch('/packages/:id', validate(updatePackageSchema), updatePackage);

@@ -34,6 +34,7 @@ export const createPackageSchema = z.object({
     name: z.string().min(2),
     shortDescription: z.string().optional(),
     badgeText: z.string().optional(),
+    sectionTitle: z.string().optional().nullable(),
 
     // Pricing
     originalPrice: z.number().min(0),
@@ -43,16 +44,25 @@ export const createPackageSchema = z.object({
     duration: z.string().optional().default('60 mins'),
 
     // Media
-    cardImage: z.string().optional(),
+    cardImage: z.string().optional().nullable(),
     detailBannerImages: z.array(z.string()).max(4).optional().default([]),
+    detailBannerVideo: z.string().optional().nullable(),
+    offersBanner: z.string().optional().nullable(),
 
-    // Detail content
+    // Detail content & titles
+    highlightsTitle: z.string().optional().default('Highlights'),
     highlights: z.array(z.string()).optional().default([]),
+    processTitle: z.string().optional().default('Our Process'),
     processSteps: z.array(processStepSchema).optional().default([]),
+    whatsIncludedTitle: z.string().optional().default("What's Included"),
     whatsIncluded: z.array(z.string()).optional().default([]),
+    requirementsTitle: z.string().optional().default('What We Need From You'),
     requirements: z.array(requirementSchema).optional().default([]),
+    pleaseNoteTitle: z.string().optional().default('Please Note'),
     pleaseNote: z.array(z.string()).optional().default([]),
+    faqsTitle: z.string().optional().default('Frequently Asked Questions'),
     faqs: z.array(faqSchema).optional().default([]),
+    reviews: z.array(z.any()).optional().default([]),
 
     // Meta
     displayOrder: z.number().int().optional().default(0),
@@ -67,6 +77,7 @@ export const updatePackageSchema = z.object({
     name: z.string().min(2).optional(),
     shortDescription: z.string().optional().nullable(),
     badgeText: z.string().optional().nullable(),
+    sectionTitle: z.string().optional().nullable(),
     originalPrice: z.number().min(0).optional(),
     discountedPrice: z.number().min(0).optional(),
     savingsLabel: z.string().optional().nullable(),
@@ -74,12 +85,21 @@ export const updatePackageSchema = z.object({
     duration: z.string().optional(),
     cardImage: z.string().optional().nullable(),
     detailBannerImages: z.array(z.string()).max(4).optional(),
+    detailBannerVideo: z.string().optional().nullable(),
+    offersBanner: z.string().optional().nullable(),
+    highlightsTitle: z.string().optional(),
     highlights: z.array(z.string()).optional(),
+    processTitle: z.string().optional(),
     processSteps: z.array(processStepSchema).optional(),
+    whatsIncludedTitle: z.string().optional(),
     whatsIncluded: z.array(z.string()).optional(),
+    requirementsTitle: z.string().optional(),
     requirements: z.array(requirementSchema).optional(),
+    pleaseNoteTitle: z.string().optional(),
     pleaseNote: z.array(z.string()).optional(),
+    faqsTitle: z.string().optional(),
     faqs: z.array(faqSchema).optional(),
+    reviews: z.array(z.any()).optional(),
     displayOrder: z.number().int().optional(),
     isPopular: z.boolean().optional(),
     isActive: z.boolean().optional(),
@@ -214,10 +234,12 @@ export const createPackage = async (req: Request, res: Response, next: NextFunct
   try {
     const serviceId = req.params.serviceId as string;
     const {
-      name, shortDescription, badgeText,
+      name, shortDescription, badgeText, sectionTitle,
       originalPrice, discountedPrice, savingsLabel, pricePerUnitLabel, duration,
-      cardImage, detailBannerImages,
-      highlights, processSteps, whatsIncluded, requirements, pleaseNote, faqs,
+      cardImage, detailBannerImages, detailBannerVideo, offersBanner,
+      highlightsTitle, highlights, processTitle, processSteps,
+      whatsIncludedTitle, whatsIncluded, requirementsTitle, requirements,
+      pleaseNoteTitle, pleaseNote, faqsTitle, faqs, reviews,
       displayOrder, isPopular, isActive,
     } = req.body;
 
@@ -231,11 +253,15 @@ export const createPackage = async (req: Request, res: Response, next: NextFunct
     const [
       uploadedCardImage,
       uploadedBanners,
+      uploadedBannerVideo,
+      uploadedOffersBanner,
       uploadedSteps,
       uploadedRequirements,
     ] = await Promise.all([
       cardImage ? uploadToCloudinary(cardImage, 'servfex/packages/cards').catch(() => cardImage) : Promise.resolve(null),
       uploadBannerImages(detailBannerImages || []),
+      detailBannerVideo ? uploadToCloudinary(detailBannerVideo, 'servfex/packages/videos').catch(() => detailBannerVideo) : Promise.resolve(null),
+      offersBanner ? uploadToCloudinary(offersBanner, 'servfex/packages/offers').catch(() => offersBanner) : Promise.resolve(null),
       uploadProcessStepImages(processSteps || []),
       uploadRequirementIcons(requirements || []),
     ]);
@@ -247,6 +273,7 @@ export const createPackage = async (req: Request, res: Response, next: NextFunct
           name,
           shortDescription: shortDescription || null,
           badgeText: badgeText || null,
+          sectionTitle: sectionTitle?.trim() || null,
           originalPrice: toMoney(originalPrice),
           discountedPrice: toMoney(discountedPrice),
           savingsLabel: savingsLabel || null,
@@ -254,12 +281,21 @@ export const createPackage = async (req: Request, res: Response, next: NextFunct
           duration: duration || '60 mins',
           cardImage: uploadedCardImage || null,
           detailBannerImages: uploadedBanners,
+          detailBannerVideo: uploadedBannerVideo || null,
+          offersBanner: uploadedOffersBanner || null,
+          highlightsTitle: highlightsTitle || 'Highlights',
           highlights: highlights || [],
+          processTitle: processTitle || 'Our Process',
           processSteps: uploadedSteps as any,
+          whatsIncludedTitle: whatsIncludedTitle || "What's Included",
           whatsIncluded: whatsIncluded || [],
+          requirementsTitle: requirementsTitle || 'What We Need From You',
           requirements: uploadedRequirements as any,
+          pleaseNoteTitle: pleaseNoteTitle || 'Please Note',
           pleaseNote: pleaseNote || [],
+          faqsTitle: faqsTitle || 'Frequently Asked Questions',
           faqs: faqs || [],
+          reviews: reviews || [],
           displayOrder: displayOrder ?? 0,
           isPopular: isPopular || false,
           isActive: isActive !== undefined ? isActive : true,
@@ -300,10 +336,12 @@ export const updatePackage = async (req: Request, res: Response, next: NextFunct
   try {
     const id = req.params.id as string;
     const {
-      name, shortDescription, badgeText,
+      name, shortDescription, badgeText, sectionTitle,
       originalPrice, discountedPrice, savingsLabel, pricePerUnitLabel, duration,
-      cardImage, detailBannerImages,
-      highlights, processSteps, whatsIncluded, requirements, pleaseNote, faqs,
+      cardImage, detailBannerImages, detailBannerVideo, offersBanner,
+      highlightsTitle, highlights, processTitle, processSteps,
+      whatsIncludedTitle, whatsIncluded, requirementsTitle, requirements,
+      pleaseNoteTitle, pleaseNote, faqsTitle, faqs, reviews,
       displayOrder, isPopular, isActive, reason,
     } = req.body;
 
@@ -314,11 +352,24 @@ export const updatePackage = async (req: Request, res: Response, next: NextFunct
     }
 
     // Upload new media in parallel (only if provided)
-    const [uploadedCardImage, uploadedBanners, uploadedSteps, uploadedRequirements] = await Promise.all([
+    const [
+      uploadedCardImage,
+      uploadedBanners,
+      uploadedBannerVideo,
+      uploadedOffersBanner,
+      uploadedSteps,
+      uploadedRequirements,
+    ] = await Promise.all([
       cardImage !== undefined
         ? (cardImage ? uploadToCloudinary(cardImage, 'servfex/packages/cards').catch(() => cardImage) : Promise.resolve(null))
         : Promise.resolve(undefined),
       detailBannerImages ? uploadBannerImages(detailBannerImages) : Promise.resolve(undefined),
+      detailBannerVideo !== undefined
+        ? (detailBannerVideo ? uploadToCloudinary(detailBannerVideo, 'servfex/packages/videos').catch(() => detailBannerVideo) : Promise.resolve(null))
+        : Promise.resolve(undefined),
+      offersBanner !== undefined
+        ? (offersBanner ? uploadToCloudinary(offersBanner, 'servfex/packages/offers').catch(() => offersBanner) : Promise.resolve(null))
+        : Promise.resolve(undefined),
       processSteps ? uploadProcessStepImages(processSteps) : Promise.resolve(undefined),
       requirements ? uploadRequirementIcons(requirements) : Promise.resolve(undefined),
     ]);
@@ -330,6 +381,7 @@ export const updatePackage = async (req: Request, res: Response, next: NextFunct
           ...(name !== undefined ? { name, title: name } : {}),
           ...(shortDescription !== undefined ? { shortDescription, description: shortDescription } : {}),
           ...(badgeText !== undefined ? { badgeText } : {}),
+          ...(sectionTitle !== undefined ? { sectionTitle: sectionTitle?.trim() || null } : {}),
           ...(originalPrice !== undefined ? { originalPrice: toMoney(originalPrice) } : {}),
           ...(discountedPrice !== undefined ? {
             discountedPrice: toMoney(discountedPrice),
@@ -340,12 +392,21 @@ export const updatePackage = async (req: Request, res: Response, next: NextFunct
           ...(duration !== undefined ? { duration } : {}),
           ...(uploadedCardImage !== undefined ? { cardImage: uploadedCardImage } : {}),
           ...(uploadedBanners !== undefined ? { detailBannerImages: uploadedBanners } : {}),
+          ...(uploadedBannerVideo !== undefined ? { detailBannerVideo: uploadedBannerVideo } : {}),
+          ...(uploadedOffersBanner !== undefined ? { offersBanner: uploadedOffersBanner } : {}),
+          ...(highlightsTitle !== undefined ? { highlightsTitle } : {}),
           ...(highlights !== undefined ? { highlights, features: highlights } : {}),
+          ...(processTitle !== undefined ? { processTitle } : {}),
           ...(uploadedSteps !== undefined ? { processSteps: uploadedSteps as any } : {}),
+          ...(whatsIncludedTitle !== undefined ? { whatsIncludedTitle } : {}),
           ...(whatsIncluded !== undefined ? { whatsIncluded } : {}),
+          ...(requirementsTitle !== undefined ? { requirementsTitle } : {}),
           ...(uploadedRequirements !== undefined ? { requirements: uploadedRequirements as any } : {}),
+          ...(pleaseNoteTitle !== undefined ? { pleaseNoteTitle } : {}),
           ...(pleaseNote !== undefined ? { pleaseNote } : {}),
+          ...(faqsTitle !== undefined ? { faqsTitle } : {}),
           ...(faqs !== undefined ? { faqs } : {}),
+          ...(reviews !== undefined ? { reviews: reviews as any } : {}),
           ...(displayOrder !== undefined ? { displayOrder } : {}),
           ...(isPopular !== undefined ? { isPopular } : {}),
           ...(isActive !== undefined ? { isActive } : {}),
@@ -369,6 +430,82 @@ export const updatePackage = async (req: Request, res: Response, next: NextFunct
     });
 
     sendSuccess(res, updated);
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * POST /admin/sub-categories/:subCategoryId/packages
+ * Create a package under a sub-category directly (creates or reuses a default backing service)
+ */
+export const createSubCategoryPackage = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  try {
+    const subCategoryId = req.params.subCategoryId as string;
+    const subCategory = await prisma.serviceSubCategory.findUnique({
+      where: { id: subCategoryId },
+      include: { category: true },
+    });
+    if (!subCategory) {
+      sendError(res, 'SUBCATEGORY_NOT_FOUND', 'Sub-category not found', 404);
+      return;
+    }
+
+    // Find existing service for this subcategory or create one
+    let service = await prisma.service.findFirst({
+      where: { subCategoryId, deletedAt: null },
+    });
+
+    if (!service) {
+      const baseSlug = subCategory.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)+/g, '');
+      const uniqueSlug = `${baseSlug}-${Date.now().toString().slice(-4)}`;
+      const priceStr = req.body.discountedPrice !== undefined ? toMoney(req.body.discountedPrice) : '0.00';
+      service = await prisma.service.create({
+        data: {
+          categoryId: subCategory.categoryId,
+          subCategoryId: subCategory.id,
+          name: subCategory.name,
+          slug: uniqueSlug,
+          description: `Services under ${subCategory.name}`,
+          startingPrice: priceStr,
+          isActive: true,
+        },
+      });
+    }
+
+    // Assign serviceId to req.params and delegate
+    req.params.serviceId = service.id;
+    return createPackage(req, res, next);
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * GET /admin/sub-categories/:subCategoryId/packages
+ * Fetch all packages for a subcategory
+ */
+export const getSubCategoryPackages = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  try {
+    const subCategoryId = req.params.subCategoryId as string;
+    const services = await prisma.service.findMany({
+      where: { subCategoryId, deletedAt: null },
+      select: { id: true, name: true },
+    });
+    const serviceIds = services.map((s) => s.id);
+    const serviceNameMap = new Map(services.map((s) => [s.id, s.name]));
+
+    const packages = await prisma.servicePackage.findMany({
+      where: { serviceId: { in: serviceIds }, isActive: true },
+      orderBy: [{ displayOrder: 'asc' }, { createdAt: 'asc' }],
+    });
+
+    const enriched = packages.map((p) => ({
+      ...p,
+      _serviceName: serviceNameMap.get(p.serviceId) || '',
+    }));
+
+    sendSuccess(res, enriched);
   } catch (error) {
     next(error);
   }

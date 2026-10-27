@@ -391,6 +391,7 @@ model ServicePackage {
   name               String?
   shortDescription   String?
   badgeText          String?
+  sectionTitle       String?  // Optional Section / Heading under Sub-Category (e.g., "Intense Cleaning", "Express Cleaning")
 
   // Pricing
   originalPrice      String?
@@ -399,19 +400,30 @@ model ServicePackage {
   pricePerUnitLabel  String?
   duration           String   @default("60 mins")
 
-  // Listing card media
+  // Listing card media (top image)
   cardImage          String?
 
-  // Detail page banner (up to 4 images)
+  // Detail page banner (up to 4 images OR 1 video)
   detailBannerImages String[]
+  detailBannerVideo  String?
 
-  // Detail page content
+  // Offers banner (optional)
+  offersBanner       String?
+
+  // Detail page content with customizable section titles
+  highlightsTitle    String?  @default("Highlights")
   highlights         String[]
+  processTitle       String?  @default("Our Process")
   processSteps       Json     @default("[]")
+  whatsIncludedTitle String?  @default("What's Included")
   whatsIncluded      String[]
+  requirementsTitle  String?  @default("What We Need From You")
   requirements       Json     @default("[]")
+  pleaseNoteTitle    String?  @default("Please Note")
   pleaseNote         String[]
+  faqsTitle          String?  @default("Frequently Asked Questions")
   faqs               Json     @default("[]")
+  reviews            Json     @default("[]")
 
   // Meta
   displayOrder       Int      @default(0)
