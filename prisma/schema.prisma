@@ -331,6 +331,8 @@ model ServiceSubCategory {
   category     ServiceCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
   name         String
   iconUrl      String?         // Cloudinary icon/logo URL
+  bannerImages String[]        @default([]) // Up to 4 banner images (min 1 required on creation)
+  bannerVideo  String?         // Optional 1 video URL
   displayOrder Int             @default(0)
   isActive     Boolean         @default(true)
   createdAt    DateTime        @default(now())

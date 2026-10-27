@@ -8,7 +8,9 @@ import { uploadToCloudinary } from '../utils/cloudinary';
 export const createSubCategorySchema = z.object({
   body: z.object({
     name: z.string().min(2, 'Name must be at least 2 characters'),
-    iconUrl: z.string().optional(),
+    iconUrl: z.string().optional().nullable(),
+    bannerImages: z.array(z.string()).min(1, 'At least 1 banner image is required').max(4, 'Maximum 4 banner images'),
+    bannerVideo: z.string().optional().nullable(),
     displayOrder: z.number().int().optional().default(0),
     isActive: z.boolean().optional().default(true),
   }),
@@ -19,6 +21,8 @@ export const updateSubCategorySchema = z.object({
   body: z.object({
     name: z.string().min(2).optional(),
     iconUrl: z.string().optional().nullable(),
+    bannerImages: z.array(z.string()).max(4).optional(),
+    bannerVideo: z.string().optional().nullable(),
     displayOrder: z.number().int().optional(),
     isActive: z.boolean().optional(),
     reason: z.string().optional(),
@@ -75,7 +79,7 @@ export const getSubCategories = async (req: Request, res: Response, next: NextFu
 export const createSubCategory = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const categoryId = req.params.categoryId as string;
-    const { name, iconUrl, displayOrder, isActive } = req.body;
+    const { name, iconUrl, bannerImages, bannerVideo, displayOrder, isActive } = req.body;
 
     const category = await prisma.serviceCategory.findUnique({
       where: { id: categoryId, deletedAt: null },
@@ -95,12 +99,41 @@ export const createSubCategory = async (req: Request, res: Response, next: NextF
       }
     }
 
+    // Upload banner images (up to 4)
+    const uploadedBanners: string[] = [];
+    if (bannerImages && Array.isArray(bannerImages) && bannerImages.length > 0) {
+      const toUpload = bannerImages.slice(0, 4);
+      const results = await Promise.allSettled(
+        toUpload.map((img: string) =>
+          img && (img.startsWith('data:') || img.startsWith('http'))
+            ? uploadToCloudinary(img, 'servfex/sub-categories/banners')
+            : Promise.resolve(img)
+        )
+      );
+      uploadedBanners.push(
+        ...results.map((r, i) => (r.status === 'fulfilled' ? r.value : toUpload[i]))
+      );
+    }
+
+    // Upload banner video (optional)
+    let uploadedBannerVideo: string | null = null;
+    if (bannerVideo && (bannerVideo.startsWith('data:') || bannerVideo.startsWith('http'))) {
+      try {
+        uploadedBannerVideo = await uploadToCloudinary(bannerVideo, 'servfex/sub-categories/videos');
+      } catch (videoErr) {
+        console.error('[SubCategory] Video upload warning:', videoErr);
+        uploadedBannerVideo = bannerVideo;
+      }
+    }
+
     const subCategory = await prisma.$transaction(async (tx) => {
       const sc = await tx.serviceSubCategory.create({
         data: {
           categoryId,
           name: name.trim(),
           iconUrl: finalIconUrl,
+          bannerImages: uploadedBanners,
+          bannerVideo: uploadedBannerVideo,
           displayOrder: displayOrder ?? 0,
           isActive: isActive !== undefined ? isActive : true,
         },
@@ -133,7 +166,7 @@ export const createSubCategory = async (req: Request, res: Response, next: NextF
 export const updateSubCategory = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const id = req.params.id as string;
-    const { name, iconUrl, displayOrder, isActive, reason } = req.body;
+    const { name, iconUrl, bannerImages, bannerVideo, displayOrder, isActive, reason } = req.body;
 
     const existing = await prisma.serviceSubCategory.findUnique({ where: { id } });
     if (!existing) {
@@ -158,12 +191,47 @@ export const updateSubCategory = async (req: Request, res: Response, next: NextF
       }
     }
 
+    // Upload banner images if provided
+    let uploadedBanners: string[] | undefined = undefined;
+    if (bannerImages !== undefined) {
+      const toUpload = (bannerImages as string[]).slice(0, 4);
+      const results = await Promise.allSettled(
+        toUpload.map((img) =>
+          img && (img.startsWith('data:') || img.startsWith('http'))
+            ? uploadToCloudinary(img, 'servfex/sub-categories/banners')
+            : Promise.resolve(img)
+        )
+      );
+      uploadedBanners = results.map((r, i) =>
+        r.status === 'fulfilled' ? r.value : toUpload[i]
+      );
+    }
+
+    // Upload banner video if provided
+    let uploadedBannerVideo: string | null | undefined = undefined;
+    if (bannerVideo !== undefined) {
+      if (bannerVideo === null) {
+        uploadedBannerVideo = null;
+      } else if (bannerVideo.startsWith('data:') || bannerVideo.startsWith('http')) {
+        try {
+          uploadedBannerVideo = await uploadToCloudinary(bannerVideo, 'servfex/sub-categories/videos');
+        } catch (videoErr) {
+          console.error('[SubCategory] Video upload warning:', videoErr);
+          uploadedBannerVideo = bannerVideo;
+        }
+      } else {
+        uploadedBannerVideo = bannerVideo;
+      }
+    }
+
     const updated = await prisma.$transaction(async (tx) => {
       const sc = await tx.serviceSubCategory.update({
         where: { id },
         data: {
           ...(name !== undefined ? { name: name.trim() } : {}),
           ...(finalIconUrl !== undefined ? { iconUrl: finalIconUrl } : {}),
+          ...(uploadedBanners !== undefined ? { bannerImages: uploadedBanners } : {}),
+          ...(uploadedBannerVideo !== undefined ? { bannerVideo: uploadedBannerVideo } : {}),
           ...(displayOrder !== undefined ? { displayOrder } : {}),
           ...(isActive !== undefined ? { isActive } : {}),
         },
