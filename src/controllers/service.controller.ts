@@ -74,25 +74,34 @@ export const getServices = async (req: Request, res: Response, next: NextFunctio
     const { page, limit, categoryId, search, isActive, sortBy, sortOrder } = req.query as any;
     const skip = (page - 1) * limit;
 
-    const where: any = {
-      deletedAt: null,
-    };
+    const andConditions: any[] = [
+      {
+        OR: [
+          { deletedAt: null },
+          { deletedAt: { isSet: false } },
+        ],
+      },
+    ];
 
     if (categoryId) {
-      where.categoryId = categoryId;
+      andConditions.push({ categoryId });
     }
 
     if (isActive !== undefined) {
-      where.isActive = isActive;
+      andConditions.push({ isActive });
     }
 
     if (search) {
-      where.OR = [
-        { name: { contains: search, mode: 'insensitive' } },
-        { description: { contains: search, mode: 'insensitive' } },
-        { slug: { contains: search, mode: 'insensitive' } },
-      ];
+      andConditions.push({
+        OR: [
+          { name: { contains: search, mode: 'insensitive' } },
+          { description: { contains: search, mode: 'insensitive' } },
+          { slug: { contains: search, mode: 'insensitive' } },
+        ],
+      });
     }
+
+    const where = { AND: andConditions };
 
     const [total, services] = await Promise.all([
       prisma.service.count({ where }),
@@ -233,6 +242,7 @@ export const createService = async (req: Request, res: Response, next: NextFunct
           bannerVideo: uploadedBannerVideo,
           isPopular: isPopular || false,
           isActive: isActive !== undefined ? isActive : true,
+          deletedAt: null,
         },
         include: {
           category: { select: { id: true, name: true } },

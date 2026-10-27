@@ -45,7 +45,12 @@ export const reorderCategoriesSchema = z.object({
 export const getCategories = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const categories = await prisma.serviceCategory.findMany({
-      where: { deletedAt: null },
+      where: {
+        OR: [
+          { deletedAt: null },
+          { deletedAt: { isSet: false } },
+        ],
+      },
       orderBy: { displayOrder: 'asc' },
       include: {
         subCategories: {
@@ -53,12 +58,30 @@ export const getCategories = async (req: Request, res: Response, next: NextFunct
           orderBy: { displayOrder: 'asc' },
           include: {
             _count: {
-              select: { services: { where: { deletedAt: null } } },
+              select: {
+                services: {
+                  where: {
+                    OR: [
+                      { deletedAt: null },
+                      { deletedAt: { isSet: false } },
+                    ],
+                  },
+                },
+              },
             },
           },
         },
         _count: {
-          select: { services: { where: { deletedAt: null } } },
+          select: {
+            services: {
+              where: {
+                OR: [
+                  { deletedAt: null },
+                  { deletedAt: { isSet: false } },
+                ],
+              },
+            },
+          },
         },
       },
     });
@@ -106,6 +129,7 @@ export const createCategory = async (req: Request, res: Response, next: NextFunc
           description: description || null,
           displayOrder: displayOrder || 0,
           isActive: isActive !== undefined ? isActive : true,
+          deletedAt: null,
         },
       });
 

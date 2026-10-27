@@ -32,7 +32,10 @@ export const getCatalogCategories = async (_req: Request, res: Response): Promis
     const categories = await prisma.serviceCategory.findMany({
       where: {
         isActive: true,
-        deletedAt: null,
+        OR: [
+          { deletedAt: null },
+          { deletedAt: { isSet: false } },
+        ],
       },
       orderBy: {
         displayOrder: 'asc',
@@ -43,7 +46,13 @@ export const getCatalogCategories = async (_req: Request, res: Response): Promis
           orderBy: { displayOrder: 'asc' },
           include: {
             services: {
-              where: { isActive: true, deletedAt: null },
+              where: {
+                isActive: true,
+                OR: [
+                  { deletedAt: null },
+                  { deletedAt: { isSet: false } },
+                ],
+              },
               orderBy: { name: 'asc' },
               select: {
                 id: true,

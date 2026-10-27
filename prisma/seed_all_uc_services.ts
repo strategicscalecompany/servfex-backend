@@ -1090,6 +1090,7 @@ async function main() {
         description: catData.description,
         displayOrder: catData.displayOrder,
         isActive: true,
+        deletedAt: null,
       },
     });
 
@@ -1153,6 +1154,7 @@ async function main() {
             reviewCount: 312,
             isPopular: true,
             isActive: true,
+            deletedAt: null,
           },
         });
         console.log(`  ✓ Created Backing Service: "${service.name}" (${service.id})`);
@@ -1210,6 +1212,7 @@ async function main() {
           displayOrder: pIdx,
           isPopular: pIdx === 0,
           isActive: true,
+          deletedAt: null,
           // Legacy compat fields
           title: pData.name,
           description: pData.shortDescription,
