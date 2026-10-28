@@ -370,26 +370,20 @@ export const getCatalogServiceReviews = async (req: Request, res: Response): Pro
  */
 export const getCatalogHomeLayout = async (_req: Request, res: Response): Promise<void> => {
   try {
-    const cacheKey = 'home-layout:public';
-    const cached = catalogMemoryCache.get(cacheKey);
-    if (cached && cached.expiresAt > Date.now()) {
-      res.setHeader('Cache-Control', 'public, max-age=30, stale-while-revalidate=60');
-      sendSuccess(res, cached.data, 200);
-      return;
-    }
+    // Send explicit zero-delay headers so mobile clients and proxies NEVER serve stale cache
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
 
     const config = await prisma.appConfiguration.findUnique({
       where: { key: 'HOME_LAYOUT' },
     });
 
     const data = (config?.value as any) || DEFAULT_HOME_LAYOUT;
-    catalogMemoryCache.set(cacheKey, {
-      data,
-      expiresAt: Date.now() + CACHE_TTL_MS,
-    });
+    const updatedAt = config?.updatedAt ? config.updatedAt.getTime() : Date.now();
+    const payload = { ...data, updatedAt };
 
-    res.setHeader('Cache-Control', 'public, max-age=30, stale-while-revalidate=60');
-    sendSuccess(res, data, 200);
+    sendSuccess(res, payload, 200);
   } catch (err: any) {
     sendSuccess(res, DEFAULT_HOME_LAYOUT, 200);
   }
