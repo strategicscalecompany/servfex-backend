@@ -1,3 +1,4 @@
+import { DEFAULT_HOME_LAYOUT } from './settings.controller';
 import { Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { sendSuccess, sendError } from '../utils/response';
@@ -360,6 +361,37 @@ export const getCatalogServiceReviews = async (req: Request, res: Response): Pro
     );
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
+  }
+};
+
+/**
+ * Get Customer App Home Screen Layout (slides, section visibility, search hints)
+ * Public - no authentication required.
+ */
+export const getCatalogHomeLayout = async (_req: Request, res: Response): Promise<void> => {
+  try {
+    const cacheKey = 'home-layout:public';
+    const cached = catalogMemoryCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      res.setHeader('Cache-Control', 'public, max-age=30, stale-while-revalidate=60');
+      sendSuccess(res, cached.data, 200);
+      return;
+    }
+
+    const config = await prisma.appConfiguration.findUnique({
+      where: { key: 'HOME_LAYOUT' },
+    });
+
+    const data = (config?.value as any) || DEFAULT_HOME_LAYOUT;
+    catalogMemoryCache.set(cacheKey, {
+      data,
+      expiresAt: Date.now() + CACHE_TTL_MS,
+    });
+
+    res.setHeader('Cache-Control', 'public, max-age=30, stale-while-revalidate=60');
+    sendSuccess(res, data, 200);
+  } catch (err: any) {
+    sendSuccess(res, DEFAULT_HOME_LAYOUT, 200);
   }
 };
 

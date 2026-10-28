@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { prisma } from '../config/prisma';
 import { sendSuccess } from '../utils/response';
 import { logAuditEvent } from '../utils/audit';
+import { invalidateCatalogCache } from './catalog.controller';
 
 export const platformSettingsSchema = z.object({
   body: z.object({
@@ -62,6 +63,40 @@ export const appConfigSchema = z.object({
   }),
 });
 
+export const homeLayoutSchema = z.object({
+  body: z.object({
+    slides: z
+      .array(
+        z.object({
+          id: z.string(),
+          tag: z.string(),
+          headline: z.string(),
+          subtext: z.string(),
+          accentColor: z.string(),
+          bgColor: z.string(),
+          isActive: z.boolean(),
+          targetCategoryId: z.string().nullable().optional(),
+          targetServiceId: z.string().nullable().optional(),
+        })
+      )
+      .optional(),
+    sections: z
+      .array(
+        z.object({
+          id: z.string(),
+          name: z.string().optional(),
+          componentName: z.string().optional(),
+          description: z.string().optional(),
+          enabled: z.boolean(),
+        })
+      )
+      .optional(),
+    searchHints: z.array(z.string()).optional(),
+    deliveringLocation: z.string().optional(),
+    reason: z.string().optional(),
+  }),
+});
+
 // Default Fallbacks
 const DEFAULT_PLATFORM = {
   platformName: 'ServFex',
@@ -103,6 +138,65 @@ const DEFAULT_APP_CONFIG = {
     forceUpdate: false,
     maintenanceMode: false,
   },
+};
+
+export const DEFAULT_HOME_LAYOUT = {
+  slides: [
+    {
+      id: 'SLIDE-1',
+      tag: 'Limited Offer',
+      headline: '25% off on\nyour first booking',
+      subtext: 'Book Now →',
+      accentColor: '#FFD166',
+      bgColor: '#1A1A2E',
+      isActive: true,
+      targetCategoryId: null,
+      targetServiceId: null,
+    },
+    {
+      id: 'SLIDE-2',
+      tag: 'Home Cleaning',
+      headline: 'Sparkling clean\nfrom ₹299',
+      subtext: 'Explore →',
+      accentColor: '#06D6A0',
+      bgColor: '#0F3460',
+      isActive: true,
+      targetCategoryId: null,
+      targetServiceId: null,
+    },
+    {
+      id: 'SLIDE-3',
+      tag: 'AC Service',
+      headline: 'Expert AC\nrepair & service',
+      subtext: 'Book Now →',
+      accentColor: '#90E0EF',
+      bgColor: '#1B1B2F',
+      isActive: true,
+      targetCategoryId: null,
+      targetServiceId: null,
+    },
+  ],
+  sections: [
+    { id: 'SEC-HERO', name: 'Hero Header & GPS Bar', componentName: 'HeroHeader.kt', description: 'Dark gradient hero (#0F0F1A → #1C1C2E) with doorstep GPS status and refresh button', enabled: true },
+    { id: 'SEC-UC-BANNER', name: 'Urban Company Location Banner', componentName: 'UC Prompt Surface', description: 'Amber bordered banner (#232018) for setting area or granting doorstep GPS', enabled: true },
+    { id: 'SEC-SEARCH-BAR', name: 'Slim Search Bar with Cycling Hints', componentName: 'ServFexSearchBar.kt', description: '44dp slim white bar with animated text cycling 8 service keywords', enabled: true },
+    { id: 'SEC-PROMO-PAGER', name: 'Dynamic Promo Carousel', componentName: 'PromoBannerPager.kt', description: '140dp rounded-2xl cards with tag pills, bold headlines, and dot indicators', enabled: true },
+    { id: 'SEC-CATEGORIES', name: 'Categories LazyRow', componentName: 'ServFexCategoryCard.kt', description: 'Horizontal scrollable 88dp cards with 44dp icon boxes and active highlight', enabled: true },
+    { id: 'SEC-POPULAR', name: 'Popular Services Section', componentName: 'ServFexServiceCard.kt', description: 'Header with "View All", 60dp icon boxes, ★ rating, duration, and Book pill', enabled: true },
+    { id: 'SEC-WHY-CHOOSE', name: 'Why Choose ServFex (5 Guarantees)', componentName: 'WhyChooseItem.kt', description: 'White container with 5 verified trust badges from strings.xml', enabled: true },
+    { id: 'SEC-BOTTOM-NAV', name: 'Customer App Bottom Navigation', componentName: 'ServFexBottomNav.kt', description: '64dp bottom bar with 4 tabs: Home, Services, Bookings, Profile', enabled: true },
+  ],
+  searchHints: [
+    'Sofa Cleaning',
+    'AC Repair',
+    'Plumbing',
+    'Bathroom Cleaning',
+    'Car Detailing',
+    'Pest Control',
+    'Electrical Work',
+    'Home Shifting',
+  ],
+  deliveringLocation: 'Jubilee Hills, Hyderabad',
 };
 
 export const getPlatformSettings = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
@@ -328,3 +422,63 @@ export const updateAppConfiguration = async (req: Request, res: Response, next: 
     next(error);
   }
 };
+
+export const getHomeLayout = async (_req: Request, res: Response, next: NextFunction): Promise<void> => {
+  try {
+    const config = await prisma.appConfiguration.findUnique({
+      where: { key: 'HOME_LAYOUT' },
+    });
+    sendSuccess(res, config?.value || DEFAULT_HOME_LAYOUT);
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const updateHomeLayout = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  try {
+    const { reason, ...data } = req.body;
+
+    const existing = await prisma.appConfiguration.findUnique({
+      where: { key: 'HOME_LAYOUT' },
+    });
+
+    const merged = { ...(existing?.value as any || DEFAULT_HOME_LAYOUT), ...data };
+
+    const updated = await prisma.$transaction(async (tx) => {
+      const s = await tx.appConfiguration.upsert({
+        where: { key: 'HOME_LAYOUT' },
+        create: {
+          key: 'HOME_LAYOUT',
+          value: merged,
+          description: 'Customer App Home Screen dynamic layout, slides, and section controls',
+        },
+        update: {
+          value: merged,
+        },
+      });
+
+      await logAuditEvent({
+        superAdminId: req.user!.userId,
+        action: 'HOME_LAYOUT_CONFIG_UPDATED',
+        entityType: 'AppConfiguration',
+        entityId: 'HOME_LAYOUT',
+        before: existing?.value as any,
+        after: merged,
+        reason,
+        ipAddress: req.ip,
+        userAgent: req.headers['user-agent'],
+        tx,
+      });
+
+      return s;
+    });
+
+    // Invalidate public catalog cache so customer mobile app immediately sees new changes
+    invalidateCatalogCache();
+
+    sendSuccess(res, updated.value);
+  } catch (error) {
+    next(error);
+  }
+};
+

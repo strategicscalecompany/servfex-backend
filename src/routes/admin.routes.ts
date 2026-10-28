@@ -117,10 +117,13 @@ import {
   updatePricingSettings,
   getAppConfiguration,
   updateAppConfiguration,
+  getHomeLayout,
+  updateHomeLayout,
   platformSettingsSchema,
   bookingSettingsSchema,
   pricingSettingsSchema,
   appConfigSchema,
+  homeLayoutSchema,
 } from '../controllers/settings.controller';
 import {
   broadcastNotification,
@@ -308,6 +311,10 @@ router.put('/settings/app-config', validate(appConfigSchema), updateAppConfigura
 router.get('/settings/app', getAppConfiguration);
 router.put('/settings/app', validate(appConfigSchema), updateAppConfiguration);
 router.patch('/settings/app', validate(appConfigSchema), updateAppConfiguration);
+
+router.get('/home-layout', getHomeLayout);
+router.put('/home-layout', validate(homeLayoutSchema), updateHomeLayout);
+router.patch('/home-layout', validate(homeLayoutSchema), updateHomeLayout);
 
 // ==========================================
 // CONTROL CENTER - SYSTEM & HEALTH
