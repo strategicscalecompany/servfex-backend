@@ -215,18 +215,16 @@ export const DEFAULT_HOME_LAYOUT = {
     'Home Shifting',
   ],
   deliveringLocation: 'Jubilee Hills, Hyderabad',
-  popularTitle: 'Popular Services',
-  popularSubtitle: 'Most booked in your area this week',
+  popularTitle: '',
+  popularSubtitle: '',
   popularServiceIds: [] as string[],
-  serviceSections: [
-    {
-      id: 'HS-POPULAR',
-      title: 'Popular Services',
-      subtitle: 'Most booked in your area this week',
-      serviceIds: [] as string[],
-      enabled: true,
-    },
-  ],
+  serviceSections: [] as Array<{
+    id: string;
+    title: string;
+    subtitle: string;
+    serviceIds: string[];
+    enabled: boolean;
+  }>,
 };
 
 const sanitizeServiceSections = (raw: unknown): Array<{
@@ -241,7 +239,7 @@ const sanitizeServiceSections = (raw: unknown): Array<{
     .filter((item) => item && typeof item === 'object' && typeof (item as any).id === 'string')
     .map((item: any) => ({
       id: String(item.id),
-      title: typeof item.title === 'string' && item.title.trim() ? item.title.trim() : 'Services',
+      title: typeof item.title === 'string' ? item.title.trim() : '',
       subtitle: typeof item.subtitle === 'string' ? item.subtitle : '',
       serviceIds: Array.isArray(item.serviceIds)
         ? item.serviceIds.filter((id: unknown) => typeof id === 'string' && id.length > 0)
@@ -259,22 +257,27 @@ export const normalizeHomeLayoutValue = (value: any) => {
     const fallbackIds = Array.isArray(merged.popularServiceIds)
       ? merged.popularServiceIds.filter((id: unknown) => typeof id === 'string' && id.length > 0)
       : [];
-    serviceSections = [
-      {
-        id: 'HS-POPULAR',
-        title: merged.popularTitle || 'Popular Services',
-        subtitle: merged.popularSubtitle || 'Most booked in your area this week',
-        serviceIds: fallbackIds,
-        enabled: true,
-      },
-    ];
+    const legacyTitle = typeof merged.popularTitle === 'string' ? merged.popularTitle.trim() : '';
+    if (fallbackIds.length > 0 || (legacyTitle && legacyTitle.toLowerCase() !== 'popular services')) {
+      serviceSections = [
+        {
+          id: 'HS-POPULAR',
+          title: legacyTitle.toLowerCase() === 'popular services' ? '' : legacyTitle,
+          subtitle: typeof merged.popularSubtitle === 'string' ? merged.popularSubtitle : '',
+          serviceIds: fallbackIds,
+          enabled: true,
+        },
+      ];
+    } else {
+      serviceSections = [];
+    }
   }
 
   const firstEnabled = serviceSections.find((section) => section.enabled) || serviceSections[0];
   return {
     ...merged,
     serviceSections,
-    popularTitle: firstEnabled?.title || 'Popular Services',
+    popularTitle: firstEnabled?.title || '',
     popularSubtitle: firstEnabled?.subtitle || '',
     popularServiceIds: firstEnabled?.serviceIds || [],
   };
