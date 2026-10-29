@@ -77,6 +77,7 @@ export const homeLayoutSchema = z.object({
           isActive: z.boolean(),
           targetCategoryId: z.string().nullable().optional(),
           targetServiceId: z.string().nullable().optional(),
+          imageUrl: z.string().nullable().optional(),
         })
       )
       .optional(),
@@ -152,6 +153,7 @@ export const DEFAULT_HOME_LAYOUT = {
       isActive: true,
       targetCategoryId: null,
       targetServiceId: null,
+      imageUrl: 'https://images.unsplash.com/photo-1600585154340-be6161a56a0c?q=80&w=800&auto=format&fit=crop',
     },
     {
       id: 'SLIDE-2',
@@ -163,6 +165,7 @@ export const DEFAULT_HOME_LAYOUT = {
       isActive: true,
       targetCategoryId: null,
       targetServiceId: null,
+      imageUrl: 'https://images.unsplash.com/photo-1581578731548-c64695cc6952?q=80&w=800&auto=format&fit=crop',
     },
     {
       id: 'SLIDE-3',
@@ -174,6 +177,7 @@ export const DEFAULT_HOME_LAYOUT = {
       isActive: true,
       targetCategoryId: null,
       targetServiceId: null,
+      imageUrl: 'https://images.unsplash.com/photo-1621905251189-08b45d6a269e?q=80&w=800&auto=format&fit=crop',
     },
   ],
   sections: [
