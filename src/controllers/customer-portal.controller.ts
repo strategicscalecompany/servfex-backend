@@ -290,6 +290,13 @@ export const addCustomerAddress = async (req: Request, res: Response): Promise<v
     const userId = req.user!.userId;
     const data = req.body;
 
+    // Rule: Maximum 2 saved locations per user (Home & Work)
+    const existingCount = await prisma.userAddress.count({ where: { userId } });
+    if (existingCount >= 2) {
+      sendError(res, 'LIMIT_EXCEEDED', 'A customer can save a maximum of 2 locations (Home & Work). Please delete an existing address to save a new one.', 400);
+      return;
+    }
+
     const newAddress = await prisma.$transaction(async (tx) => {
       if (data.isDefault) {
         await tx.userAddress.updateMany({
