@@ -14,7 +14,6 @@
     "prisma:push": "prisma db push",
     "prisma:seed": "ts-node prisma/seed.ts",
     "seed": "ts-node prisma/seed.ts",
-    "seed:uc-catalog": "ts-node --transpile-only prisma/seed_uc_catalog.ts",
     "test": "node --test tests/*.test.cjs"
   },
   "keywords": [
