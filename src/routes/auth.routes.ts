@@ -19,14 +19,15 @@ import {
 } from '../controllers/auth.controller';
 import { authenticate } from '../middleware/auth';
 import { validate } from '../middleware/validate';
+import { otpSendLimiter, otpVerifyLimiter } from '../middleware/otp-rate-limit';
 
 const router = Router();
 
-// Customer OTP Authentication (Email OTP via Hostinger SMTP / Phone)
-router.post('/customer/send-otp', validate(sendOtpSchema), sendCustomerOtp);
-router.post('/customer/verify-otp', validate(verifyOtpSchema), verifyCustomerOtp);
-router.post('/send-otp', validate(sendOtpSchema), sendCustomerOtp);
-router.post('/verify-otp', validate(verifyOtpSchema), verifyCustomerOtp);
+// Customer & User OTP Authentication (MSG91 Flow SMS / Hostinger SMTP)
+router.post('/customer/send-otp', otpSendLimiter, validate(sendOtpSchema), sendCustomerOtp);
+router.post('/customer/verify-otp', otpVerifyLimiter, validate(verifyOtpSchema), verifyCustomerOtp);
+router.post('/send-otp', otpSendLimiter, validate(sendOtpSchema), sendCustomerOtp);
+router.post('/verify-otp', otpVerifyLimiter, validate(verifyOtpSchema), verifyCustomerOtp);
 
 // Forgot Password Flow with Email OTP via Hostinger SMTP
 router.post('/forgot-password/send-otp', validate(forgotPasswordSendOtpSchema), forgotPasswordSendOtp);

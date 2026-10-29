@@ -38,5 +38,20 @@ export async function ensureMongoSparseUniqueIndexes(): Promise<void> {
     update: 'ServiceCategory',
     updates: [{ q: { deletedAt: null }, u: { $unset: { deletedAt: '' } }, multi: true }],
   });
-  logger.info('MongoDB sparse unique indexes ensured');
+  try {
+    await prisma.$runCommandRaw({
+      createIndexes: 'OtpChallenge',
+      indexes: [
+        {
+          key: { expiresAt: 1 },
+          name: 'OtpChallenge_expiresAt_ttl_idx',
+          expireAfterSeconds: 0,
+        },
+      ],
+    });
+  } catch (err: any) {
+    logger.warn({ err: err.message }, 'Failed to create OtpChallenge TTL index');
+  }
+
+    logger.info('MongoDB sparse unique indexes ensured');
 }

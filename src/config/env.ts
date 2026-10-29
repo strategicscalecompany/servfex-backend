@@ -62,6 +62,13 @@ const envSchema = z.object({
   SMTP_PASSWORD: z.string().optional(),
   SMTP_FROM: z.string().default('ServFex <no-reply@servfex.com>'),
 
+  // MSG91 SMS OTP Configuration
+  MSG91_AUTH_KEY: z.string().optional(),
+  MSG91_OTP_TEMPLATE_ID: z.string().default('6adc8287bbeb62d5330dba32'),
+  OTP_EXPIRY_MINUTES: z.string().default('5').transform((val) => parseInt(val, 10)),
+  OTP_MAX_ATTEMPTS: z.string().default('5').transform((val) => parseInt(val, 10)),
+  OTP_RESEND_COOLDOWN_SECONDS: z.string().default('60').transform((val) => parseInt(val, 10)),
+
   // Super Admin Seed Config (Requires actual Firebase UID for seed)
   SUPER_ADMIN_FIREBASE_UID: z.string().optional(),
   SUPER_ADMIN_EMAIL: z.string().email().optional().default('vamshi.c2002@gmail.com'),

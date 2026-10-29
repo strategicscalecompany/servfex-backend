@@ -807,3 +807,27 @@ model AuditLog {
   @@index([entityType, entityId])
   @@index([createdAt])
 }
+
+
+// ==========================================
+// OTP AUTHENTICATION & VERIFICATION
+// ==========================================
+
+model OtpChallenge {
+  id             String    @id @default(uuid()) @map("_id")
+  mobile         String    // Normalized mobile number with country code (e.g., 919876543210)
+  otpHash        String    // Keyed HMAC-SHA256 hash of the 6-digit OTP
+  attempts       Int       @default(0)
+  maxAttempts    Int       @default(5)
+  isConsumed     Boolean   @default(false)
+  expiresAt      DateTime
+  resendUnlockAt DateTime
+  ipAddress      String?
+  userAgent      String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@index([mobile])
+  @@index([mobile, isConsumed, expiresAt])
+  @@index([expiresAt])
+}

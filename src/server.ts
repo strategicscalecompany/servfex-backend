@@ -225,6 +225,7 @@ app.get('/health', (_req, res) => {
 
 // Mount Versioned API Routes (Rule #13 in master architecture)
 app.use('/api/v1/auth', authRoutes);
+app.use('/api/auth', authRoutes);
 app.use('/api/v1/admin', adminRoutes);
 app.use('/api/v1/catalog', catalogRoutes);
 app.use('/api/v1/customer', customerRoutes);
