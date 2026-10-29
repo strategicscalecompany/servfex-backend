@@ -17,6 +17,64 @@ export const invalidateCatalogCache = (): void => {
   catalogMemoryCache.clear();
 };
 
+const CATALOG_SERVICE_INCLUDE = {
+  category: {
+    select: { id: true, name: true, slug: true, icon: true, iconUrl: true },
+  },
+  subCategory: {
+    select: { id: true, name: true, displayOrder: true },
+  },
+  packages: {
+    where: { isActive: true },
+    orderBy: [{ displayOrder: 'asc' as const }, { discountedPrice: 'asc' as const }],
+  },
+} satisfies Prisma.ServiceInclude;
+
+const sanitizeCatalogService = (s: any) => ({
+  ...s,
+  imageUrl: s.imageUrl && s.imageUrl.startsWith('data:') && s.imageUrl.length > 2000 ? (s.iconUrl || '') : s.imageUrl,
+  category: s.category
+    ? {
+        ...s.category,
+        icon:
+          s.category.icon && s.category.icon.startsWith('data:') && s.category.icon.length > 2000
+            ? s.category.iconUrl || ''
+            : s.category.icon,
+      }
+    : null,
+});
+
+const parseRequestedIds = (raw: unknown): string[] => {
+  const values = Array.isArray(raw) ? raw : typeof raw === 'string' ? raw.split(',') : [];
+  return [...new Set(values.map((id) => String(id).trim()).filter((id) => id.length > 0))];
+};
+
+const loadCatalogServicesByIds = async (ids: string[]) => {
+  if (ids.length === 0) return [];
+  const fetched = await prisma.service.findMany({
+    where: {
+      id: { in: ids },
+      isActive: true,
+      deletedAt: null,
+    },
+    include: CATALOG_SERVICE_INCLUDE,
+  });
+  const byId = new Map(fetched.map((s) => [s.id, sanitizeCatalogService(s)]));
+  return ids.map((id) => byId.get(id)).filter(Boolean);
+};
+
+const attachHomeSectionServices = async (
+  sections: Array<{ id: string; title: string; subtitle: string; serviceIds: string[]; enabled: boolean }>
+) => {
+  const allIds = [...new Set(sections.flatMap((section) => section.serviceIds))];
+  const loaded = await loadCatalogServicesByIds(allIds);
+  const byId = new Map(loaded.map((service: any) => [service.id, service]));
+  return sections.map((section) => ({
+    ...section,
+    services: section.serviceIds.map((id) => byId.get(id)).filter(Boolean),
+  }));
+};
+
 /**
  * List all active service categories.
  * Public - no authentication required.
@@ -103,11 +161,12 @@ export const getCatalogServices = async (req: Request, res: Response): Promise<v
     const categorySlug = typeof req.query.categorySlug === 'string' ? req.query.categorySlug : undefined;
     const search = typeof req.query.search === 'string' ? req.query.search : undefined;
     const isPopular = req.query.isPopular === 'true';
+    const requestedIds = parseRequestedIds(req.query.ids);
     const page = parseInt(String(req.query.page || '1'), 10) || 1;
-    const limit = Math.min(Math.max(parseInt(String(req.query.limit || '20'), 10) || 20, 1), 100);
+    const limit = Math.min(Math.max(parseInt(String(req.query.limit || '100'), 10) || 100, 1), 100);
     const skip = (page - 1) * limit;
 
-    const cacheKey = `services:${categoryId || ''}:${subCategoryId || ''}:${categorySlug || ''}:${search || ''}:${isPopular}:${page}:${limit}`;
+    const cacheKey = `services:${categoryId || ''}:${subCategoryId || ''}:${categorySlug || ''}:${search || ''}:${isPopular}:${requestedIds.join(',')}:${page}:${limit}`;
     const cached = catalogMemoryCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) {
       res.setHeader('Cache-Control', 'private, max-age=60, stale-while-revalidate=120');
@@ -134,6 +193,10 @@ export const getCatalogServices = async (req: Request, res: Response): Promise<v
       where.isPopular = true;
     }
 
+    if (requestedIds.length > 0) {
+      where.id = { in: requestedIds };
+    }
+
     if (search && search.trim().length > 0) {
       const term = search.trim();
       where.OR = [
@@ -145,38 +208,22 @@ export const getCatalogServices = async (req: Request, res: Response): Promise<v
     const [services, total] = await Promise.all([
       prisma.service.findMany({
         where,
-        take: limit,
-        skip,
+        take: requestedIds.length > 0 ? Math.min(Math.max(requestedIds.length, 1), 100) : limit,
+        skip: requestedIds.length > 0 ? 0 : skip,
         orderBy: [{ isPopular: 'desc' }, { rating: 'desc' }],
-        include: {
-          category: {
-            select: { id: true, name: true, slug: true, icon: true, iconUrl: true },
-          },
-          subCategory: {
-            select: { id: true, name: true, displayOrder: true },
-          },
-          packages: {
-            where: { isActive: true },
-            orderBy: [{ displayOrder: 'asc' }, { discountedPrice: 'asc' }],
-          },
-        },
+        include: CATALOG_SERVICE_INCLUDE,
       }),
       prisma.service.count({ where }),
     ]);
 
-    const sanitizedServices = services.map((s) => ({
-      ...s,
-      imageUrl: s.imageUrl && s.imageUrl.startsWith('data:') && s.imageUrl.length > 2000 ? (s.iconUrl || '') : s.imageUrl,
-      category: s.category
-        ? {
-            ...s.category,
-            icon:
-              s.category.icon && s.category.icon.startsWith('data:') && s.category.icon.length > 2000
-                ? s.category.iconUrl || ''
-                : s.category.icon,
-          }
-        : null,
-    }));
+    const servicesById = new Map(services.map((s) => [s.id, s]));
+    const sanitizedServices =
+      requestedIds.length > 0
+        ? requestedIds
+            .map((id) => servicesById.get(id))
+            .filter((s): s is NonNullable<typeof s> => s != null)
+            .map(sanitizeCatalogService)
+        : services.map(sanitizeCatalogService);
 
     const resultData = { services: sanitizedServices };
     const meta = {
@@ -416,8 +463,9 @@ export const getCatalogHomeLayout = async (_req: Request, res: Response): Promis
     });
 
     const data = normalizeHomeLayoutValue(config?.value);
+    const serviceSections = await attachHomeSectionServices(data.serviceSections || []);
     const updatedAt = config?.updatedAt ? config.updatedAt.getTime() : Date.now();
-    const payload = { ...data, updatedAt };
+    const payload = { ...data, serviceSections, updatedAt };
 
     sendSuccess(res, payload, 200);
   } catch (err: any) {
