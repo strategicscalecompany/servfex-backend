@@ -94,6 +94,9 @@ export const homeLayoutSchema = z.object({
       .optional(),
     searchHints: z.array(z.string()).optional(),
     deliveringLocation: z.string().optional(),
+    popularTitle: z.string().optional(),
+    popularSubtitle: z.string().optional(),
+    popularServiceIds: z.array(z.string()).optional(),
     reason: z.string().optional(),
   }),
 });
@@ -201,6 +204,9 @@ export const DEFAULT_HOME_LAYOUT = {
     'Home Shifting',
   ],
   deliveringLocation: 'Jubilee Hills, Hyderabad',
+  popularTitle: 'Popular Services',
+  popularSubtitle: 'Most booked in your area this week',
+  popularServiceIds: [] as string[],
 };
 
 export const getPlatformSettings = async (req: Request, res: Response, next: NextFunction): Promise<void> => {

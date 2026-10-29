@@ -263,9 +263,18 @@ export const getCatalogServiceById = async (req: Request, res: Response): Promis
  */
 export const getPopularServices = async (req: Request, res: Response): Promise<void> => {
   try {
-    const limit = Math.min(Math.max(parseInt(String(req.query.limit || '10'), 10) || 10, 1), 50);
+    const requestedLimit = Math.min(Math.max(parseInt(String(req.query.limit || '10'), 10) || 10, 1), 50);
 
-    const cacheKey = `services:popular:${limit}`;
+    const layoutConfig = await prisma.appConfiguration.findUnique({
+      where: { key: 'HOME_LAYOUT' },
+    });
+    const layoutValue = (layoutConfig?.value as any) || {};
+    const selectedIds: string[] = Array.isArray(layoutValue.popularServiceIds)
+      ? layoutValue.popularServiceIds.filter((id: unknown) => typeof id === 'string' && id.length > 0)
+      : [];
+    const limit = selectedIds.length > 0 ? Math.min(Math.max(selectedIds.length, 1), 50) : requestedLimit;
+
+    const cacheKey = `services:popular:${limit}:${selectedIds.join(',')}`;
     const cached = catalogMemoryCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) {
       res.setHeader('Cache-Control', 'private, max-age=60, stale-while-revalidate=120');
@@ -273,25 +282,46 @@ export const getPopularServices = async (req: Request, res: Response): Promise<v
       return;
     }
 
-    const services = await prisma.service.findMany({
-      where: {
-        isActive: true,
-        isPopular: true,
-        deletedAt: null,
+    const include = {
+      category: {
+        select: { id: true, name: true, slug: true, icon: true, iconUrl: true },
       },
-      take: limit,
-      orderBy: { rating: 'desc' },
-      include: {
-        category: {
-          select: { id: true, name: true, slug: true, icon: true, iconUrl: true },
-        },
-        packages: {
-          where: { isActive: true },
-          take: 1,
-          orderBy: { discountedPrice: 'asc' },
-        },
+      packages: {
+        where: { isActive: true },
+        take: 1,
+        orderBy: { discountedPrice: 'asc' },
       },
-    });
+    };
+
+    let services;
+    if (selectedIds.length > 0) {
+      const fetched = await prisma.service.findMany({
+        where: {
+          id: { in: selectedIds },
+          isActive: true,
+          deletedAt: null,
+        },
+        include,
+      });
+      const byId = new Map(fetched.map((s) => [s.id, s]));
+      const ordered = [];
+      for (const id of selectedIds) {
+        const match = byId.get(id);
+        if (match) ordered.push(match);
+      }
+      services = ordered.slice(0, limit);
+    } else {
+      services = await prisma.service.findMany({
+        where: {
+          isActive: true,
+          isPopular: true,
+          deletedAt: null,
+        },
+        take: limit,
+        orderBy: { rating: 'desc' },
+        include,
+      });
+    }
 
     const sanitizedServices = services.map((s) => ({
       ...s,
