@@ -258,11 +258,11 @@ export const normalizeHomeLayoutValue = (value: any) => {
       ? merged.popularServiceIds.filter((id: unknown) => typeof id === 'string' && id.length > 0)
       : [];
     const legacyTitle = typeof merged.popularTitle === 'string' ? merged.popularTitle.trim() : '';
-    if (fallbackIds.length > 0 || (legacyTitle && legacyTitle.toLowerCase() !== 'popular services')) {
+    if (fallbackIds.length > 0 || legacyTitle) {
       serviceSections = [
         {
           id: 'HS-POPULAR',
-          title: legacyTitle.toLowerCase() === 'popular services' ? '' : legacyTitle,
+          title: legacyTitle || 'Popular Services',
           subtitle: typeof merged.popularSubtitle === 'string' ? merged.popularSubtitle : '',
           serviceIds: fallbackIds,
           enabled: true,
