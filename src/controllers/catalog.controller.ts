@@ -1,5 +1,6 @@
 import { DEFAULT_HOME_LAYOUT, normalizeHomeLayoutValue } from './settings.controller';
 import { Request, Response } from 'express';
+import { Prisma } from '@prisma/client';
 import { prisma } from '../config/prisma';
 import { sendSuccess, sendError } from '../utils/response';
 
@@ -294,9 +295,9 @@ export const getPopularServices = async (req: Request, res: Response): Promise<v
       packages: {
         where: { isActive: true },
         take: 1,
-        orderBy: { discountedPrice: 'asc' },
+        orderBy: { discountedPrice: 'asc' as const },
       },
-    };
+    } satisfies Prisma.ServiceInclude;
 
     let services;
     if (selectedIds.length > 0) {
