@@ -97,6 +97,17 @@ export const homeLayoutSchema = z.object({
     popularTitle: z.string().optional(),
     popularSubtitle: z.string().optional(),
     popularServiceIds: z.array(z.string()).optional(),
+    serviceSections: z
+      .array(
+        z.object({
+          id: z.string(),
+          title: z.string(),
+          subtitle: z.string().optional(),
+          serviceIds: z.array(z.string()).optional(),
+          enabled: z.boolean().optional(),
+        })
+      )
+      .optional(),
     reason: z.string().optional(),
   }),
 });
@@ -207,6 +218,66 @@ export const DEFAULT_HOME_LAYOUT = {
   popularTitle: 'Popular Services',
   popularSubtitle: 'Most booked in your area this week',
   popularServiceIds: [] as string[],
+  serviceSections: [
+    {
+      id: 'HS-POPULAR',
+      title: 'Popular Services',
+      subtitle: 'Most booked in your area this week',
+      serviceIds: [] as string[],
+      enabled: true,
+    },
+  ],
+};
+
+const sanitizeServiceSections = (raw: unknown): Array<{
+  id: string;
+  title: string;
+  subtitle: string;
+  serviceIds: string[];
+  enabled: boolean;
+}> => {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((item) => item && typeof item === 'object' && typeof (item as any).id === 'string')
+    .map((item: any) => ({
+      id: String(item.id),
+      title: typeof item.title === 'string' && item.title.trim() ? item.title.trim() : 'Services',
+      subtitle: typeof item.subtitle === 'string' ? item.subtitle : '',
+      serviceIds: Array.isArray(item.serviceIds)
+        ? item.serviceIds.filter((id: unknown) => typeof id === 'string' && id.length > 0)
+        : [],
+      enabled: item.enabled !== false,
+    }));
+};
+
+export const normalizeHomeLayoutValue = (value: any) => {
+  const merged = { ...DEFAULT_HOME_LAYOUT, ...(value || {}) };
+  const explicitSections = Array.isArray(value?.serviceSections);
+  let serviceSections = sanitizeServiceSections(value?.serviceSections);
+
+  if (!explicitSections) {
+    const fallbackIds = Array.isArray(merged.popularServiceIds)
+      ? merged.popularServiceIds.filter((id: unknown) => typeof id === 'string' && id.length > 0)
+      : [];
+    serviceSections = [
+      {
+        id: 'HS-POPULAR',
+        title: merged.popularTitle || 'Popular Services',
+        subtitle: merged.popularSubtitle || 'Most booked in your area this week',
+        serviceIds: fallbackIds,
+        enabled: true,
+      },
+    ];
+  }
+
+  const firstEnabled = serviceSections.find((section) => section.enabled) || serviceSections[0];
+  return {
+    ...merged,
+    serviceSections,
+    popularTitle: firstEnabled?.title || 'Popular Services',
+    popularSubtitle: firstEnabled?.subtitle || '',
+    popularServiceIds: firstEnabled?.serviceIds || [],
+  };
 };
 
 export const getPlatformSettings = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
@@ -438,7 +509,7 @@ export const getHomeLayout = async (_req: Request, res: Response, next: NextFunc
     const config = await prisma.appConfiguration.findUnique({
       where: { key: 'HOME_LAYOUT' },
     });
-    sendSuccess(res, config?.value || DEFAULT_HOME_LAYOUT);
+    sendSuccess(res, normalizeHomeLayoutValue(config?.value));
   } catch (error) {
     next(error);
   }
@@ -452,7 +523,7 @@ export const updateHomeLayout = async (req: Request, res: Response, next: NextFu
       where: { key: 'HOME_LAYOUT' },
     });
 
-    const merged = { ...(existing?.value as any || DEFAULT_HOME_LAYOUT), ...data };
+    const merged = normalizeHomeLayoutValue({ ...(existing?.value as any || DEFAULT_HOME_LAYOUT), ...data });
 
     const updated = await prisma.$transaction(async (tx) => {
       const s = await tx.appConfiguration.upsert({

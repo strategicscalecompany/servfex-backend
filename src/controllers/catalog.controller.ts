@@ -1,4 +1,4 @@
-import { DEFAULT_HOME_LAYOUT } from './settings.controller';
+import { DEFAULT_HOME_LAYOUT, normalizeHomeLayoutValue } from './settings.controller';
 import { Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { sendSuccess, sendError } from '../utils/response';
@@ -268,10 +268,15 @@ export const getPopularServices = async (req: Request, res: Response): Promise<v
     const layoutConfig = await prisma.appConfiguration.findUnique({
       where: { key: 'HOME_LAYOUT' },
     });
-    const layoutValue = (layoutConfig?.value as any) || {};
-    const selectedIds: string[] = Array.isArray(layoutValue.popularServiceIds)
-      ? layoutValue.popularServiceIds.filter((id: unknown) => typeof id === 'string' && id.length > 0)
-      : [];
+    const layoutValue = normalizeHomeLayoutValue(layoutConfig?.value);
+    const firstEnabled = Array.isArray(layoutValue.serviceSections)
+      ? layoutValue.serviceSections.find((section: any) => section.enabled !== false)
+      : null;
+    const selectedIds: string[] = Array.isArray(firstEnabled?.serviceIds)
+      ? firstEnabled.serviceIds.filter((id: unknown) => typeof id === 'string' && id.length > 0)
+      : Array.isArray(layoutValue.popularServiceIds)
+        ? layoutValue.popularServiceIds.filter((id: unknown) => typeof id === 'string' && id.length > 0)
+        : [];
     const limit = selectedIds.length > 0 ? Math.min(Math.max(selectedIds.length, 1), 50) : requestedLimit;
 
     const cacheKey = `services:popular:${limit}:${selectedIds.join(',')}`;
@@ -409,7 +414,7 @@ export const getCatalogHomeLayout = async (_req: Request, res: Response): Promis
       where: { key: 'HOME_LAYOUT' },
     });
 
-    const data = (config?.value as any) || DEFAULT_HOME_LAYOUT;
+    const data = normalizeHomeLayoutValue(config?.value);
     const updatedAt = config?.updatedAt ? config.updatedAt.getTime() : Date.now();
     const payload = { ...data, updatedAt };
 
