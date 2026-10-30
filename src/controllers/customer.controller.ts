@@ -5,6 +5,96 @@ import { sendError, sendSuccess } from '../utils/response';
 import { hashPassword } from '../utils/password';
 import { logAuditEvent } from '../utils/audit';
 
+const RECENT_BOOKINGS_LIMIT = 8;
+
+const bookingDetailInclude = {
+  service: { select: { id: true, name: true } },
+  package: { select: { id: true, name: true, title: true } },
+  vendor: { select: { id: true, companyName: true } },
+  employee: {
+    select: {
+      id: true,
+      user: { select: { name: true, phone: true } },
+    },
+  },
+  address: true,
+} as const;
+
+function formatAddressLabel(address: {
+  addressLine1?: string | null;
+  addressLine2?: string | null;
+  landmark?: string | null;
+  city?: string | null;
+  state?: string | null;
+  postalCode?: string | null;
+} | null | undefined): string | null {
+  if (!address) return null;
+  const parts = [
+    address.addressLine1,
+    address.addressLine2,
+    address.landmark,
+    address.city,
+    address.state,
+    address.postalCode,
+  ]
+    .map((part) => (typeof part === 'string' ? part.trim() : ''))
+    .filter(Boolean);
+  return parts.length > 0 ? parts.join(', ') : null;
+}
+
+function serializeBooking(booking: any) {
+  const location =
+    (typeof booking.serviceFormattedAddress === 'string' && booking.serviceFormattedAddress.trim()) ||
+    formatAddressLabel(booking.address) ||
+    null;
+
+  return {
+    id: booking.id,
+    bookingNumber: booking.bookingNumber,
+    status: booking.status,
+    scheduledDate: booking.scheduledDate,
+    scheduledTimeSlot: booking.scheduledTimeSlot,
+    totalAmount: booking.totalAmount,
+    paymentStatus: booking.paymentStatus,
+    paymentMethod: booking.paymentMethod,
+    createdAt: booking.createdAt,
+    service: booking.service || null,
+    package: booking.package
+      ? {
+          id: booking.package.id,
+          name: booking.package.name || booking.package.title || null,
+          title: booking.package.title || booking.package.name || null,
+        }
+      : null,
+    vendor: booking.vendor || null,
+    employee: booking.employee
+      ? {
+          id: booking.employee.id,
+          name: booking.employee.user?.name || null,
+          phone: booking.employee.user?.phone || null,
+        }
+      : null,
+    address: booking.address || null,
+    location,
+    serviceLatitude: booking.serviceLatitude ?? null,
+    serviceLongitude: booking.serviceLongitude ?? null,
+  };
+}
+
+function resolveCustomerLocation(addresses: any[], recentBookings: any[]) {
+  const defaultAddress =
+    addresses.find((address) => address?.isDefault) || addresses[0] || null;
+  const latestBooking = recentBookings[0] || null;
+  const location =
+    formatAddressLabel(defaultAddress) ||
+    (typeof latestBooking?.serviceFormattedAddress === 'string' &&
+      latestBooking.serviceFormattedAddress.trim()) ||
+    formatAddressLabel(latestBooking?.address) ||
+    null;
+
+  return { defaultAddress, location };
+}
+
 export const listCustomersQuerySchema = z.object({
   query: z.object({
     page: z.string().optional().default('1').transform((v) => Math.max(1, parseInt(v, 10))),
@@ -13,6 +103,16 @@ export const listCustomersQuerySchema = z.object({
     status: z.enum(['ACTIVE', 'INACTIVE', 'SUSPENDED', 'PENDING_APPROVAL']).optional(),
     sortBy: z.enum(['createdAt', 'name', 'email']).optional().default('createdAt'),
     sortOrder: z.enum(['asc', 'desc']).optional().default('desc'),
+  }),
+});
+
+export const listCustomerBookingsQuerySchema = z.object({
+  params: z.object({
+    id: z.string().min(1, 'Customer ID is required'),
+  }),
+  query: z.object({
+    page: z.string().optional().default('1').transform((v) => Math.max(1, parseInt(v, 10))),
+    limit: z.string().optional().default('20').transform((v) => Math.min(50, Math.max(1, parseInt(v, 10)))),
   }),
 });
 
@@ -28,7 +128,7 @@ export const createCustomerSchema = z.object({
 
 export const updateCustomerSchema = z.object({
   params: z.object({
-    id: z.string().uuid(),
+    id: z.string().min(1, 'Customer ID is required'),
   }),
   body: z.object({
     name: z.string().min(2).optional(),
@@ -69,25 +169,55 @@ export const getCustomers = async (req: Request, res: Response, next: NextFuncti
         take: limit,
         orderBy: { [sortBy]: sortOrder },
         include: {
-          customerProfile: true,
-          addresses: { where: { isDefault: true } },
+          customerProfile: {
+            include: {
+              bookings: {
+                take: RECENT_BOOKINGS_LIMIT,
+                orderBy: { createdAt: 'desc' },
+                include: bookingDetailInclude,
+              },
+              _count: { select: { bookings: true } },
+            },
+          },
+          addresses: {
+            orderBy: [{ isDefault: 'desc' }, { createdAt: 'desc' }],
+          },
         },
       }),
     ]);
 
-    const sanitizedData = users.map((u) => ({
-      id: u.id,
-      name: u.name,
-      email: u.email,
-      phone: u.phone,
-      status: u.status,
-      profilePhotoUrl: u.profilePhotoUrl,
-      isVerified: u.isVerified,
-      createdAt: u.createdAt,
-      lastLoginAt: u.lastLoginAt,
-      customerProfile: u.customerProfile,
-      defaultAddress: u.addresses[0] || null,
-    }));
+    const sanitizedData = users.map((u) => {
+      const recentBookings = (u.customerProfile?.bookings || []).map(serializeBooking);
+      const { defaultAddress, location } = resolveCustomerLocation(u.addresses, u.customerProfile?.bookings || []);
+      const totalBookings = u.customerProfile?._count?.bookings ?? u.customerProfile?.totalBookings ?? 0;
+
+      return {
+        id: u.id,
+        name: u.name,
+        email: u.email,
+        phone: u.phone,
+        status: u.status,
+        profilePhotoUrl: u.profilePhotoUrl,
+        isVerified: u.isVerified,
+        createdAt: u.createdAt,
+        lastLoginAt: u.lastLoginAt,
+        location,
+        defaultAddress,
+        addresses: u.addresses,
+        customerProfile: u.customerProfile
+          ? {
+              id: u.customerProfile.id,
+              userId: u.customerProfile.userId,
+              totalBookings,
+              totalSpent: u.customerProfile.totalSpent,
+              emergencyContact: u.customerProfile.emergencyContact,
+              notes: u.customerProfile.notes,
+              createdAt: u.customerProfile.createdAt,
+            }
+          : null,
+        recentBookings,
+      };
+    });
 
     sendSuccess(res, sanitizedData, 200, {
       page,
@@ -110,16 +240,16 @@ export const getCustomerById = async (req: Request, res: Response, next: NextFun
         customerProfile: {
           include: {
             bookings: {
-              take: 10,
+              take: 20,
               orderBy: { createdAt: 'desc' },
-              include: {
-                service: { select: { name: true } },
-                vendor: { select: { companyName: true } },
-              },
+              include: bookingDetailInclude,
             },
+            _count: { select: { bookings: true } },
           },
         },
-        addresses: true,
+        addresses: {
+          orderBy: [{ isDefault: 'desc' }, { createdAt: 'desc' }],
+        },
         reviewsWritten: {
           take: 5,
           orderBy: { createdAt: 'desc' },
@@ -133,8 +263,75 @@ export const getCustomerById = async (req: Request, res: Response, next: NextFun
       return;
     }
 
-    const { passwordHash, ...safeUser } = user;
-    sendSuccess(res, safeUser);
+    const { passwordHash: _passwordHash, customerProfile, addresses, ...safeUser } = user;
+    const recentBookings = (customerProfile?.bookings || []).map(serializeBooking);
+    const { defaultAddress, location } = resolveCustomerLocation(addresses, customerProfile?.bookings || []);
+    const totalBookings = customerProfile?._count?.bookings ?? customerProfile?.totalBookings ?? 0;
+
+    sendSuccess(res, {
+      ...safeUser,
+      location,
+      defaultAddress,
+      addresses,
+      customerProfile: customerProfile
+        ? {
+            id: customerProfile.id,
+            userId: customerProfile.userId,
+            totalBookings,
+            totalSpent: customerProfile.totalSpent,
+            emergencyContact: customerProfile.emergencyContact,
+            notes: customerProfile.notes,
+            createdAt: customerProfile.createdAt,
+          }
+        : null,
+      recentBookings,
+      bookings: recentBookings,
+      reviewsWritten: user.reviewsWritten,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const getCustomerBookings = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  try {
+    const id = req.params.id as string;
+    const { page, limit } = req.query as any;
+    const skip = (page - 1) * limit;
+
+    const user = await prisma.user.findFirst({
+      where: { id, role: 'CUSTOMER', deletedAt: null },
+      include: { customerProfile: true },
+    });
+
+    if (!user) {
+      sendError(res, 'CUSTOMER_NOT_FOUND', 'Customer not found', 404);
+      return;
+    }
+
+    if (!user.customerProfile) {
+      sendSuccess(res, [], 200, { page, limit, total: 0, totalPages: 0 });
+      return;
+    }
+
+    const where = { customerId: user.customerProfile.id };
+    const [total, bookings] = await Promise.all([
+      prisma.booking.count({ where }),
+      prisma.booking.findMany({
+        where,
+        skip,
+        take: limit,
+        orderBy: { createdAt: 'desc' },
+        include: bookingDetailInclude,
+      }),
+    ]);
+
+    sendSuccess(res, bookings.map(serializeBooking), 200, {
+      page,
+      limit,
+      total,
+      totalPages: Math.ceil(total / limit),
+    });
   } catch (error) {
     next(error);
   }

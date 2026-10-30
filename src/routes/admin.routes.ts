@@ -9,10 +9,12 @@ import { globalSearch, globalSearchSchema } from '../controllers/search.controll
 import {
   getCustomers,
   getCustomerById,
+  getCustomerBookings,
   createCustomer,
   updateCustomer,
   softDeleteCustomer,
   listCustomersQuerySchema,
+  listCustomerBookingsQuerySchema,
   createCustomerSchema,
   updateCustomerSchema,
 } from '../controllers/customer.controller';
@@ -183,6 +185,7 @@ router.post('/upload', validate(uploadImageSchema), uploadImage);
 // ==========================================
 router.get('/customers', validate(listCustomersQuerySchema), getCustomers);
 router.post('/customers', validate(createCustomerSchema), createCustomer);
+router.get('/customers/:id/bookings', validate(listCustomerBookingsQuerySchema), getCustomerBookings);
 router.get('/customers/:id', getCustomerById);
 router.patch('/customers/:id', validate(updateCustomerSchema), updateCustomer);
 router.delete('/customers/:id', softDeleteCustomer);
