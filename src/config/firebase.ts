@@ -1,11 +1,13 @@
 import { initializeApp, getApps, getApp, cert, applicationDefault, App } from 'firebase-admin/app';
 import { getAuth, Auth } from 'firebase-admin/auth';
+import { getMessaging, Messaging } from 'firebase-admin/messaging';
 import * as fs from 'fs';
 import * as path from 'path';
 import { logger } from './logger';
 
 let isConfigured = false;
 let authInstance: Auth | null = null;
+let messagingInstance: Messaging | null = null;
 let appInstance: App | null = null;
 
 function initializeFirebase(): App | null {
@@ -13,6 +15,7 @@ function initializeFirebase(): App | null {
     isConfigured = true;
     appInstance = getApp();
     authInstance = getAuth(appInstance);
+    messagingInstance = getMessaging(appInstance);
     return appInstance;
   }
 
@@ -38,6 +41,7 @@ function initializeFirebase(): App | null {
         });
         isConfigured = true;
         authInstance = getAuth(appInstance);
+        messagingInstance = getMessaging(appInstance);
         logger.info('Firebase Admin SDK initialized from service account JSON file');
         return appInstance;
       }
@@ -54,6 +58,7 @@ function initializeFirebase(): App | null {
       });
       isConfigured = true;
       authInstance = getAuth(appInstance);
+      messagingInstance = getMessaging(appInstance);
       logger.info('Firebase Admin SDK initialized from environment credentials');
       return appInstance;
     }
@@ -65,6 +70,7 @@ function initializeFirebase(): App | null {
       });
       isConfigured = true;
       authInstance = getAuth(appInstance);
+      messagingInstance = getMessaging(appInstance);
       logger.info('Firebase Admin SDK initialized with Application Default Credentials');
       return appInstance;
     }
@@ -105,6 +111,17 @@ export const getFirebaseAuth = (): Auth => {
     }
   }
   return authInstance;
+};
+
+export const getFirebaseMessaging = (): Messaging => {
+  if (!messagingInstance) {
+    const app = appInstance || (getApps().length > 0 ? getApp() : null);
+    if (!app) {
+      throw new Error('Firebase Admin SDK is not initialized.');
+    }
+    messagingInstance = getMessaging(app);
+  }
+  return messagingInstance;
 };
 
 export const isFirebaseConfigured = (): boolean => isConfigured;

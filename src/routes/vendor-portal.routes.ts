@@ -46,6 +46,8 @@ import {
   updateEmployeeSchema,
   vendorInquirySchema,
   feedbackSchema,
+  sendCustomerOffer,
+  sendCustomerOfferSchema,
 } from '../controllers/vendor-portal.controller';
 import {
   createSalesVisit,
@@ -117,5 +119,8 @@ router.delete('/visits/:id', deleteSalesVisit);
 router.get('/reviews', getVendorReviews);
 router.post('/feedback', validate(feedbackSchema), submitVendorFeedback);
 router.get('/feedback', getVendorFeedback);
+
+// Customer offers (partner marketing push)
+router.post('/offers', validate(sendCustomerOfferSchema), sendCustomerOffer);
 
 export default router;

@@ -2,19 +2,44 @@ import { Request, Response } from 'express';
 import { z } from 'zod';
 import { prisma } from '../config/prisma';
 import { sendSuccess, sendError } from '../utils/response';
-import { NotificationTarget } from '@prisma/client';
+import { NotificationTarget, UserRole } from '@prisma/client';
+import {
+  deleteDevicePushToken,
+  sendPushToRoles,
+  sendPushToUserIds,
+  upsertDevicePushToken,
+} from '../services/push.service';
 
 export const registerFcmTokenSchema = z.object({
   fcmToken: z.string().min(10, 'Valid FCM token is required'),
   deviceType: z.enum(['ANDROID', 'IOS', 'WEB']).default('ANDROID'),
 });
 
+export const unregisterFcmTokenSchema = z.object({
+  fcmToken: z.string().min(10, 'Valid FCM token is required'),
+});
+
 export const broadcastNotificationSchema = z.object({
-  title: z.string().min(1, 'Title is required'),
-  message: z.string().min(1, 'Message is required'),
+  title: z.string().min(1, 'Title is required').max(80),
+  message: z.string().min(1, 'Message is required').max(400),
   target: z.enum(['ALL', 'CUSTOMERS', 'VENDORS', 'EMPLOYEES', 'SPECIFIC_USER']).default('ALL'),
   targetUserId: z.string().uuid().optional(),
 });
+
+function rolesForTarget(target: NotificationTarget): UserRole[] | 'ALL' {
+  switch (target) {
+    case 'CUSTOMERS':
+      return ['CUSTOMER'];
+    case 'VENDORS':
+      return ['VENDOR'];
+    case 'EMPLOYEES':
+      return ['EMPLOYEE'];
+    case 'ALL':
+      return 'ALL';
+    default:
+      return 'ALL';
+  }
+}
 
 /**
  * Super Admin broadcast notification
@@ -23,16 +48,38 @@ export const broadcastNotification = async (req: Request, res: Response): Promis
   try {
     const { title, message, target, targetUserId } = req.body;
 
+    if (target === 'SPECIFIC_USER' && !targetUserId) {
+      sendError(res, 'VALIDATION_ERROR', 'targetUserId is required for SPECIFIC_USER', 400);
+      return;
+    }
+
     const notification = await prisma.notification.create({
       data: {
         title,
         message,
         target: target as NotificationTarget,
         targetUserId: target === 'SPECIFIC_USER' ? targetUserId : null,
+        type: 'GENERAL',
       },
     });
 
-    sendSuccess(res, { notification }, 201);
+    const pushPayload = {
+      title,
+      body: message,
+      data: {
+        type: 'GENERAL',
+        notificationId: notification.id,
+      },
+    };
+
+    let delivered = 0;
+    if (target === 'SPECIFIC_USER' && targetUserId) {
+      delivered = await sendPushToUserIds([targetUserId], pushPayload);
+    } else {
+      delivered = await sendPushToRoles(rolesForTarget(target as NotificationTarget), pushPayload);
+    }
+
+    sendSuccess(res, { notification, delivered }, 201);
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
   }
@@ -121,12 +168,26 @@ export const getUserNotifications = async (req: Request, res: Response): Promise
 export const markNotificationAsRead = async (req: Request, res: Response): Promise<void> => {
   try {
     const id = req.params.id as string;
+    const userId = req.user!.userId;
+    const role = req.user!.role;
 
     const notification = await prisma.notification.findUnique({
       where: { id },
     });
 
     if (!notification) {
+      sendError(res, 'NOT_FOUND', 'Notification not found', 404);
+      return;
+    }
+
+    const roleTarget: NotificationTarget =
+      role === 'CUSTOMER' ? 'CUSTOMERS' : role === 'VENDOR' ? 'VENDORS' : role === 'EMPLOYEE' ? 'EMPLOYEES' : 'ALL';
+    const visible =
+      notification.target === 'ALL' ||
+      notification.target === roleTarget ||
+      notification.targetUserId === userId;
+
+    if (!visible) {
       sendError(res, 'NOT_FOUND', 'Notification not found', 404);
       return;
     }
@@ -173,16 +234,22 @@ export const registerFcmToken = async (req: Request, res: Response): Promise<voi
     const userId = req.user!.userId;
     const { fcmToken, deviceType } = req.body;
 
-    await prisma.session.create({
-      data: {
-        userId,
-        tokenHash: `fcm_${userId}_${Date.now()}`,
-        userAgent: `${deviceType}_DEVICE: ${fcmToken.slice(0, 15)}...`,
-        expiresAt: new Date(Date.now() + 60 * 24 * 60 * 60 * 1000), // 60 days
-      },
-    });
+    await upsertDevicePushToken(userId, fcmToken, deviceType);
 
-    sendSuccess(res, null, 200);
+    sendSuccess(res, { registered: true }, 200);
+  } catch (err: any) {
+    sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
+  }
+};
+
+export const unregisterFcmToken = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = req.user!.userId;
+    const { fcmToken } = req.body;
+
+    await deleteDevicePushToken(fcmToken, userId);
+
+    sendSuccess(res, { unregistered: true }, 200);
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
   }

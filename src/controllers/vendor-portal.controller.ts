@@ -22,6 +22,7 @@ import {
 } from '../services/dispatch.rules';
 import { generateStartOtp, isValidStartOtp, normalizeStartOtp, stripStartOtp } from '../utils/start-otp';
 import { toMoney, toMoneyOrNull } from '../utils/money';
+import { sendPushToUserIds } from '../services/push.service';
 import { estimatePayloadBytes, MAX_DOCUMENT_BYTES, resolveHostedUrl } from '../utils/cloudinary';
 import {
   COMPLETABLE_JOB_STATUSES,
@@ -2279,6 +2280,168 @@ export const getVendorFeedback = async (req: Request, res: Response): Promise<vo
     });
 
     sendSuccess(res, { feedback }, 200);
+  } catch (err: any) {
+    sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
+  }
+};
+
+const MAX_OFFER_CAMPAIGNS_PER_DAY = 5;
+
+export const sendCustomerOfferSchema = z.object({
+  title: z.string().min(3, 'Offer title is required').max(80),
+  message: z.string().min(8, 'Offer message is required').max(280),
+  serviceId: z.string().uuid().optional(),
+});
+
+/**
+ * Partner (VENDOR) sends a promotional offer to their customers.
+ * Falls back to all active customers if the partner has no booking history yet.
+ */
+export const sendCustomerOffer = async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (req.user!.role !== 'VENDOR') {
+      sendError(res, 'FORBIDDEN', 'Only the partner account can send customer offers', 403);
+      return;
+    }
+
+    const userId = req.user!.userId;
+    const { title, message, serviceId } = req.body as {
+      title: string;
+      message: string;
+      serviceId?: string;
+    };
+
+    const vendorProfile = await prisma.vendorProfile.findUnique({
+      where: { userId },
+      include: { user: true },
+    });
+
+    if (!vendorProfile) {
+      sendError(res, 'NOT_FOUND', 'Vendor profile not found', 404);
+      return;
+    }
+
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const recentCampaigns = await prisma.offerCampaign.count({
+      where: {
+        vendorUserId: userId,
+        createdAt: { gte: since },
+      },
+    });
+
+    if (recentCampaigns >= MAX_OFFER_CAMPAIGNS_PER_DAY) {
+      sendError(
+        res,
+        'RATE_LIMITED',
+        `You can send up to ${MAX_OFFER_CAMPAIGNS_PER_DAY} customer offers per day`,
+        429
+      );
+      return;
+    }
+
+    let catalogServiceId: string | null = null;
+    if (serviceId) {
+      const vendorService = await prisma.vendorService.findFirst({
+        where: {
+          vendorId: vendorProfile.id,
+          OR: [{ id: serviceId }, { serviceId }],
+        },
+        select: { serviceId: true },
+      });
+      if (vendorService) {
+        catalogServiceId = vendorService.serviceId;
+      } else {
+        const catalogService = await prisma.service.findFirst({
+          where: { id: serviceId, deletedAt: null },
+          select: { id: true },
+        });
+        if (!catalogService) {
+          sendError(res, 'BAD_REQUEST', 'Selected service was not found', 400);
+          return;
+        }
+        catalogServiceId = catalogService.id;
+      }
+    }
+
+    const bookings = await prisma.booking.findMany({
+      where: { vendorId: vendorProfile.id },
+      select: {
+        customer: { select: { userId: true } },
+      },
+    });
+
+    let recipientIds = [
+      ...new Set(
+        bookings
+          .map((booking) => booking.customer?.userId)
+          .filter((id): id is string => Boolean(id))
+      ),
+    ];
+
+    if (recipientIds.length === 0) {
+      const customers = await prisma.user.findMany({
+        where: {
+          role: 'CUSTOMER',
+          status: 'ACTIVE',
+          deletedAt: null,
+        },
+        select: { id: true },
+        take: 5000,
+      });
+      recipientIds = customers.map((customer) => customer.id);
+    }
+
+    if (recipientIds.length === 0) {
+      sendError(res, 'NOT_FOUND', 'No customers are available to receive this offer yet', 404);
+      return;
+    }
+
+    const senderName = vendorProfile.companyName || vendorProfile.user.name || 'ServFex Partner';
+
+    await prisma.notification.createMany({
+      data: recipientIds.map((targetUserId) => ({
+        title,
+        message,
+        target: 'SPECIFIC_USER' as const,
+        targetUserId,
+        type: 'OFFER',
+        senderUserId: userId,
+        senderName,
+        serviceId: catalogServiceId,
+      })),
+    });
+
+    const campaign = await prisma.offerCampaign.create({
+      data: {
+        vendorUserId: userId,
+        vendorId: vendorProfile.id,
+        title,
+        message,
+        serviceId: catalogServiceId,
+        recipientCount: recipientIds.length,
+      },
+    });
+
+    const delivered = await sendPushToUserIds(recipientIds, {
+      title,
+      body: message,
+      data: {
+        type: 'OFFER',
+        serviceId: catalogServiceId || '',
+        senderName,
+        campaignId: campaign.id,
+      },
+    });
+
+    sendSuccess(
+      res,
+      {
+        campaignId: campaign.id,
+        recipientCount: recipientIds.length,
+        delivered,
+      },
+      201
+    );
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
   }

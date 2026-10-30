@@ -158,6 +158,7 @@ model User {
   addresses       UserAddress[]
   documents       Document[]
   sessions        Session[]
+  pushTokens      DevicePushToken[]
   auditLogs       AuditLog[]        @relation("AdminAuditLogs")
   reviewsWritten  Review[]          @relation("CustomerReviews")
   feedbackGiven   EmployeeFeedback[] @relation("FeedbackGiven")
@@ -758,10 +759,40 @@ model Notification {
   targetUserId String?
   isRead       Boolean            @default(false)
   sentAt       DateTime           @default(now())
+  type         String             @default("GENERAL") // GENERAL | OFFER
+  senderUserId String?
+  senderName   String?
+  serviceId    String?
 
   @@index([targetUserId])
   @@index([sentAt])
   @@index([targetUserId, isRead, sentAt(sort: Desc)])
+  @@index([senderUserId, sentAt])
+}
+
+model DevicePushToken {
+  id        String   @id @default(uuid()) @map("_id")
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token     String   @unique
+  platform  String   @default("ANDROID")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+}
+
+model OfferCampaign {
+  id             String   @id @default(uuid()) @map("_id")
+  vendorUserId   String
+  vendorId       String
+  title          String
+  message        String
+  serviceId      String?
+  recipientCount Int      @default(0)
+  createdAt      DateTime @default(now())
+
+  @@index([vendorUserId, createdAt])
 }
 
 // ==========================================
