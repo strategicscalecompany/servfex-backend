@@ -541,14 +541,20 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
 
     const assignedVendorId = matchedVendor ? matchedVendor.id : null;
 
+    let selectedPackage = packageId
+      ? service.packages.find((pkg) => pkg.id === packageId)
+      : undefined;
+    if (!selectedPackage && service.packages.length > 0) {
+      selectedPackage = service.packages[0];
+    }
+
     let basePrice = asDecimal(service.startingPrice);
     let actualPackageId: string | null = null;
-    if (packageId) {
-      const selectedPackage = service.packages.find((p) => p.id === packageId);
-      if (selectedPackage) {
-        actualPackageId = selectedPackage.id;
-        basePrice = asDecimal(selectedPackage.discountedPrice ?? selectedPackage.price ?? service.startingPrice);
-      }
+    if (selectedPackage) {
+      actualPackageId = selectedPackage.id;
+      basePrice = asDecimal(
+        selectedPackage.discountedPrice ?? selectedPackage.originalPrice ?? service.startingPrice
+      );
     }
 
     // Zero GST / taxes and zero extra commission markup on bookings
