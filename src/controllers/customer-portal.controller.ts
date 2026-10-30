@@ -512,7 +512,7 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
     }
 
     if (!address) {
-      sendError(res, 'BAD_REQUEST', 'Please select or add a valid doorstep address before placing a booking', 400);
+      sendError(res, 'BAD_REQUEST', 'Please add your full location (house/flat, landmark, and area) before placing a booking', 400);
       return;
     }
 
