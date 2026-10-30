@@ -11,6 +11,8 @@ import {
   channelNameForBooking,
   evaluateCallAccess,
 } from '../services/dispatch.rules';
+import { notifyUsers } from '../services/notify.service';
+import { recordCallOutcome } from '../services/escalation.service';
 
 export const callTokenSchema = z.object({
   bookingId: z.string().min(1, 'Booking ID is required'),
@@ -101,9 +103,7 @@ export const generateCallToken = async (req: Request, res: Response): Promise<vo
     const peerName = isCustomer
       ? booking.employee?.user?.name || 'Assigned Technician'
       : booking.customer?.user?.name || 'Customer';
-    const peerPhone = isCustomer
-      ? booking.employee?.user?.phone || ''
-      : booking.customer?.user?.phone || '';
+    const peerPhone = '';
     const peerRole = isCustomer ? 'EMPLOYEE' : 'CUSTOMER';
     const peerPhotoUrl = isCustomer
       ? booking.employee?.user?.profilePhotoUrl || null
@@ -159,15 +159,12 @@ export const generateCallToken = async (req: Request, res: Response): Promise<vo
         [peerUserId]
       );
 
-      // Notification for push/offline delivery
-      await prisma.notification.create({
-        data: {
-          title: `Incoming call from ${myName}`,
-          message: `${myName} is calling you regarding booking #${booking.bookingNumber}.`,
-          target: 'SPECIFIC_USER',
-          targetUserId: peerUserId,
-        },
-      }).catch((e) => logger.warn({ e }, 'Failed to persist call notification'));
+      void notifyUsers(
+        [peerUserId],
+        `Incoming call from ${myName}`,
+        `${myName} is calling you regarding booking #${booking.bookingNumber}.`,
+        { bookingId: booking.id, callId: call.id, type: 'call:incoming' }
+      );
     }
 
     logger.info(
@@ -312,16 +309,19 @@ export const endCall = async (req: Request, res: Response): Promise<void> => {
     }
 
     const isDecline = call.status === 'RINGING' && call.calleeUserId === userId;
-    const newStatus = isDecline ? 'DECLINED' : 'ENDED';
+    const isMissed = call.status === 'RINGING' && call.callerUserId === userId;
+    const newStatus = isDecline ? 'DECLINED' : isMissed ? 'MISSED' : 'ENDED';
 
-    const updated = await prisma.bookingCall.update({
-      where: { id: call.id },
-      data: {
-        status: newStatus,
-        endedAt: new Date(),
-        endReason: reason,
-      },
-    });
+    const updated = isMissed
+      ? await recordCallOutcome(call.id, 'MISSED')
+      : await prisma.bookingCall.update({
+          where: { id: call.id },
+          data: {
+            status: newStatus,
+            endedAt: new Date(),
+            endReason: reason,
+          },
+        });
 
     const peerUserId = call.callerUserId === userId ? call.calleeUserId : call.callerUserId;
     emitUserEvent(

@@ -21,9 +21,12 @@ import {
   approximateCoordinate,
   LocationViewerRole,
 } from '../services/dispatch.rules';
-import { generateStartOtp, isValidStartOtp, normalizeStartOtp, stripStartOtp } from '../utils/start-otp';
+import { generateStartOtp, stripStartOtp } from '../utils/start-otp';
+import { setLocationSharing, verifyStartOtpForExpert } from '../services/execution.service';
+import { isValidUpiId, normalizeUpiId } from '../utils/upi';
 import { toMoney, toMoneyOrNull } from '../utils/money';
 import { sendPushToUserIds } from '../services/push.service';
+import { env } from '../config/env';
 import { estimatePayloadBytes, MAX_DOCUMENT_BYTES, resolveHostedUrl } from '../utils/cloudinary';
 import {
   COMPLETABLE_JOB_STATUSES,
@@ -62,6 +65,8 @@ export const updateVendorProfileSchema = z.object({
   longitude: z.number().optional(),
   isActive: z.boolean().optional(),
   isAvailable: z.boolean().optional(),
+  acceptingRequests: z.boolean().optional(),
+  upiId: z.string().min(5).max(320).optional(),
 });
 
 export const uploadDocumentSchema = z.object({
@@ -115,6 +120,7 @@ export const updateOrderStatusSchema = z.object({
     'DECLINED',
   ]),
   note: z.string().optional(),
+  etaMinutes: z.number().int().min(1).max(240).optional(),
 });
 
 export const verifyOrderQrSchema = z
@@ -196,6 +202,8 @@ export const updateEmployeeSchema = z.object({
   phone: z.string().min(10).optional(),
   specialization: z.string().min(2).optional(),
   isAvailable: z.boolean().optional(),
+  acceptingRequests: z.boolean().optional(),
+  upiId: z.string().min(5).max(320).optional(),
   expertKind: expertKindSchema,
 });
 
@@ -489,6 +497,10 @@ export const updateVendorProfile = async (req: Request, res: Response): Promise<
             ...(phone ? { phone } : {}),
             ...(specialization ? { specialization } : {}),
             ...(isAvailable !== undefined ? { isAvailable } : {}),
+            ...(req.body.acceptingRequests !== undefined ? { acceptingRequests: req.body.acceptingRequests } : {}),
+            ...(req.body.upiId !== undefined
+              ? { upiId: isValidUpiId(req.body.upiId) ? normalizeUpiId(req.body.upiId) : undefined }
+              : {}),
           },
         });
       });
@@ -894,12 +906,13 @@ export const getDeskContext = async (req: Request, res: Response): Promise<void>
     }
 
     const hubs = assignedHubsForActor(actor);
-    let technicians: Array<{ id: string; name: string; phone: string }> = [];
+    let technicians: Array<{ id: string; name: string; phone: string; vendorId: string }> = [];
 
-    if (actor.isSalesManager && actor.vendorId) {
+    if ((actor.isSalesManager || actor.isManager || actor.isVendor) && actor.vendorId) {
+      const technicianHubIds = actor.isManager ? hubs.map((h) => h.id) : [actor.vendorId];
       const employees = await prisma.employeeProfile.findMany({
         where: {
-          vendorId: actor.vendorId,
+          vendorId: { in: technicianHubIds },
           expertKind: 'SERVICE_PROFESSIONAL',
           user: { status: 'ACTIVE', deletedAt: null },
         },
@@ -910,6 +923,7 @@ export const getDeskContext = async (req: Request, res: Response): Promise<void>
         id: emp.id,
         name: emp.user.name,
         phone: emp.phone || emp.user.phone || '',
+        vendorId: emp.vendorId,
       }));
     }
 
@@ -918,7 +932,7 @@ export const getDeskContext = async (req: Request, res: Response): Promise<void>
       hubs,
       technicians,
       canAssignHub: actor.isManager,
-      canAssignTechnician: actor.isSalesManager,
+      canAssignTechnician: actor.isSalesManager || actor.isManager,
     });
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
@@ -961,9 +975,23 @@ function sanitizeOrderForViewer(order: any, viewer: { isVendor: boolean; employe
       : 'OTHER_EXPERT';
 
   const exactAllowed = canSeeExactLocation(role, order.status);
+  const hideCustomerContact = !viewer.isVendor && !viewer.isManager;
+
+  const sanitizedCustomer = hideCustomerContact && order.customer
+    ? {
+        ...order.customer,
+        user: order.customer.user
+          ? {
+              ...order.customer.user,
+              phone: null,
+              email: null,
+            }
+          : order.customer.user,
+      }
+    : order.customer;
 
   if (exactAllowed) {
-    return withoutOtp;
+    return stripStartOtp({ ...withoutOtp, customer: sanitizedCustomer });
   }
 
   const sanitizedAddress = order.address
@@ -977,23 +1005,12 @@ function sanitizeOrderForViewer(order: any, viewer: { isVendor: boolean; employe
       }
     : order.address;
 
-  const sanitizedCustomer = order.customer
-    ? {
-        ...order.customer,
-        user: order.customer.user
-          ? {
-              ...order.customer.user,
-              phone: null,
-              email: null,
-            }
-          : order.customer.user,
-      }
-    : order.customer;
-
   return stripStartOtp({
     ...withoutOtp,
     address: sanitizedAddress,
     customer: sanitizedCustomer,
+    serviceLatitude: approximateCoordinate(order.serviceLatitude),
+    serviceLongitude: approximateCoordinate(order.serviceLongitude),
   });
 }
 
@@ -1131,7 +1148,7 @@ export const updateOrderStatus = async (req: Request, res: Response): Promise<vo
   try {
     const userId = req.user!.userId;
     const id = req.params.id as string;
-    const { status, note } = req.body;
+    const { status, note, etaMinutes } = req.body;
 
     const user = await prisma.user.findUnique({
       where: { id: userId },
@@ -1183,7 +1200,7 @@ export const updateOrderStatus = async (req: Request, res: Response): Promise<vo
         return;
       }
       if (status === 'ACCEPTED') {
-        await acceptAssignment(userId, id);
+        await acceptAssignment(userId, id, etaMinutes);
         const order = await prisma.booking.findUnique({
           where: { id },
           include: ORDER_LIST_INCLUDE,
@@ -1302,83 +1319,18 @@ export const verifyOrderOtp = async (req: Request, res: Response): Promise<void>
   try {
     const userId = req.user!.userId;
     const id = req.params.id as string;
-    const token = normalizeStartOtp(req.body.otp || req.body.startOtp || req.body.token || req.body.qrToken);
-
-    const { user, vendorId } = await resolvePortalActor(userId);
-
-    let booking;
-    if (vendorId && (user?.vendorProfile || user?.managerProfile)) {
-      booking = await prisma.booking.findFirst({
-        where: { id, vendorId },
-      });
-    } else if (user?.employeeProfile) {
-      booking = await prisma.booking.findFirst({
-        where: isTestingWorkflowEnabled()
-          ? { id, employeeId: user.employeeProfile.id }
-          : {
-              id,
-              OR: [
-                { employeeId: user.employeeProfile.id },
-                { vendorId: user.employeeProfile.vendorId },
-              ],
-            },
-      });
-    }
-
-    if (!booking) {
-      sendError(res, 'NOT_FOUND', 'Order not found or unauthorized', 404);
-      return;
-    }
-
-    if (isTestingWorkflowEnabled() && user?.employeeProfile?.expertKind === 'SALES_MANAGER') {
-      sendError(res, 'FORBIDDEN', 'Sales Managers cannot start service jobs', 403);
-      return;
-    }
-
-    if (!isValidStartOtp(token)) {
-      sendError(res, 'INVALID_OTP', 'Enter the 4-digit start OTP shown on the customer app', 400);
-      return;
-    }
-
-    if (!booking.qrChallengeToken) {
-      sendError(res, 'BAD_REQUEST', 'No start OTP is active for this order. Ask the customer to open the booking in their app', 400);
-      return;
-    }
-
-    if (booking.qrVerifiedAt) {
-      sendError(res, 'BAD_REQUEST', 'This service has already been OTP-verified and started', 400);
-      return;
-    }
-
-    if (booking.qrChallengeToken !== token) {
-      sendError(res, 'INVALID_OTP', 'Start OTP does not match this booking. Ask the customer for the 4-digit code', 400);
-      return;
-    }
-
-    const updated = await prisma.$transaction(async (tx) => {
-      return tx.booking.update({
-        where: { id },
-        data: {
-          status: 'IN_PROGRESS',
-          qrVerifiedAt: new Date(),
-          qrChallengeToken: null,
-          statusHistory: {
-            create: {
-              oldStatus: booking.status,
-              newStatus: 'IN_PROGRESS',
-              changedBy: userId,
-              changedByRole: (user?.role as any) || 'EMPLOYEE',
-              reason: 'Customer start OTP verified on site. Work officially commenced.',
-            },
-          },
-        },
-        include: ORDER_LIST_INCLUDE,
-      });
+    const token = req.body.otp || req.body.startOtp || req.body.token || req.body.qrToken;
+    await verifyStartOtpForExpert(userId, id, token);
+    const updated = await prisma.booking.findUnique({
+      where: { id },
+      include: ORDER_LIST_INCLUDE,
     });
-
-    void emitBookingRefresh(id);
-    sendSuccess(res, { order: stripStartOtp(updated), message: 'OTP verified successfully. Service is now IN PROGRESS.' }, 200);
+    sendSuccess(res, { order: updated ? stripStartOtp(updated) : updated, message: 'OTP verified successfully. Service is now IN PROGRESS.' }, 200);
   } catch (err: any) {
+    if (err instanceof DispatchError) {
+      sendError(res, err.code, err.message, err.httpStatus);
+      return;
+    }
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
   }
 };
@@ -1448,6 +1400,15 @@ export const uploadOrderCompletionPhotos = async (req: Request, res: Response): 
         completionPhotoUrls: true,
       },
     });
+    await prisma.bookingPhoto.createMany({
+      data: hosted.map((url) => ({
+        bookingId: id,
+        employeeId: user.employeeProfile!.id,
+        url,
+        category: 'COMPLETION' as const,
+      })),
+    });
+    void emitBookingRefresh(id, { reason: 'PHOTOS_UPLOADED' });
 
     sendSuccess(res, {
       orderId: updated.id,
@@ -1606,7 +1567,8 @@ export const completeOrder = async (req: Request, res: Response): Promise<void> 
       },
     });
 
-    void emitBookingRefresh(id);
+    await setLocationSharing(id, false);
+    void emitBookingRefresh(id, { reason: 'SERVICE_COMPLETED' });
     sendSuccess(res, { order: updated, message: 'Completion submitted. Awaiting customer confirmation.' }, 200);
   } catch (err: any) {
     if (err.code === 'COMPLETION_PHOTOS_REQUIRED' || err.code === 'BAD_REQUEST' || err.code === 'ASSIGNMENT_CONFLICT') {
@@ -1718,8 +1680,15 @@ export const assignEmployeeToOrder = async (req: Request, res: Response): Promis
     const id = req.params.id as string;
     const { employeeId, expertPayout, payout, note, instructions } = req.body;
 
+    const actor = await resolvePortalActor(userId);
+    const vendorId = actor.vendorId;
+    if (!vendorId || (!actor.isVendor && !actor.isManager)) {
+      sendError(res, 'FORBIDDEN', 'Only the hub partner or operations manager can assign this order', 403);
+      return;
+    }
+
     const vendorProfile = await prisma.vendorProfile.findUnique({
-      where: { userId },
+      where: { id: vendorId },
       include: { user: true },
     });
 
@@ -1976,7 +1945,7 @@ export const updateVendorEmployee = async (req: Request, res: Response): Promise
   try {
     const userId = req.user!.userId;
     const id = req.params.id as string;
-    const { name, phone, specialization, isAvailable, expertKind } = req.body;
+    const { name, phone, specialization, isAvailable, acceptingRequests, upiId, expertKind } = req.body;
 
     const vendorProfile = await prisma.vendorProfile.findUnique({
       where: { userId },
@@ -2013,6 +1982,8 @@ export const updateVendorEmployee = async (req: Request, res: Response): Promise
           ...(phone ? { phone } : {}),
           ...(specialization ? { specialization } : {}),
           ...(isAvailable !== undefined ? { isAvailable } : {}),
+          ...(acceptingRequests !== undefined ? { acceptingRequests } : {}),
+          ...(upiId !== undefined && isValidUpiId(upiId) ? { upiId: normalizeUpiId(upiId) } : {}),
           ...(expertKind ? { expertKind: normalizeExpertKind(expertKind) } : {}),
         },
         include: { user: true },
@@ -2301,7 +2272,7 @@ export const createHubBooking = async (req: Request, res: Response): Promise<voi
     }
 
     let technicianToAssign: { id: string; userId: string } | null = null;
-    if (isSalesManager && employeeId) {
+    if ((isSalesManager || isManager) && employeeId) {
       const technician = await prisma.employeeProfile.findFirst({
         where: {
           vendorId: targetVendorId,
@@ -2417,6 +2388,7 @@ export const createHubBooking = async (req: Request, res: Response): Promise<voi
         totalAmount: toMoney(service.startingPrice),
         notes: notes || null,
         bookingSource,
+        assignmentStrategy: 'DIRECT_EXPERT',
         dispatchDueAt: null,
         serviceLatitude: latitude,
         serviceLongitude: longitude,
@@ -2424,6 +2396,7 @@ export const createHubBooking = async (req: Request, res: Response): Promise<voi
         serviceLocationNote: mapsUrl || null,
         serviceLocationConfirmedAt: new Date(),
         qrChallengeToken: generateStartOtp(),
+        qrChallengeExpiresAt: new Date(Date.now() + env.START_OTP_EXPIRY_MINUTES * 60 * 1000),
         statusHistory: {
           create: {
             newStatus: 'PENDING',
@@ -2454,7 +2427,7 @@ export const createHubBooking = async (req: Request, res: Response): Promise<voi
         vendorUserId: userId,
         employeeIdOrUserId: technicianToAssign.id,
         expertPayout: null,
-        note: 'Assigned immediately by Sales Manager',
+        note: isSalesManager ? 'Assigned immediately by Sales Manager' : 'Assigned immediately by Hub Operation Manager',
       });
       if (assigned) {
         finalBooking = assigned;

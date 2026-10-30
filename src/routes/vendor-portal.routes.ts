@@ -52,6 +52,23 @@ import {
   sendCustomerOfferSchema,
 } from '../controllers/vendor-portal.controller';
 import {
+  availabilitySchema,
+  chatMessageSchema,
+  getMyProfessionalProfile,
+  getOrderMessages,
+  getOrderTracking,
+  getPaymentQr,
+  listEscalations,
+  locationPingSchema,
+  pingOrderLocation,
+  postOrderMessage,
+  resolveEscalationSchema,
+  resolveEscalationTicket,
+  updateMyAvailability,
+  updateMyUpi,
+  upiSchema,
+} from '../controllers/execution.controller';
+import {
   createSalesVisit,
   createSalesVisitSchema,
   deleteSalesVisit,
@@ -105,6 +122,16 @@ router.post('/orders/:id/completion-photos', validate(uploadCompletionPhotosSche
 router.post('/orders/:id/call-token', generateCallToken);
 router.post('/orders/:id/record-cash', validate(recordCashSchema), recordCashCollection);
 router.post('/orders/:id/assign', validate(assignEmployeeOrderSchema), assignEmployeeToOrder);
+router.post('/orders/:id/location', validate(locationPingSchema), pingOrderLocation);
+router.get('/orders/:id/tracking', getOrderTracking);
+router.get('/orders/:id/messages', getOrderMessages);
+router.post('/orders/:id/messages', validate(chatMessageSchema), postOrderMessage);
+router.get('/orders/:id/payment-qr', getPaymentQr);
+router.get('/me/professional', getMyProfessionalProfile);
+router.patch('/me/availability', validate(availabilitySchema), updateMyAvailability);
+router.patch('/me/upi', validate(upiSchema), updateMyUpi);
+router.get('/escalations', listEscalations);
+router.post('/escalations/:id/resolve', validate(resolveEscalationSchema), resolveEscalationTicket);
 
 // Employee / Technician Management
 router.get('/employees', getVendorEmployees);

@@ -4,6 +4,7 @@ import { logger } from '../config/logger';
 import { registerDispatchHandler, scheduleDispatch, clearAllDispatchTimers } from './dispatch.scheduler';
 import { processBookingDispatch } from './dispatch.service';
 import { isTestingWorkflowEnabled } from '../config/testing-workflow';
+import { sweepMissedRingingCalls } from './escalation.service';
 
 let sweepTimer: NodeJS.Timeout | null = null;
 let isSweeping = false;
@@ -22,7 +23,7 @@ export async function sweepDueBookings(clock: () => Date = () => new Date()): Pr
       where: {
         status: { in: ['PENDING', 'ASSIGNED'] },
         dispatchDueAt: { lte: now },
-        ...(isTestingWorkflowEnabled() ? { bookingSource: { not: 'SALES_MANAGER' } } : {}),
+        bookingSource: 'CUSTOMER_APP',
       },
       select: { id: true },
       take: 20,
@@ -38,6 +39,9 @@ export async function sweepDueBookings(clock: () => Date = () => new Date()): Pr
         logger.error({ err, bookingId: b.id }, 'Sweeper failed to process booking dispatch');
       }
     }
+    await sweepMissedRingingCalls(now).catch((err) =>
+      logger.warn({ err }, 'Missed-call sweep failed')
+    );
     return processed;
   } catch (err) {
     logger.error({ err }, 'Error running dispatch sweeper');

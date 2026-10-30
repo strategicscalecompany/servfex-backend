@@ -10,28 +10,26 @@ import {
   MAX_ACTIVE_JOBS_PER_EXPERT,
   MAX_AUTO_ASSIGN_ATTEMPTS,
   addSeconds,
+  haversineKm,
+  isValidCoordinate,
   isValidExpertTravelTransition,
   rankEligibleExperts,
+  rankExpertsByScore,
+  usesCustomerAssignmentWorkflow,
+  usesDirectExpertAssignment,
   type ExpertCandidate,
+  type ScoredExpertCandidate,
 } from './dispatch.rules';
 import { isTestingWorkflowEnabled } from '../config/testing-workflow';
 import { toMoney } from '../utils/money';
+import { notifyUsers } from './notify.service';
+import { DispatchError } from './dispatch.errors';
+
+export { DispatchError };
 
 type Tx = Prisma.TransactionClient;
 
 const TX_OPTIONS = { maxWait: 10000, timeout: 20000 };
-
-/** Error with a stable machine-readable code that controllers surface as-is (zero silent failures). */
-export class DispatchError extends Error {
-  constructor(
-    public readonly code: string,
-    message: string,
-    public readonly httpStatus: number = 409
-  ) {
-    super(message);
-    this.name = 'DispatchError';
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Transaction occupancy (the atomicity primitive behind "only one expert wins")
@@ -119,6 +117,12 @@ async function runEffects(effects: Effects): Promise<void> {
       { bookingId: effects.refreshBookingId, reason: effects.reason },
       [effects.offerToUserId]
     );
+    void notifyUsers(
+      [effects.offerToUserId],
+      'New order assigned',
+      'You have a new service request. Open ServFex to accept or reject it.',
+      { bookingId: effects.refreshBookingId, type: 'booking:assignment' }
+    );
   }
   await emitBookingRefresh(effects.refreshBookingId, {
     reason: effects.reason,
@@ -162,7 +166,13 @@ const BOOKING_FOR_DISPATCH = {
   dispatchDueAt: true,
   dispatchAttempts: true,
   assignmentMethod: true,
+  assignmentStrategy: true,
+  outOfRadiusDispatch: true,
   bookingSource: true,
+  serviceId: true,
+  serviceLatitude: true,
+  serviceLongitude: true,
+  address: { select: { latitude: true, longitude: true, city: true } },
   service: { select: { name: true } },
   customer: { select: { userId: true } },
   vendor: { select: { userId: true, companyName: true, warehouseName: true } },
@@ -221,6 +231,7 @@ export async function offerToExpertInTx(tx: Tx, p: OfferParams): Promise<void> {
       assignmentMethod: p.method,
       assignedAt: now,
       dispatchDueAt: addSeconds(now, env.EXPERT_ACCEPT_WINDOW_SECONDS),
+      ...(booking.vendorId ? { vendorId: booking.vendorId } : {}),
       ...(p.expertPayout ? { expertPayout: toMoney(p.expertPayout) } : {}),
       ...(p.dispatchNote ? { notes: p.dispatchNote } : {}),
     },
@@ -265,8 +276,8 @@ async function notifyOffer(tx: Tx, p: OfferParams): Promise<void> {
   });
   await tx.notification.create({
     data: {
-      title: `Expert assigned #${booking.bookingNumber}`,
-      message: `${employee.userName} has been assigned to your ${booking.service.name} booking and will confirm shortly.`,
+      title: `Your service professional has been assigned`,
+      message: `${employee.userName} has been assigned to your ${booking.service.name} booking. They will reach your location at the estimated arrival time.`,
       target: 'SPECIFIC_USER',
       targetUserId: booking.customer.userId,
     },
@@ -289,23 +300,34 @@ async function notifyOffer(tx: Tx, p: OfferParams): Promise<void> {
 
 type AutoAssignOutcome = 'ASSIGNED' | 'NO_EXPERT' | 'EXHAUSTED';
 
+function bookingServicePoint(booking: DispatchBooking): { lat: number; lng: number } | null {
+  const lat = booking.serviceLatitude ?? booking.address?.latitude ?? null;
+  const lng = booking.serviceLongitude ?? booking.address?.longitude ?? null;
+  return isValidCoordinate(lat, lng) ? { lat: lat as number, lng: lng as number } : null;
+}
+
 async function loadExpertCandidates(
   tx: Tx,
   booking: DispatchBooking
 ): Promise<{ candidates: ExpertCandidate[]; nameById: Map<string, string> }> {
+  if (!booking.vendorId) {
+    return { candidates: [], nameById: new Map() };
+  }
   const experts = await tx.employeeProfile.findMany({
     where: {
-      vendorId: booking.vendorId as string,
+      vendorId: booking.vendorId,
       ...(isTestingWorkflowEnabled() ? { expertKind: 'SERVICE_PROFESSIONAL' } : {}),
     },
     select: {
       id: true,
       userId: true,
       isAvailable: true,
+      acceptingRequests: true,
       lastAssignedAt: true,
       completedJobs: true,
       expertKind: true,
       user: { select: { name: true, status: true, deletedAt: true } },
+      vendor: { select: { isActive: true } },
     },
   });
 
@@ -337,6 +359,8 @@ async function loadExpertCandidates(
     id: e.id,
     userId: e.userId,
     isAvailable: e.isAvailable,
+    acceptingRequests: e.acceptingRequests,
+    vendorActive: e.vendor?.isActive !== false,
     userActive: e.user.status === 'ACTIVE' && e.user.deletedAt === null,
     lastAssignedAt: e.lastAssignedAt,
     completedJobs: e.completedJobs,
@@ -347,28 +371,170 @@ async function loadExpertCandidates(
   return { candidates, nameById: new Map(experts.map((e) => [e.id, e.user.name])) };
 }
 
-async function autoAssignInTx(tx: Tx, booking: DispatchBooking, now: Date): Promise<AutoAssignOutcome> {
-  if (!booking.vendorId) return 'NO_EXPERT';
+async function loadNearbyScoredExperts(
+  tx: Tx,
+  booking: DispatchBooking
+): Promise<{ ranked: ScoredExpertCandidate[]; nameById: Map<string, string> }> {
+  const point = bookingServicePoint(booking);
+  const maxKm = env.OUT_OF_RADIUS_MAX_DISTANCE_KM;
+  const vendors = await tx.vendorProfile.findMany({
+    where: { isActive: true, kycStatus: { not: 'REJECTED' } },
+    select: {
+      id: true,
+      isActive: true,
+      latitude: true,
+      longitude: true,
+      vendorServices: { where: { isActive: true }, select: { serviceId: true } },
+      employees: {
+        where: {
+          expertKind: 'SERVICE_PROFESSIONAL',
+          isAvailable: true,
+          acceptingRequests: true,
+        },
+        select: {
+          id: true,
+          userId: true,
+          isAvailable: true,
+          acceptingRequests: true,
+          lastAssignedAt: true,
+          completedJobs: true,
+          lastLatitude: true,
+          lastLongitude: true,
+          lastLocationAt: true,
+          user: { select: { name: true, status: true, deletedAt: true } },
+        },
+      },
+    },
+  });
 
-  const { candidates, nameById } = await loadExpertCandidates(tx, booking);
+  const expertIds = vendors.flatMap((v) => v.employees.map((e) => e.id));
+  const [busy, previous] = await Promise.all([
+    expertIds.length
+      ? tx.booking.groupBy({
+          by: ['employeeId'],
+          where: {
+            employeeId: { in: expertIds },
+            id: { not: booking.id },
+            status: { in: ACTIVE_JOB_STATUSES },
+            scheduledDate: booking.scheduledDate,
+            scheduledTimeSlot: booking.scheduledTimeSlot,
+          },
+          _count: { _all: true },
+        })
+      : Promise.resolve([] as Array<{ employeeId: string | null; _count: { _all: number } }>),
+    tx.bookingAssignment.findMany({
+      where: { bookingId: booking.id, status: { in: ['REJECTED', 'EXPIRED'] } },
+      select: { employeeId: true },
+    }),
+  ]);
+  const busyByExpert = new Map(busy.map((b) => [b.employeeId as string, b._count._all]));
+  const excluded = new Set(previous.map((a) => a.employeeId));
+  const nameById = new Map<string, string>();
+  const scoredInput: Array<Omit<ScoredExpertCandidate, 'score' | 'etaMinutes'> & { etaMinutes?: number | null }> = [];
 
-  for (const pick of rankEligibleExperts(candidates)) {
-    try {
-      await offerToExpertInTx(tx, {
-        booking,
-        employee: { id: pick.id, userId: pick.userId, userName: nameById.get(pick.id) ?? 'Expert' },
-        method: 'AUTO',
-        assignedBy: 'SYSTEM',
-        changedByRole: 'SUPER_ADMIN',
-        reason: `Auto-assigned after ${env.PROVIDER_RESPONSE_WINDOW_SECONDS}s without provider action (fair rotation)`,
-        now,
+  for (const vendor of vendors) {
+    const offersService =
+      vendor.vendorServices.length === 0 || vendor.vendorServices.some((vs) => vs.serviceId === booking.serviceId);
+    if (!offersService) continue;
+    for (const expert of vendor.employees) {
+      nameById.set(expert.id, expert.user.name);
+      const originLat = expert.lastLatitude ?? vendor.latitude;
+      const originLng = expert.lastLongitude ?? vendor.longitude;
+      const distanceKm =
+        point && isValidCoordinate(originLat, originLng)
+          ? haversineKm(point.lat, point.lng, originLat as number, originLng as number)
+          : null;
+      if (distanceKm != null && distanceKm > maxKm) continue;
+      scoredInput.push({
+        id: expert.id,
+        userId: expert.userId,
+        vendorId: vendor.id,
+        isAvailable: expert.isAvailable,
+        acceptingRequests: expert.acceptingRequests,
+        vendorActive: vendor.isActive,
+        userActive: expert.user.status === 'ACTIVE' && expert.user.deletedAt === null,
+        lastAssignedAt: expert.lastAssignedAt,
+        completedJobs: expert.completedJobs,
+        activeJobs: busyByExpert.get(expert.id) ?? 0,
+        excludedForBooking: excluded.has(expert.id),
+        offersService,
+        distanceKm,
       });
-      await tx.booking.update({ where: { id: booking.id }, data: { dispatchAttempts: 0 } });
+    }
+  }
+
+  return {
+    ranked: rankExpertsByScore(scoredInput, {
+      maxDistanceKm: maxKm,
+      speedKmh: env.AVG_TRAVEL_SPEED_KMH,
+    }),
+    nameById,
+  };
+}
+
+async function offerAutoPick(
+  tx: Tx,
+  booking: DispatchBooking,
+  pick: { id: string; userId: string },
+  nameById: Map<string, string>,
+  now: Date,
+  reason: string
+): Promise<boolean> {
+  try {
+    await offerToExpertInTx(tx, {
+      booking,
+      employee: { id: pick.id, userId: pick.userId, userName: nameById.get(pick.id) ?? 'Expert' },
+      method: 'AUTO',
+      assignedBy: 'SYSTEM',
+      changedByRole: 'SUPER_ADMIN',
+      reason,
+      now,
+    });
+    await tx.booking.update({
+      where: { id: booking.id },
+      data: { dispatchAttempts: 0 },
+    });
+    return true;
+  } catch (err) {
+    if (err instanceof DispatchError && (err.code === 'EXPERT_BUSY' || err.code === 'ASSIGNMENT_CONFLICT')) {
+      return false;
+    }
+    throw err;
+  }
+}
+
+async function autoAssignInTx(tx: Tx, booking: DispatchBooking, now: Date): Promise<AutoAssignOutcome> {
+  const windowReason = `Auto-assigned after ${env.PROVIDER_RESPONSE_WINDOW_SECONDS}s without provider action`;
+  const nearbyReason = booking.outOfRadiusDispatch
+    ? 'Auto-assigned nearest eligible professional (customer outside vendor service radius)'
+    : 'Auto-assigned nearest eligible professional after warehouse pool was empty';
+
+  if (booking.vendorId && !booking.outOfRadiusDispatch) {
+    const { candidates, nameById } = await loadExpertCandidates(tx, booking);
+    for (const pick of rankEligibleExperts(candidates)) {
+      const won = await offerAutoPick(tx, booking, pick, nameById, now, windowReason);
+      if (won) return 'ASSIGNED';
+    }
+  }
+
+  const { ranked, nameById } = await loadNearbyScoredExperts(tx, booking);
+  for (const pick of ranked) {
+    const won = await offerAutoPick(
+      tx,
+      { ...booking, vendorId: booking.vendorId || pick.vendorId },
+      pick,
+      nameById,
+      now,
+      nearbyReason
+    );
+    if (won) {
+      if (!booking.vendorId) {
+        await tx.booking.update({
+          where: { id: booking.id },
+          data: { vendorId: pick.vendorId, outOfRadiusDispatch: true, assignmentStrategy: 'NEAREST_EXPERT' },
+        });
+      }
       return 'ASSIGNED';
-    } catch (err) {
-      // Candidate became busy between ranking and locking: try the next one.
-      if (err instanceof DispatchError && err.code === 'EXPERT_BUSY') continue;
-      throw err;
     }
   }
 
@@ -437,6 +603,7 @@ export type DispatchResult =
   | 'SKIPPED_NOT_DUE'
   | 'SKIPPED_STATE_CHANGED'
   | 'SKIPPED_TESTING_WORKFLOW'
+  | 'SKIPPED_DIRECT_ASSIGNMENT'
   | 'AUTO_ASSIGNED'
   | 'NO_EXPERT'
   | 'OFFER_EXPIRED';
@@ -471,6 +638,19 @@ export async function processBookingDispatch(
     }
     if (!booking.dispatchDueAt || booking.dispatchDueAt.getTime() > now.getTime()) {
       result = 'SKIPPED_NOT_DUE';
+      return;
+    }
+    if (
+      booking.assignmentStrategy === 'DIRECT_EXPERT' ||
+      usesDirectExpertAssignment(booking.bookingSource) ||
+      !usesCustomerAssignmentWorkflow(booking.bookingSource)
+    ) {
+      await tx.booking.updateMany({
+        where: { id: bookingId },
+        data: { dispatchDueAt: null },
+      });
+      logger.info({ bookingId, source: booking.bookingSource }, 'Auto-dispatch skipped for manager/direct assignment booking');
+      result = 'SKIPPED_DIRECT_ASSIGNMENT';
       return;
     }
     if (isTestingWorkflowEnabled() && booking.bookingSource === 'SALES_MANAGER') {
@@ -636,9 +816,13 @@ async function loadExpertContext(tx: Tx, userId: string) {
  * (re-assigned, expired, cancelled) is refused with 409 instead of silently succeeding.
  * Repeating the call after success is idempotent (returns success, no duplicate events).
  */
-export async function acceptAssignment(userId: string, bookingId: string) {
+export async function acceptAssignment(userId: string, bookingId: string, etaMinutes?: number | null) {
   const now = new Date();
   const effects: Effects = { refreshBookingId: bookingId, reason: 'EXPERT_ACCEPTED' };
+  const confirmedEta =
+    typeof etaMinutes === 'number' && Number.isFinite(etaMinutes)
+      ? Math.max(1, Math.min(Math.round(etaMinutes), 240))
+      : null;
 
   const result = await prisma.$transaction(async (tx) => {
     const expert = await loadExpertContext(tx, userId);
@@ -660,7 +844,14 @@ export async function acceptAssignment(userId: string, bookingId: string) {
 
     const flipped = await tx.booking.updateMany({
       where: { id: bookingId, status: 'ASSIGNED', employeeId: expert.id },
-      data: { status: 'ACCEPTED', acceptedAt: now, dispatchDueAt: null, dispatchAttempts: 0 },
+      data: {
+        status: 'ACCEPTED',
+        acceptedAt: now,
+        dispatchDueAt: null,
+        dispatchAttempts: 0,
+        locationSharingEnabled: true,
+        ...(confirmedEta ? { etaMinutes: confirmedEta, etaConfirmedAt: now } : {}),
+      },
     });
     if (flipped.count !== 1) {
       throw new DispatchError('ASSIGNMENT_CONFLICT', 'Assignment changed while accepting. Please refresh.', 409);
@@ -671,10 +862,11 @@ export async function acceptAssignment(userId: string, bookingId: string) {
     });
     await recordHistory(tx, bookingId, 'ASSIGNED', 'ACCEPTED', userId, 'EMPLOYEE', `Order accepted by ${expert.user.name}`);
 
+    const etaText = confirmedEta ? ` They will reach your location in about ${confirmedEta} minutes.` : ' They will reach your location at the estimated arrival time.';
     await tx.notification.create({
       data: {
-        title: `Expert confirmed #${booking.bookingNumber}`,
-        message: `${expert.user.name} accepted your ${booking.service.name} booking and will head to your location.`,
+        title: 'Your service professional has been assigned',
+        message: `${expert.user.name} accepted your ${booking.service.name} booking.${etaText}`,
         target: 'SPECIFIC_USER',
         targetUserId: booking.customer.userId,
       },
@@ -732,9 +924,17 @@ export async function rejectAssignment(userId: string, bookingId: string, reason
       where: { bookingId, employeeId: expert.id, status: 'OFFERED' },
       data: { status: 'REJECTED', respondedAt: now, reason: reason?.trim() || 'Rejected by expert' },
     });
+    const keepDirect = usesDirectExpertAssignment(booking.bookingSource) || booking.assignmentStrategy === 'DIRECT_EXPERT';
     await tx.booking.update({
       where: { id: bookingId },
-      data: { status: 'PENDING', employeeId: null, assignmentMethod: null, dispatchDueAt: now, dispatchAttempts: 0 },
+      data: {
+        status: 'PENDING',
+        employeeId: null,
+        assignmentMethod: null,
+        locationSharingEnabled: false,
+        dispatchDueAt: keepDirect ? null : now,
+        dispatchAttempts: 0,
+      },
     });
     await recordHistory(
       tx, bookingId, 'ASSIGNED', 'PENDING', userId, 'EMPLOYEE',
@@ -760,8 +960,11 @@ export async function rejectAssignment(userId: string, bookingId: string, reason
     where: { id: bookingId },
     select: { bookingSource: true },
   });
-  if (isTestingWorkflowEnabled() && rejected?.bookingSource === 'SALES_MANAGER') {
-    logger.info({ bookingId }, 'Rejection left Sales Manager booking PENDING for Provider assignment');
+  if (
+    usesDirectExpertAssignment(rejected?.bookingSource) ||
+    (isTestingWorkflowEnabled() && rejected?.bookingSource === 'SALES_MANAGER')
+  ) {
+    logger.info({ bookingId }, 'Rejection left manager-created booking PENDING without auto-dispatch');
     return outcome;
   }
   // Re-offer right away; if this fails the sweeper retries because dispatchDueAt is already due.
@@ -814,7 +1017,7 @@ export async function advanceTravelStatus(userId: string, bookingId: string, tar
         message:
           target === 'ON_THE_WAY'
             ? `${expert.user.name} is heading to your location.`
-            : `${expert.user.name} has arrived. You can call them from the booking screen if needed.`,
+            : 'Your service professional has arrived. Please be available to start your service.',
         target: 'SPECIFIC_USER',
         targetUserId: booking.customer.userId,
       },
@@ -838,8 +1041,14 @@ export async function releaseDispatchOnCancel(bookingId: string): Promise<void> 
       data: { status: 'CANCELLED', respondedAt: now },
     });
     await tx.booking.updateMany({
-      where: { id: bookingId, status: 'CANCELLED' },
-      data: { dispatchDueAt: null },
+      where: { id: bookingId, status: { in: ['CANCELLED', 'DECLINED', 'COMPLETED'] } },
+      data: {
+        dispatchDueAt: null,
+        locationSharingEnabled: false,
+        professionalLastLatitude: null,
+        professionalLastLongitude: null,
+        professionalLastLocationAt: null,
+      },
     });
   }, TX_OPTIONS);
 }

@@ -18,7 +18,7 @@ import { corsMiddleware } from './middleware/cors';
 import { timingMiddleware } from './middleware/timing.middleware';
 import { verifyAccessToken } from './utils/token';
 import { getFirebaseAuth, isFirebaseConfigured } from './config/firebase';
-import { setRealtimeServer } from './utils/realtime';
+import { bookingRoom, setRealtimeServer } from './utils/realtime';
 
 // Route Handlers
 import authRoutes from './routes/auth.routes';
@@ -129,6 +129,42 @@ io.on('connection', (socket) => {
     socket.join('admins');
   }
   logger.info({ socketId: socket.id, userId: socket.data.userId, role: socket.data.role }, 'Realtime client connected');
+
+  socket.on('booking:join', async (payload: { bookingId?: string }, ack?: (result: { ok: boolean }) => void) => {
+    try {
+      const bookingId = payload?.bookingId;
+      if (!bookingId) {
+        ack?.({ ok: false });
+        return;
+      }
+      const booking = await prisma.booking.findUnique({
+        where: { id: bookingId },
+        select: {
+          customer: { select: { userId: true } },
+          employee: { select: { userId: true } },
+          vendor: { select: { userId: true } },
+        },
+      });
+      const userId = socket.data.userId as string;
+      const allowed =
+        socket.data.role === 'SUPER_ADMIN' ||
+        booking?.customer.userId === userId ||
+        booking?.employee?.userId === userId ||
+        booking?.vendor?.userId === userId;
+      if (!allowed) {
+        ack?.({ ok: false });
+        return;
+      }
+      socket.join(bookingRoom(bookingId));
+      ack?.({ ok: true });
+    } catch {
+      ack?.({ ok: false });
+    }
+  });
+
+  socket.on('booking:leave', (payload: { bookingId?: string }) => {
+    if (payload?.bookingId) socket.leave(bookingRoom(payload.bookingId));
+  });
 
   socket.on('disconnect', (reason) => {
     logger.info({ socketId: socket.id, reason }, 'Realtime client disconnected');

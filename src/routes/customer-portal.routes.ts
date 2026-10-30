@@ -30,6 +30,13 @@ import {
   submitReviewSchema,
   reportIssueSchema,
 } from '../controllers/customer-portal.controller';
+import {
+  chatMessageSchema,
+  getActiveCustomerBooking,
+  getOrderMessages,
+  getOrderTracking,
+  postOrderMessage,
+} from '../controllers/execution.controller';
 
 const router = Router();
 
@@ -63,7 +70,11 @@ router.patch('/addresses/:id/default', setDefaultCustomerAddress);
 // Booking Lifecycle
 router.post('/bookings', validate(createBookingSchema), createBooking);
 router.get('/bookings', getCustomerBookings);
+router.get('/bookings/active', getActiveCustomerBooking);
 router.get('/bookings/:id', getCustomerBookingById);
+router.get('/bookings/:id/tracking', getOrderTracking);
+router.get('/bookings/:id/messages', getOrderMessages);
+router.post('/bookings/:id/messages', validate(chatMessageSchema), postOrderMessage);
 router.get('/bookings/:id/start-otp', getBookingStartOtp);
 router.get('/bookings/:id/qr-token', getBookingQrToken);
 router.post('/bookings/:id/call-token', generateCallToken);

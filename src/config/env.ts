@@ -43,11 +43,18 @@ const envSchema = z.object({
   AGORA_TOKEN_TTL_SECONDS: z.string().default('1800').transform((val) => parseInt(val, 10)),
 
   // Booking dispatch: provider-first window, then server-side auto-assignment
-  PROVIDER_RESPONSE_WINDOW_SECONDS: z.string().default('60').transform((val) => parseInt(val, 10)),
+  PROVIDER_RESPONSE_WINDOW_SECONDS: z.string().default('120').transform((val) => parseInt(val, 10)),
   AUTO_ASSIGN_RETRY_SECONDS: z.string().default('30').transform((val) => parseInt(val, 10)),
   EXPERT_ACCEPT_WINDOW_SECONDS: z.string().default('120').transform((val) => parseInt(val, 10)),
   DISPATCH_SWEEP_INTERVAL_MS: z.string().default('15000').transform((val) => parseInt(val, 10)),
   DISPATCH_WORKER_ENABLED: z.string().default('true').transform((val) => val !== 'false'),
+  OUT_OF_RADIUS_MAX_DISTANCE_KM: z.string().default('25').transform((val) => parseFloat(val)),
+  AVG_TRAVEL_SPEED_KMH: z.string().default('25').transform((val) => parseFloat(val)),
+  START_OTP_MAX_ATTEMPTS: z.string().default('5').transform((val) => parseInt(val, 10)),
+  START_OTP_EXPIRY_MINUTES: z.string().default('180').transform((val) => parseInt(val, 10)),
+  START_OTP_LOCKOUT_MINUTES: z.string().default('15').transform((val) => parseInt(val, 10)),
+  MISSED_CALL_ESCALATION_THRESHOLD: z.string().default('4').transform((val) => parseInt(val, 10)),
+  LOCATION_PING_MIN_INTERVAL_MS: z.string().default('8000').transform((val) => parseInt(val, 10)),
 
   // Temporary Expert testing workflow. Set to "false" to restore the original auto-dispatch
   // and unrestricted Expert portal behaviour without deleting any code.

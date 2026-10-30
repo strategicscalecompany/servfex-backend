@@ -104,6 +104,41 @@ enum AssignmentMethod {
   AUTO
 }
 
+/// How a booking enters the expert-assignment pipeline. Execution after ACCEPTED is shared.
+enum AssignmentStrategy {
+  VENDOR_WINDOW
+  NEAREST_EXPERT
+  DIRECT_EXPERT
+}
+
+enum EscalationStatus {
+  OPEN
+  ACKNOWLEDGED
+  IN_PROGRESS
+  RESOLVED
+  CLOSED
+}
+
+enum EscalationReason {
+  MISSED_CALLS
+  CUSTOMER_UNREACHABLE
+  ASSIGNMENT_FAILED
+  OTHER
+}
+
+enum ChatSenderRole {
+  CUSTOMER
+  EXPERT
+  OPERATIONS_MANAGER
+}
+
+enum PhotoCategory {
+  COMPLETION
+  BEFORE
+  AFTER
+  OTHER
+}
+
 enum AssignmentStatus {
   OFFERED
   ACCEPTED
@@ -246,7 +281,12 @@ model EmployeeProfile {
   completedJobs  Int             @default(0)
   phone          String
   isAvailable    Boolean         @default(true)
+  acceptingRequests Boolean      @default(true)
   lastAssignedAt DateTime?
+  lastLatitude   Float?
+  lastLongitude  Float?
+  lastLocationAt DateTime?
+  upiId          String?
   createdAt      DateTime        @default(now())
   updatedAt      DateTime        @updatedAt
 
@@ -255,11 +295,13 @@ model EmployeeProfile {
   feedback       EmployeeFeedback[]
   assignments    BookingAssignment[]
   salesVisits    SalesVisit[]
+  photos         BookingPhoto[]
 
   @@index([vendorId])
   @@index([isAvailable])
   @@index([vendorId, isAvailable])
   @@index([vendorId, expertKind])
+  @@index([acceptingRequests])
 }
 
 model ManagerProfile {
@@ -533,6 +575,19 @@ model Booking {
   onTheWayAt             DateTime?
   arrivedAt              DateTime?
 
+  assignmentStrategy     AssignmentStrategy?
+  etaMinutes             Int?
+  etaConfirmedAt         DateTime?
+  startOtpAttempts       Int                  @default(0)
+  startOtpLockedUntil    DateTime?
+  missedCallCount        Int                  @default(0)
+  locationSharingEnabled Boolean              @default(false)
+  professionalLastLatitude  Float?
+  professionalLastLongitude Float?
+  professionalLastLocationAt DateTime?
+  outOfRadiusDispatch    Boolean              @default(false)
+  lastChatAt             DateTime?
+
   // Hosted completion photograph URLs. Empty for historic bookings; required (min 4) only while the
   // temporary expert testing workflow is enabled.
   completionPhotoUrls    String[]             @default([])
@@ -546,6 +601,9 @@ model Booking {
   review             Review?
   assignments        BookingAssignment[]
   calls              BookingCall[]
+  messages           BookingMessage[]
+  photos             BookingPhoto[]
+  escalations        EscalationTicket[]
 
   @@index([customerId])
   @@index([vendorId])
@@ -564,6 +622,8 @@ model Booking {
   @@index([vendorId, bookingSource, createdAt(sort: Desc)])
   @@index([employeeId, scheduledDate(sort: Desc)])
   @@index([vendorId, employeeId, status])
+  @@index([assignmentStrategy, status])
+  @@index([outOfRadiusDispatch, status])
 }
 
 /// Lead-generation visit captured by a Sales Manager at a warehouse, hub, or business location.
@@ -623,6 +683,76 @@ model BookingAssignment {
   @@index([bookingId, status])
   @@index([employeeId, status])
   @@index([bookingId, offeredAt])
+}
+
+/// Order-scoped in-app chat. Phone numbers are never stored in message bodies by the API.
+model BookingMessage {
+  id            String         @id @default(uuid()) @map("_id")
+  bookingId     String
+  booking       Booking        @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  senderUserId  String
+  senderRole    ChatSenderRole
+  body          String
+  createdAt     DateTime       @default(now())
+  readAt        DateTime?
+
+  @@index([bookingId, createdAt])
+  @@index([senderUserId, createdAt])
+}
+
+model BookingPhoto {
+  id         String        @id @default(uuid()) @map("_id")
+  bookingId  String
+  booking    Booking       @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  employeeId String?
+  employee   EmployeeProfile? @relation(fields: [employeeId], references: [id], onDelete: SetNull)
+  url        String
+  category   PhotoCategory @default(COMPLETION)
+  createdAt  DateTime      @default(now())
+
+  @@index([bookingId, createdAt])
+  @@index([employeeId])
+}
+
+model EscalationTicket {
+  id                     String            @id @default(uuid()) @map("_id")
+  bookingId              String
+  booking                Booking           @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  reason                 EscalationReason  @default(MISSED_CALLS)
+  status                 EscalationStatus  @default(OPEN)
+  callAttemptCount       Int               @default(0)
+  customerName           String
+  customerPhone          String
+  professionalName       String?
+  professionalPhone      String?
+  professionalId         String?
+  orderLocation          String?
+  orderStatusSnapshot    BookingStatus
+  createdBy              String            @default("SYSTEM")
+  assignedManagerUserId  String?
+  resolvedBy             String?
+  resolvedAt             DateTime?
+  resolutionNote         String?
+  createdAt              DateTime          @default(now())
+  updatedAt              DateTime          @updatedAt
+
+  actions                EscalationAction[]
+
+  @@index([bookingId, status])
+  @@index([status, createdAt])
+  @@index([assignedManagerUserId, status])
+}
+
+model EscalationAction {
+  id           String           @id @default(uuid()) @map("_id")
+  ticketId     String
+  ticket       EscalationTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  actorUserId  String
+  action       String
+  note         String?
+  createdAt    DateTime         @default(now())
+
+  @@index([ticketId, createdAt])
 }
 
 /// Metadata for booking-scoped voice calls. No audio is stored.

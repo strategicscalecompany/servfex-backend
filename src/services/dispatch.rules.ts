@@ -36,8 +36,27 @@ export const EXACT_LOCATION_STATUSES: BookingStatus[] = [
 /** Statuses in which the customer and the assigned expert may open a private call. */
 export const CALLABLE_STATUSES: BookingStatus[] = ['ACCEPTED', 'ON_THE_WAY', 'ARRIVED', 'IN_PROGRESS'];
 
+/** Same window as calling: in-app chat is order-scoped and revoked after completion/cancel. */
+export const CHATTABLE_STATUSES: BookingStatus[] = ['ACCEPTED', 'ON_THE_WAY', 'ARRIVED', 'IN_PROGRESS'];
+
+/** Live GPS is only shared while the assigned professional is actively executing. */
+export const TRACKABLE_STATUSES: BookingStatus[] = ['ACCEPTED', 'ON_THE_WAY', 'ARRIVED', 'IN_PROGRESS'];
+
+/** Start PIN may only be verified after the professional has arrived. */
+export const START_OTP_ELIGIBLE_STATUSES: BookingStatus[] = ['ARRIVED'];
+
 /** A ringing call that is not answered within this window is marked MISSED. */
 export const CALL_RING_TIMEOUT_SECONDS = 60;
+
+export const DIRECT_ASSIGNMENT_SOURCES = ['PHONE_HUB', 'SALES_MANAGER', 'EXPERT_TEAM'] as const;
+
+export function usesDirectExpertAssignment(source: string | null | undefined): boolean {
+  return DIRECT_ASSIGNMENT_SOURCES.includes(source as (typeof DIRECT_ASSIGNMENT_SOURCES)[number]);
+}
+
+export function usesCustomerAssignmentWorkflow(source: string | null | undefined): boolean {
+  return source === 'CUSTOMER_APP' || !source;
+}
 
 // ---------------------------------------------------------------------------
 // Coordinates
@@ -175,10 +194,78 @@ export interface ExpertCandidate {
   activeJobs: number;
   /** Already rejected / let this booking's offer expire. */
   excludedForBooking: boolean;
+  acceptingRequests?: boolean;
+  vendorActive?: boolean;
 }
 
 export function isExpertEligible(e: ExpertCandidate, maxActiveJobs = MAX_ACTIVE_JOBS_PER_EXPERT): boolean {
-  return e.isAvailable && e.userActive && !e.excludedForBooking && e.activeJobs < maxActiveJobs;
+  if (!e.isAvailable) return false;
+  if (e.acceptingRequests === false) return false;
+  if (!e.userActive) return false;
+  if (e.vendorActive === false) return false;
+  if (e.excludedForBooking) return false;
+  return e.activeJobs < maxActiveJobs;
+}
+
+export interface ScoredExpertCandidate extends ExpertCandidate {
+  vendorId: string;
+  offersService: boolean;
+  distanceKm: number | null;
+  etaMinutes: number | null;
+  score: number;
+}
+
+export interface ExpertScoringOptions {
+  maxDistanceKm: number;
+  speedKmh: number;
+}
+
+export function estimateEtaMinutes(distanceKm: number | null | undefined, speedKmh: number): number | null {
+  if (distanceKm == null || !Number.isFinite(distanceKm) || speedKmh <= 0) return null;
+  return Math.max(1, Math.round((distanceKm / speedKmh) * 60));
+}
+
+/**
+ * Higher is better. Distance is the largest factor, but an unavailable or occupied
+ * professional never wins because they are filtered out before scoring.
+ */
+export function scoreExpertCandidate(
+  candidate: Omit<ScoredExpertCandidate, 'score' | 'etaMinutes'> & { etaMinutes?: number | null },
+  options: ExpertScoringOptions
+): number {
+  const maxDistance = Math.max(options.maxDistanceKm, 0.1);
+  const distanceScore =
+    candidate.distanceKm == null ? 8 : (1 - Math.min(candidate.distanceKm / maxDistance, 1)) * 40;
+  const availabilityScore = candidate.isAvailable && candidate.acceptingRequests !== false ? 25 : 0;
+  const workloadScore = (1 - Math.min(candidate.activeJobs / Math.max(MAX_ACTIVE_JOBS_PER_EXPERT, 1), 1)) * 15;
+  const vendorScore = candidate.vendorActive === false ? 0 : 10;
+  const serviceScore = candidate.offersService ? 5 : 0;
+  const eta = candidate.etaMinutes ?? estimateEtaMinutes(candidate.distanceKm, options.speedKmh);
+  const etaScore = eta == null ? 2 : (1 - Math.min(eta / 90, 1)) * 5;
+  return Math.round((distanceScore + availabilityScore + workloadScore + vendorScore + serviceScore + etaScore) * 10) / 10;
+}
+
+export function rankExpertsByScore(
+  candidates: Array<Omit<ScoredExpertCandidate, 'score' | 'etaMinutes'> & { etaMinutes?: number | null }>,
+  options: ExpertScoringOptions,
+  maxActiveJobs = MAX_ACTIVE_JOBS_PER_EXPERT
+): ScoredExpertCandidate[] {
+  return candidates
+    .filter((c) => isExpertEligible(c, maxActiveJobs) && c.offersService)
+    .map((c) => {
+      const etaMinutes = c.etaMinutes ?? estimateEtaMinutes(c.distanceKm, options.speedKmh);
+      return { ...c, etaMinutes, score: scoreExpertCandidate({ ...c, etaMinutes }, options) };
+    })
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      if (a.distanceKm != null && b.distanceKm != null && a.distanceKm !== b.distanceKm) {
+        return a.distanceKm - b.distanceKm;
+      }
+      const at = a.lastAssignedAt ? a.lastAssignedAt.getTime() : Number.NEGATIVE_INFINITY;
+      const bt = b.lastAssignedAt ? b.lastAssignedAt.getTime() : Number.NEGATIVE_INFINITY;
+      if (at !== bt) return at < bt ? -1 : 1;
+      return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+    });
 }
 
 /**

@@ -6,8 +6,9 @@ import { prisma } from '../config/prisma';
  * Realtime fan-out for booking lifecycle and call-signalling events.
  *
  * Rooms (joined only after the socket handshake token is verified against the DB):
- *   - `admins`        -> every active SUPER_ADMIN
- *   - `user:<userId>` -> that single user (vendor owner, employee, customer)
+ *   - `admins`             -> every active SUPER_ADMIN
+ *   - `user:<userId>`      -> that single user (vendor owner, employee, customer)
+ *   - `booking:<bookingId>` -> participants who explicitly joined an authorized booking room
  *
  * PRIVACY: events are never broadcast globally. Super admins receive the full payload (they already have
  * platform-wide access); every other user receives a sanitized payload containing identifiers and status only.
@@ -17,6 +18,25 @@ let ioInstance: SocketIOServer | null = null;
 
 export const setRealtimeServer = (io: SocketIOServer): void => {
   ioInstance = io;
+};
+
+export const getRealtimeServer = (): SocketIOServer | null => ioInstance;
+
+export function bookingRoom(bookingId: string): string {
+  return `booking:${bookingId}`;
+}
+
+export const emitToBookingRoom = (
+  bookingId: string,
+  event: string,
+  payload: Record<string, unknown>
+): void => {
+  if (!ioInstance) return;
+  try {
+    ioInstance.to(bookingRoom(bookingId)).emit(event, payload);
+  } catch (err) {
+    logger.warn({ err, bookingId, event }, 'Failed to emit booking-room event');
+  }
 };
 
 export interface BookingRealtimeEvent {
@@ -31,6 +51,9 @@ export interface BookingRealtimeEvent {
 
 export type UserRealtimeEventName =
   | 'booking:assignment'
+  | 'booking:location'
+  | 'booking:chat'
+  | 'booking:escalation'
   | 'call:incoming'
   | 'call:answered'
   | 'call:declined'

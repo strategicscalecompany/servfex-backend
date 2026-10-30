@@ -14,6 +14,8 @@ import {
   type WarehouseCandidate,
 } from '../services/dispatch.rules';
 import { releaseDispatchOnCancel, syncDispatchTimer } from '../services/dispatch.service';
+import { issueStartOtp, setLocationSharing } from '../services/execution.service';
+import { notifyUsers } from '../services/notify.service';
 import { scheduleDispatch } from '../services/dispatch.scheduler';
 import { asDecimal, toMoney } from '../utils/money';
 import { normalizeIndianMobile } from '../utils/otp.util';
@@ -159,6 +161,22 @@ function normalizeOptionalContact(raw?: string | null): string | null | undefine
   const digits = String(raw || '').replace(/\D/g, '').slice(-10);
   if (!digits) return null;
   return digits.length === 10 ? digits : undefined;
+}
+
+function publicProfessional(employee: any) {
+  if (!employee) return employee;
+  const name = employee.user?.name || employee.name || 'Service professional';
+  return {
+    id: employee.id,
+    specialization: employee.specialization || null,
+    rating: employee.rating ?? null,
+    user: {
+      name,
+      profilePhotoUrl: employee.user?.profilePhotoUrl || employee.photoUrl || null,
+    },
+    name,
+    photoUrl: employee.user?.profilePhotoUrl || employee.photoUrl || null,
+  };
 }
 
 function publicCustomer<T extends { email?: string | null; customerProfile?: { emergencyContact?: string | null } | null }>(
@@ -698,7 +716,12 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
     const totalAmount = basePrice;
     const bookingNumber = `SFX-${Date.now().toString().slice(-6)}-${Math.floor(100 + Math.random() * 900)}`;
     const now = new Date();
-    const dispatchDueAt = addSeconds(now, env.PROVIDER_RESPONSE_WINDOW_SECONDS);
+    const inRadius = Boolean(matchedVendor);
+    const assignmentStrategy = inRadius ? 'VENDOR_WINDOW' : 'NEAREST_EXPERT';
+    const dispatchDueAt = inRadius ? addSeconds(now, env.PROVIDER_RESPONSE_WINDOW_SECONDS) : now;
+    const servicePoint = isValidCoordinate(address.latitude, address.longitude)
+      ? { lat: address.latitude as number, lng: address.longitude as number }
+      : null;
 
     const newBooking = await prisma.$transaction(async (tx) => {
       const [booking] = await Promise.all([
@@ -715,6 +738,13 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
             status: 'PENDING',
             dispatchDueAt,
             dispatchAttempts: 0,
+            assignmentStrategy,
+            outOfRadiusDispatch: !inRadius,
+            providerDeadlineAt: inRadius ? dispatchDueAt : null,
+            serviceLatitude: servicePoint?.lat ?? null,
+            serviceLongitude: servicePoint?.lng ?? null,
+            serviceFormattedAddress: [address.addressLine1, address.landmark, address.city].filter(Boolean).join(', '),
+            serviceLocationConfirmedAt: servicePoint ? now : null,
             basePrice: toMoney(basePrice),
             taxes: toMoney(taxes),
             totalAmount: toMoney(totalAmount),
@@ -722,6 +752,7 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
             paymentStatus: 'PENDING',
             bookingSource: 'CUSTOMER_APP',
             qrChallengeToken: generateStartOtp(),
+            qrChallengeExpiresAt: addSeconds(now, env.START_OTP_EXPIRY_MINUTES * 60),
             notes: bookingNotes,
             statusHistory: {
               create: {
@@ -730,7 +761,7 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
                 changedByRole: 'CUSTOMER',
                 reason: matchedVendor
                   ? `Order routed to warehouse: ${matchedVendor.warehouseName || matchedVendor.companyName}`
-                  : 'Customer initiated new service booking',
+                  : 'Customer is outside vendor service radiuses; nearest eligible professional search armed',
               },
             },
           },
@@ -774,14 +805,12 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
 
     // Directly notify the assigned provider to dispatch an expert
     if (matchedVendor?.user) {
-      prisma.notification.create({
-        data: {
-          title: `New booking assigned #${bookingNumber}`,
-          message: `New booking for ${service.name} from ${matchedVendor.warehouseName || matchedVendor.companyName}. Scheduled on ${scheduledDate} (${scheduledTimeSlot}). Respond within ${env.PROVIDER_RESPONSE_WINDOW_SECONDS}s.`,
-          target: 'SPECIFIC_USER',
-          targetUserId: matchedVendor.user.id,
-        },
-      }).catch((e) => console.error('Failed to create vendor notification:', e));
+      void notifyUsers(
+        [matchedVendor.user.id],
+        `New booking assigned #${bookingNumber}`,
+        `New booking for ${service.name}. Respond within ${Math.round(env.PROVIDER_RESPONSE_WINDOW_SECONDS / 60)} minutes.`,
+        { bookingId: newBooking.id, type: 'booking:new' }
+      );
     }
 
     // Notify customer that booking is routed directly to the service partner
@@ -859,7 +888,12 @@ export const getCustomerBookings = async (req: Request, res: Response): Promise<
             select: { id: true, companyName: true, rating: true, location: true },
           },
           employee: {
-            select: { id: true, specialization: true, rating: true, phone: true },
+            select: {
+              id: true,
+              specialization: true,
+              rating: true,
+              user: { select: { name: true, profilePhotoUrl: true } },
+            },
           },
           review: true,
         },
@@ -869,7 +903,7 @@ export const getCustomerBookings = async (req: Request, res: Response): Promise<
 
     sendSuccess(
       res,
-      { bookings },
+      { bookings: bookings.map((b) => ({ ...b, employee: publicProfessional(b.employee) })) },
       200,
       {
         total,
@@ -898,13 +932,14 @@ export const getCustomerBookingById = async (req: Request, res: Response): Promi
         package: true,
         address: true,
         vendor: {
-          include: {
-            user: { select: { name: true, phone: true } },
-          },
+          select: { id: true, companyName: true, rating: true, location: true },
         },
         employee: {
-          include: {
-            user: { select: { name: true, phone: true, profilePhotoUrl: true } },
+          select: {
+            id: true,
+            specialization: true,
+            rating: true,
+            user: { select: { name: true, profilePhotoUrl: true } },
           },
         },
         statusHistory: {
@@ -920,7 +955,14 @@ export const getCustomerBookingById = async (req: Request, res: Response): Promi
     }
 
     const startOtp = customerStartOtpPayload(booking);
-    sendSuccess(res, { booking: { ...booking, startOtp, qrChallengeToken: startOtp } }, 200);
+    sendSuccess(res, {
+      booking: {
+        ...booking,
+        employee: publicProfessional(booking.employee),
+        startOtp,
+        qrChallengeToken: startOtp,
+      },
+    }, 200);
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
   }
@@ -989,6 +1031,7 @@ export const cancelBooking = async (req: Request, res: Response): Promise<void> 
     });
 
     await releaseDispatchOnCancel(id);
+    await setLocationSharing(id, false);
 
     // Real-time dispatch without blocking or redundant DB queries
     emitBookingEvent(
@@ -1196,18 +1239,7 @@ export const getBookingStartOtp = async (req: Request, res: Response): Promise<v
       return;
     }
 
-    const existing = customerStartOtpPayload(booking);
-    const token = refresh || !existing ? generateStartOtp() : existing;
-
-    if (token !== existing) {
-      await prisma.booking.update({
-        where: { id },
-        data: {
-          qrChallengeToken: token,
-          qrChallengeExpiresAt: null,
-        },
-      });
-    }
+    const token = await issueStartOtp(id, refresh);
 
     sendSuccess(res, {
       bookingId: id,
@@ -1293,7 +1325,8 @@ export const confirmBookingCompletion = async (req: Request, res: Response): Pro
       return b;
     });
 
-    void emitBookingRefresh(id);
+    await setLocationSharing(id, false);
+    void emitBookingRefresh(id, { reason: nextStatus === 'COMPLETED' ? 'SERVICE_COMPLETED' : 'AWAITING_PAYMENT' });
     sendSuccess(res, { booking: updated, status: nextStatus }, 200);
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
