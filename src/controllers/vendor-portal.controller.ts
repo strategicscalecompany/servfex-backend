@@ -2,7 +2,8 @@ import { Request, Response } from 'express';
 import { z } from 'zod';
 import { prisma } from '../config/prisma';
 import { sendSuccess, sendError } from '../utils/response';
-import { emitBookingRefresh, emitBookingEvent } from '../utils/realtime';
+import { emitBookingRefresh, emitBookingEvent, emitUserEvent } from '../utils/realtime';
+import { invalidateCatalogCache } from './catalog.controller';
 import { Prisma, BookingStatus, DocumentType } from '@prisma/client';
 import { hashPassword } from '../utils/password';
 import { generateAccessToken, generateRefreshToken } from '../utils/token';
@@ -128,22 +129,31 @@ export const verifyOrderQrSchema = z
     path: ['otp'],
   });
 
-export const createHubBookingSchema = z.object({
-  customerName: z.string().min(2),
-  customerPhone: z.string().min(10),
-  customerEmail: z.string().email().optional(),
-  serviceId: z.string().uuid(),
-  scheduledDate: z.string().min(1),
-  scheduledTimeSlot: z.string().min(1),
-  addressLine1: z.string().min(3),
-  city: z.string().min(2),
-  landmark: z.string().optional(),
-  latitude: z.number().optional(),
-  longitude: z.number().optional(),
-  notes: z.string().optional(),
-  source: z.enum(['PHONE_HUB', 'EXPERT_TEAM', 'SALES_MANAGER']).optional(),
-  idempotencyKey: z.string().min(8).max(80).optional(),
-});
+export const createHubBookingSchema = z
+  .object({
+    customerName: z.string().min(2),
+    customerPhone: z.string().min(10),
+    customerEmail: z.union([z.string().email(), z.literal('')]).optional(),
+    serviceId: z.union([z.string().uuid(), z.literal('')]).optional(),
+    serviceName: z.string().min(2).optional(),
+    scheduledDate: z.string().min(1).optional(),
+    scheduledTimeSlot: z.string().min(1).optional(),
+    addressLine1: z.string().min(3),
+    city: z.string().optional(),
+    landmark: z.string().optional(),
+    mapsUrl: z.string().optional(),
+    latitude: z.number(),
+    longitude: z.number(),
+    notes: z.string().optional(),
+    source: z.enum(['PHONE_HUB', 'EXPERT_TEAM', 'SALES_MANAGER']).optional(),
+    vendorId: z.string().uuid().optional(),
+    employeeId: z.union([z.string().uuid(), z.literal('')]).optional(),
+    idempotencyKey: z.string().min(8).max(80).optional(),
+  })
+  .refine((data) => Boolean(data.serviceId || data.serviceName), {
+    message: 'Select a matching service or type a new service name to publish',
+    path: ['serviceName'],
+  });
 
 export const uploadCompletionPhotosSchema = z.object({
   image: z.string().min(8).optional(),
@@ -720,6 +730,15 @@ export const deleteVendorService = async (req: Request, res: Response): Promise<
 // Vendor Orders & Dispatch
 // -------------------------------------------------------------
 
+const hubSelect = {
+  id: true,
+  companyName: true,
+  warehouseName: true,
+  location: true,
+  warehouseLocation: true,
+  userId: true,
+} as const;
+
 async function resolvePortalActor(userId: string) {
   const user = await prisma.user.findUnique({
     where: { id: userId },
@@ -727,9 +746,22 @@ async function resolvePortalActor(userId: string) {
       id: true,
       role: true,
       name: true,
-      vendorProfile: { select: { id: true } },
-      employeeProfile: { select: { id: true, vendorId: true, expertKind: true } },
-      managerProfile: { select: { id: true, vendorId: true } },
+      vendorProfile: { select: hubSelect },
+      employeeProfile: {
+        select: {
+          id: true,
+          vendorId: true,
+          expertKind: true,
+          vendor: { select: hubSelect },
+        },
+      },
+      managerProfile: {
+        select: {
+          id: true,
+          vendorId: true,
+          vendor: { select: hubSelect },
+        },
+      },
     },
   });
   const vendorId =
@@ -745,8 +777,177 @@ async function resolvePortalActor(userId: string) {
   };
 }
 
+function formatHubOption(hub: {
+  id: string;
+  companyName: string;
+  warehouseName?: string | null;
+  location: string;
+  warehouseLocation?: string | null;
+}) {
+  return {
+    id: hub.id,
+    name: hub.warehouseName || hub.companyName,
+    location: hub.warehouseLocation || hub.location,
+  };
+}
+
+function assignedHubsForActor(actor: Awaited<ReturnType<typeof resolvePortalActor>>) {
+  const hubs = new Map<string, ReturnType<typeof formatHubOption>>();
+  const push = (hub?: { id: string; companyName: string; warehouseName?: string | null; location: string; warehouseLocation?: string | null } | null) => {
+    if (!hub) return;
+    hubs.set(hub.id, formatHubOption(hub));
+  };
+  push(actor.user?.vendorProfile || null);
+  push(actor.user?.employeeProfile?.vendor || null);
+  push(actor.user?.managerProfile?.vendor || null);
+  return Array.from(hubs.values());
+}
+
+function toServiceSlug(name: string): string {
+  const base = name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48) || 'service';
+  return `${base}-${Date.now().toString(36)}`;
+}
+
+async function resolveOrPublishDeskService(serviceId: string | undefined, serviceName: string | undefined, vendorId: string) {
+  const trimmedName = (serviceName || '').trim();
+  let service = serviceId
+    ? await prisma.service.findFirst({ where: { id: serviceId, isActive: true, deletedAt: null } })
+    : null;
+
+  if (!service && trimmedName) {
+    service = await prisma.service.findFirst({
+      where: {
+        isActive: true,
+        deletedAt: null,
+        name: { equals: trimmedName, mode: 'insensitive' },
+      },
+    });
+  }
+
+  if (!service && trimmedName) {
+    let category = await prisma.serviceCategory.findFirst({
+      where: { isActive: true, slug: 'desk-bookings' },
+    });
+    if (!category) {
+      category = await prisma.serviceCategory.findFirst({
+        where: { isActive: true, deletedAt: null },
+        orderBy: { displayOrder: 'asc' },
+      });
+    }
+    if (!category) {
+      category = await prisma.serviceCategory.create({
+        data: {
+          name: 'Desk Bookings',
+          slug: 'desk-bookings',
+          description: 'Services published from hub desk and Sales Manager orders',
+          isActive: true,
+        },
+      });
+    }
+
+    service = await prisma.service.create({
+      data: {
+        categoryId: category.id,
+        name: trimmedName,
+        slug: toServiceSlug(trimmedName),
+        description: `${trimmedName} published from a ServFex desk order`,
+        startingPrice: '0.00',
+        isActive: true,
+      },
+    });
+    invalidateCatalogCache();
+  }
+
+  if (!service) {
+    return null;
+  }
+
+  await prisma.vendorService.upsert({
+    where: { vendorId_serviceId: { vendorId, serviceId: service.id } },
+    update: { isActive: true },
+    create: { vendorId, serviceId: service.id, isActive: true },
+  });
+
+  return service;
+}
+
+function cityFromAddress(addressLine1: string, city?: string): string {
+  if (city && city.trim().length >= 2) return city.trim();
+  const parts = addressLine1.split(',').map((part) => part.trim()).filter(Boolean);
+  return parts.length >= 2 ? parts[parts.length - 2] : parts[0] || 'Hyderabad';
+}
+
 export const getVendorWorkflowConfig = async (_req: Request, res: Response): Promise<void> => {
   sendSuccess(res, { workflow: getTestingWorkflowSnapshot() }, 200);
+};
+
+export const getDeskContext = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const actor = await resolvePortalActor(req.user!.userId);
+    if (!actor.user || (!actor.isManager && !actor.isVendor && !actor.user.employeeProfile)) {
+      sendError(res, 'FORBIDDEN', 'Only a hub manager, provider, or expert can open the desk order form', 403);
+      return;
+    }
+
+    const hubs = assignedHubsForActor(actor);
+    let technicians: Array<{ id: string; name: string; phone: string }> = [];
+
+    if (actor.isSalesManager && actor.vendorId) {
+      const employees = await prisma.employeeProfile.findMany({
+        where: {
+          vendorId: actor.vendorId,
+          expertKind: 'SERVICE_PROFESSIONAL',
+          user: { status: 'ACTIVE', deletedAt: null },
+        },
+        include: { user: { select: { name: true, phone: true } } },
+        orderBy: { createdAt: 'desc' },
+      });
+      technicians = employees.map((emp) => ({
+        id: emp.id,
+        name: emp.user.name,
+        phone: emp.phone || emp.user.phone || '',
+      }));
+    }
+
+    sendSuccess(res, {
+      role: actor.isSalesManager ? 'SALES_MANAGER' : actor.isManager ? 'OPERATIONS_MANAGER' : 'VENDOR',
+      hubs,
+      technicians,
+      canAssignHub: actor.isManager,
+      canAssignTechnician: actor.isSalesManager,
+    });
+  } catch (err: any) {
+    sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
+  }
+};
+
+export const searchDeskServices = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const term = String(req.query.q || '').trim();
+    if (term.length < 1) {
+      sendSuccess(res, { services: [] });
+      return;
+    }
+
+    const services = await prisma.service.findMany({
+      where: {
+        isActive: true,
+        deletedAt: null,
+        name: { contains: term, mode: 'insensitive' },
+      },
+      select: { id: true, name: true, startingPrice: true },
+      orderBy: { name: 'asc' },
+      take: 20,
+    });
+
+    sendSuccess(res, { services });
+  } catch (err: any) {
+    sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
+  }
 };
 
 function sanitizeOrderForViewer(order: any, viewer: { isVendor: boolean; employeeId?: string; isManager?: boolean }) {
@@ -804,15 +1005,17 @@ export const getVendorOrders = async (req: Request, res: Response): Promise<void
     const limit = Math.min(Math.max(parseInt(String(req.query.limit || '20'), 10) || 20, 1), 100);
     const skip = (page - 1) * limit;
 
-    const { user, vendorId, isVendor, isManager, employeeId, isSalesManager } = await resolvePortalActor(userId);
+    const actor = await resolvePortalActor(userId);
+    const { user, isVendor, isManager, employeeId, isSalesManager } = actor;
 
     let where: any = {};
     if (isVendor || isManager) {
-      if (!vendorId) {
+      const hubIds = assignedHubsForActor(actor).map((hub) => hub.id);
+      if (hubIds.length === 0) {
         sendError(res, 'HUB_NOT_ASSIGNED', 'This manager is not assigned to a local provider hub yet', 403);
         return;
       }
-      where.vendorId = vendorId;
+      where.vendorId = hubIds.length === 1 ? hubIds[0] : { in: hubIds };
     } else if (user?.employeeProfile) {
       if (isTestingWorkflowEnabled() && isSalesManager) {
         where = {
@@ -875,15 +1078,17 @@ export const getVendorOrderById = async (req: Request, res: Response): Promise<v
     const userId = req.user!.userId;
     const id = req.params.id as string;
 
-    const { user, vendorId, isVendor, isManager, employeeId, isSalesManager } = await resolvePortalActor(userId);
+    const actor = await resolvePortalActor(userId);
+    const { user, isVendor, isManager, employeeId, isSalesManager } = actor;
 
     let where: any = { id };
     if (isVendor || isManager) {
-      if (!vendorId) {
+      const hubIds = assignedHubsForActor(actor).map((hub) => hub.id);
+      if (hubIds.length === 0) {
         sendError(res, 'HUB_NOT_ASSIGNED', 'This manager is not assigned to a local provider hub yet', 403);
         return;
       }
-      where.vendorId = vendorId;
+      where.vendorId = hubIds.length === 1 ? hubIds[0] : { in: hubIds };
     } else if (user?.employeeProfile) {
       if (isTestingWorkflowEnabled() && isSalesManager) {
         where.vendorId = user.employeeProfile.vendorId;
@@ -1660,12 +1865,9 @@ export const assignEmployeeToOrder = async (req: Request, res: Response): Promis
 
 export const getVendorEmployees = async (req: Request, res: Response): Promise<void> => {
   try {
-    const userId = req.user!.userId;
-    const vendorProfile = await prisma.vendorProfile.findUnique({
-      where: { userId },
-    });
-
-    if (!vendorProfile) {
+    const actor = await resolvePortalActor(req.user!.userId);
+    const vendorId = actor.vendorId;
+    if (!vendorId) {
       sendError(res, 'NOT_FOUND', 'Vendor profile not found', 404);
       return;
     }
@@ -1673,7 +1875,7 @@ export const getVendorEmployees = async (req: Request, res: Response): Promise<v
     const eligibleOnly = String(req.query.eligibleForAssignment || '') === 'true';
     const employees = await prisma.employeeProfile.findMany({
       where: {
-        vendorId: vendorProfile.id,
+        vendorId,
         ...(isTestingWorkflowEnabled() && eligibleOnly ? { expertKind: 'SERVICE_PROFESSIONAL' } : {}),
       },
       include: {
@@ -2038,43 +2240,94 @@ export const createHubBooking = async (req: Request, res: Response): Promise<voi
       customerPhone,
       customerEmail,
       serviceId,
+      serviceName,
       scheduledDate,
       scheduledTimeSlot,
       addressLine1,
       city,
       landmark,
+      mapsUrl,
       latitude,
       longitude,
       notes,
       source,
+      vendorId: requestedVendorId,
+      employeeId,
     } = req.body;
 
-    const { user, vendorId, isManager, isVendor } = await resolvePortalActor(userId);
-    if (!vendorId || (!isManager && !isVendor && !user?.employeeProfile)) {
+    const actor = await resolvePortalActor(userId);
+    const { user, isManager, isVendor, isSalesManager } = actor;
+    if (!actor.user || (!isManager && !isVendor && !user?.employeeProfile)) {
       sendError(res, 'FORBIDDEN', 'Only a hub manager, provider, or expert can create a desk booking', 403);
       return;
     }
 
-    if (isTestingWorkflowEnabled() && source === 'SALES_MANAGER' && user?.employeeProfile?.expertKind !== 'SALES_MANAGER' && !isVendor && !isManager) {
+    if (source === 'SALES_MANAGER' && !isSalesManager && !isVendor && !isManager) {
       sendError(res, 'FORBIDDEN', 'Only a Sales Manager can create Sales Manager bookings', 403);
       return;
     }
 
-    if (source === 'SALES_MANAGER' && !customerEmail) {
-      sendError(res, 'BAD_REQUEST', 'Customer email is required for Sales Manager bookings', 400);
+    const hubs = assignedHubsForActor(actor);
+    if (hubs.length === 0) {
+      sendError(res, 'HUB_NOT_ASSIGNED', 'You are not assigned to a fulfillment hub', 403);
       return;
     }
 
-    const service = await prisma.service.findFirst({
-      where: { id: serviceId, isActive: true, deletedAt: null },
-    });
-    if (!service) {
-      sendError(res, 'NOT_FOUND', 'Service not found or inactive', 404);
+    let targetVendorId = actor.vendorId as string;
+    if (isManager) {
+      if (requestedVendorId) {
+        if (!hubs.some((hub) => hub.id === requestedVendorId)) {
+          sendError(res, 'FORBIDDEN', 'You can only assign this order to a hub you are assigned to', 403);
+          return;
+        }
+        targetVendorId = requestedVendorId;
+      } else {
+        targetVendorId = hubs[0].id;
+      }
+    } else if (requestedVendorId && requestedVendorId !== actor.vendorId) {
+      sendError(res, 'FORBIDDEN', 'You can only create orders for your own hub', 403);
       return;
     }
+
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+      sendError(res, 'BAD_REQUEST', 'Pinpoint the customer location from a Google Maps URL first', 400);
+      return;
+    }
+
+    const service = await resolveOrPublishDeskService(serviceId || undefined, serviceName, targetVendorId);
+    if (!service) {
+      sendError(res, 'BAD_REQUEST', 'Select a matching service or type a new service name to publish', 400);
+      return;
+    }
+
+    let technicianToAssign: { id: string; userId: string } | null = null;
+    if (isSalesManager && employeeId) {
+      const technician = await prisma.employeeProfile.findFirst({
+        where: {
+          vendorId: targetVendorId,
+          expertKind: 'SERVICE_PROFESSIONAL',
+          OR: [{ id: employeeId }, { userId: employeeId }],
+        },
+        select: { id: true, userId: true },
+      });
+      if (!technician) {
+        sendError(res, 'FORBIDDEN', 'You can only assign this order to a Service Professional in your hub', 403);
+        return;
+      }
+      technicianToAssign = technician;
+    } else if (isSalesManager && !employeeId) {
+      sendError(res, 'BAD_REQUEST', 'Select a Service Professional in your hub', 400);
+      return;
+    }
+
+    const resolvedCity = cityFromAddress(addressLine1, city);
+    const today = new Date().toISOString().slice(0, 10);
+    const slotDate = scheduledDate || today;
+    const slotTime = scheduledTimeSlot || '10:00 AM - 12:00 PM';
 
     const cleanPhone = String(customerPhone).replace(/\s+/g, '');
-    const cleanEmail = (customerEmail || `${cleanPhone.replace(/\D/g, '')}@hub.servfex.local`).toLowerCase().trim();
+    const digits = cleanPhone.replace(/\D/g, '');
+    const cleanEmail = (customerEmail || `${digits || Date.now()}@hub.servfex.local`).toLowerCase().trim();
 
     const customerUser = await prisma.$transaction(async (tx) => {
       const existing = await tx.user.findFirst({
@@ -2112,10 +2365,10 @@ export const createHubBooking = async (req: Request, res: Response): Promise<voi
 
     const recentDuplicate = await prisma.booking.findFirst({
       where: {
-        vendorId,
+        vendorId: targetVendorId,
         customerId: customerUser.customerProfile!.id,
         serviceId: service.id,
-        scheduledDate,
+        scheduledDate: slotDate,
         createdAt: { gte: new Date(Date.now() - 2 * 60 * 1000) },
         status: { notIn: ['CANCELLED', 'DECLINED'] },
       },
@@ -2131,19 +2384,23 @@ export const createHubBooking = async (req: Request, res: Response): Promise<voi
         userId: customerUser.id,
         label: 'Service Address',
         addressLine1,
-        city,
-        state: city,
+        city: resolvedCity,
+        state: resolvedCity,
         postalCode: '000000',
-        landmark: landmark || null,
-        latitude: latitude ?? null,
-        longitude: longitude ?? null,
+        landmark: landmark || mapsUrl || null,
+        latitude,
+        longitude,
         isDefault: customerUser.addresses.length === 0,
       },
     });
 
     const bookingNumber = `SFX-${Date.now().toString().slice(-6)}-${Math.floor(100 + Math.random() * 900)}`;
     const bookingSource =
-      source === 'SALES_MANAGER' ? 'SALES_MANAGER' : source === 'EXPERT_TEAM' ? 'EXPERT_TEAM' : 'PHONE_HUB';
+      isSalesManager || source === 'SALES_MANAGER'
+        ? 'SALES_MANAGER'
+        : source === 'EXPERT_TEAM'
+          ? 'EXPERT_TEAM'
+          : 'PHONE_HUB';
 
     const booking = await prisma.booking.create({
       data: {
@@ -2151,15 +2408,21 @@ export const createHubBooking = async (req: Request, res: Response): Promise<voi
         customerId: customerUser.customerProfile!.id,
         serviceId: service.id,
         addressId: address.id,
-        vendorId,
-        scheduledDate,
-        scheduledTimeSlot,
+        vendorId: targetVendorId,
+        scheduledDate: slotDate,
+        scheduledTimeSlot: slotTime,
         status: 'PENDING',
         basePrice: toMoney(service.startingPrice),
         taxes: toMoney(0),
         totalAmount: toMoney(service.startingPrice),
         notes: notes || null,
         bookingSource,
+        dispatchDueAt: null,
+        serviceLatitude: latitude,
+        serviceLongitude: longitude,
+        serviceFormattedAddress: addressLine1,
+        serviceLocationNote: mapsUrl || null,
+        serviceLocationConfirmedAt: new Date(),
         qrChallengeToken: generateStartOtp(),
         statusHistory: {
           create: {
@@ -2179,26 +2442,92 @@ export const createHubBooking = async (req: Request, res: Response): Promise<voi
         customer: { include: { user: { select: { name: true, phone: true } } } },
         service: true,
         address: true,
+        employee: { include: { user: { select: { name: true, phone: true } } } },
       },
     });
 
+    let finalBooking: any = booking;
+    if (technicianToAssign) {
+      const assigned = await assignExpertManually({
+        bookingId: booking.id,
+        vendorId: targetVendorId,
+        vendorUserId: userId,
+        employeeIdOrUserId: technicianToAssign.id,
+        expertPayout: null,
+        note: 'Assigned immediately by Sales Manager',
+      });
+      if (assigned) {
+        finalBooking = assigned;
+      }
+    }
+
     const vendorOwner = await prisma.vendorProfile.findUnique({
-      where: { id: vendorId },
+      where: { id: targetVendorId },
       select: { userId: true },
     });
+    const technicianUserId = finalBooking.employee?.userId || technicianToAssign?.userId || null;
+
+    let hubProfessionalUserIds: string[] = [];
+    if (!technicianUserId) {
+      const hubProfessionals = await prisma.employeeProfile.findMany({
+        where: {
+          vendorId: targetVendorId,
+          expertKind: 'SERVICE_PROFESSIONAL',
+          user: { status: 'ACTIVE', deletedAt: null },
+        },
+        select: { userId: true },
+      });
+      hubProfessionalUserIds = hubProfessionals.map((emp) => emp.userId);
+    }
+
+    const realtimeTargets = [
+      customerUser.id,
+      userId,
+      vendorOwner?.userId,
+      technicianUserId,
+      ...hubProfessionalUserIds,
+    ].filter(Boolean) as string[];
+
     emitBookingEvent(
       'booking:new',
       {
-        bookingId: booking.id,
-        bookingNumber: booking.bookingNumber,
-        status: booking.status,
-        vendorId: booking.vendorId,
+        bookingId: finalBooking.id,
+        bookingNumber: finalBooking.bookingNumber,
+        status: finalBooking.status,
+        vendorId: finalBooking.vendorId,
+        reason: technicianUserId ? 'DESK_ORDER_ASSIGNED' : 'DESK_ORDER_CREATED',
       },
-      [customerUser.id, userId, vendorOwner?.userId].filter(Boolean) as string[]
+      realtimeTargets
     );
+    if (technicianUserId) {
+      emitUserEvent('booking:assignment', { bookingId: finalBooking.id, reason: 'DESK_ASSIGNED' }, [technicianUserId]);
+    }
 
-    sendSuccess(res, { order: stripStartOtp(booking) }, 201);
+    const pushTargets = [...new Set(
+      [vendorOwner?.userId, technicianUserId, ...hubProfessionalUserIds].filter(Boolean) as string[]
+    )];
+    void prisma.notification
+      .createMany({
+        data: pushTargets.map((targetUserId) => ({
+          title: `New order #${finalBooking.bookingNumber}`,
+          message: `${service.name} for ${customerName} is ready now.`,
+          target: 'SPECIFIC_USER' as const,
+          targetUserId,
+        })),
+      })
+      .catch((err) => console.warn('[DeskBooking] notification write failed', err?.message || err));
+    void sendPushToUserIds(pushTargets, {
+      title: `New order #${finalBooking.bookingNumber}`,
+      body: `${service.name} for ${customerName}. Open ServFex now.`,
+      data: { bookingId: finalBooking.id, type: 'booking:new' },
+    }).catch((err) => console.warn('[DeskBooking] push failed', err?.message || err));
+
+    sendSuccess(res, { order: stripStartOtp(finalBooking) }, 201);
   } catch (err: any) {
+    if (err instanceof DispatchError) {
+      sendError(res, err.code, err.message, err.httpStatus);
+      return;
+    }
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
   }
 };

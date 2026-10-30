@@ -18,6 +18,8 @@ import {
   verifyOrderQr,
   verifyOrderOtp,
   createHubBooking,
+  getDeskContext,
+  searchDeskServices,
   completeOrder,
   uploadOrderCompletionPhotos,
   getVendorWorkflowConfig,
@@ -76,6 +78,8 @@ router.use(requireRole('VENDOR', 'EMPLOYEE', 'OPERATIONS_MANAGER'));
 router.get('/profile', getVendorProfile);
 router.patch('/profile', validate(updateVendorProfileSchema), updateVendorProfile);
 router.get('/workflow-config', getVendorWorkflowConfig);
+router.get('/desk/context', getDeskContext);
+router.get('/desk/services', searchDeskServices);
 
 // KYC Documents
 router.get('/documents', getVendorDocuments);
