@@ -52,11 +52,11 @@ export type OnboardingSuccess = {
 
 export type CustomerAuthResult = AuthSuccess | OnboardingSuccess | ServiceError;
 
-function isPlaceholderEmail(email?: string | null): boolean {
+export function isPlaceholderEmail(email?: string | null): boolean {
   return Boolean(email && email.toLowerCase().endsWith(PHONE_PLACEHOLDER_DOMAIN));
 }
 
-function phonePlaceholderEmail(clean10: string): string {
+export function phonePlaceholderEmail(clean10: string): string {
   return `${clean10}${PHONE_PLACEHOLDER_DOMAIN}`;
 }
 
@@ -321,6 +321,32 @@ export async function findCustomerByGoogle(params: { firebaseUid?: string; email
     or.push({ email: params.email.toLowerCase().trim() });
   }
   return findUserByIdentities(or);
+}
+
+export async function confirmMobileOtp(params: {
+  rawMobile: string;
+  otp: string;
+}): Promise<
+  | { success: true; clean10Digit: string; displayPhone: string; normalized: string }
+  | ServiceError
+> {
+  const mobileVal = normalizeIndianMobile(params.rawMobile);
+  if (!mobileVal.valid || !mobileVal.normalized || !mobileVal.clean10Digit || !mobileVal.displayPhone) {
+    return {
+      success: false,
+      code: 'INVALID_MOBILE_NUMBER',
+      message: mobileVal.error || 'Please enter a valid 10-digit Indian mobile number',
+      status: 400,
+    };
+  }
+  const consumed = await consumeOtpChallenge(mobileVal.normalized, params.otp);
+  if (!('ok' in consumed)) return consumed;
+  return {
+    success: true,
+    clean10Digit: mobileVal.clean10Digit,
+    displayPhone: mobileVal.displayPhone,
+    normalized: mobileVal.normalized,
+  };
 }
 
 async function consumeOtpChallenge(

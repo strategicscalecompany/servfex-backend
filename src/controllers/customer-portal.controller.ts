@@ -16,7 +16,15 @@ import {
 import { releaseDispatchOnCancel, syncDispatchTimer } from '../services/dispatch.service';
 import { scheduleDispatch } from '../services/dispatch.scheduler';
 import { asDecimal, toMoney } from '../utils/money';
-import { hostProfilePhoto } from '../services/customer-onboarding.service';
+import { normalizeIndianMobile } from '../utils/otp.util';
+import {
+  confirmMobileOtp,
+  findCustomerByEmail,
+  findCustomerByPhone,
+  hostProfilePhoto,
+  isPlaceholderEmail,
+  phonePlaceholderEmail,
+} from '../services/customer-onboarding.service';
 
 // -------------------------------------------------------------
 // Validation Schemas
@@ -30,7 +38,16 @@ export const registerCustomerSchema = z.object({
 
 export const updateCustomerProfileSchema = z.object({
   name: z.string().min(2).optional(),
+  email: z
+    .string()
+    .trim()
+    .optional()
+    .refine(
+      (value) => !value || z.string().email().safeParse(value).success,
+      'Please enter a valid email address'
+    ),
   phone: z.string().min(10).optional(),
+  otp: z.string().min(4).optional(),
   profilePhotoUrl: z
     .string()
     .min(1)
@@ -44,6 +61,7 @@ export const updateCustomerProfileSchema = z.object({
     )
     .optional(),
   emergencyContact: z.string().optional(),
+  alternateContact: z.string().optional(),
   notes: z.string().optional(),
 });
 
@@ -106,6 +124,7 @@ export const createBookingSchema = z.object({
   scheduledTimeSlot: z.string().min(1, 'Scheduled time slot is required'),
   paymentMethod: z.enum(['ONLINE', 'CASH', 'UPI', 'CARD', 'WALLET']).default('ONLINE'),
   notes: z.string().optional(),
+  alternateContact: z.string().optional(),
   vendorId: z
     .string()
     .optional()
@@ -134,6 +153,23 @@ export const submitReviewSchema = z.object({
 export const reportIssueSchema = z.object({
   reason: z.string().min(5, 'Dispute reason must be at least 5 characters'),
 });
+
+function normalizeOptionalContact(raw?: string | null): string | null | undefined {
+  if (raw === undefined) return undefined;
+  const digits = String(raw || '').replace(/\D/g, '').slice(-10);
+  if (!digits) return null;
+  return digits.length === 10 ? digits : undefined;
+}
+
+function publicCustomer<T extends { email?: string | null; customerProfile?: { emergencyContact?: string | null } | null }>(
+  user: T
+) {
+  return {
+    ...user,
+    email: isPlaceholderEmail(user.email) ? '' : user.email || '',
+    emergencyContact: user.customerProfile?.emergencyContact || '',
+  };
+}
 
 // -------------------------------------------------------------
 // Customer Auth & Registration
@@ -236,7 +272,7 @@ export const getCustomerProfile = async (req: Request, res: Response): Promise<v
       return;
     }
 
-    sendSuccess(res, { customer: user }, 200);
+    sendSuccess(res, { customer: publicCustomer(user) }, 200);
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
   }
@@ -245,7 +281,89 @@ export const getCustomerProfile = async (req: Request, res: Response): Promise<v
 export const updateCustomerProfile = async (req: Request, res: Response): Promise<void> => {
   try {
     const userId = req.user!.userId;
-    const { name, phone, profilePhotoUrl, emergencyContact, notes } = req.body;
+    const {
+      name,
+      email,
+      phone,
+      otp,
+      profilePhotoUrl,
+      emergencyContact,
+      alternateContact,
+      notes,
+    } = req.body;
+
+    const current = await prisma.user.findUnique({
+      where: { id: userId },
+      include: { customerProfile: true },
+    });
+    if (!current) {
+      sendError(res, 'NOT_FOUND', 'Customer profile not found', 404);
+      return;
+    }
+
+    let nextPhone: string | undefined;
+    if (phone) {
+      const mobileVal = normalizeIndianMobile(phone);
+      if (!mobileVal.valid || !mobileVal.clean10Digit) {
+        sendError(
+          res,
+          'INVALID_MOBILE_NUMBER',
+          mobileVal.error || 'Please enter a valid 10-digit Indian mobile number',
+          400
+        );
+        return;
+      }
+      const currentDigits = (current.phone || '').replace(/\D/g, '').slice(-10);
+      if (mobileVal.clean10Digit !== currentDigits) {
+        if (!otp) {
+          sendError(
+            res,
+            'OTP_REQUIRED',
+            'Verify the new mobile number with the OTP we send before saving it.',
+            400
+          );
+          return;
+        }
+        const verified = await confirmMobileOtp({ rawMobile: phone, otp: String(otp) });
+        if (!verified.success) {
+          sendError(res, verified.code, verified.message, verified.status);
+          return;
+        }
+        const taken = await findCustomerByPhone({
+          phone: verified.clean10Digit,
+          displayPhone: verified.displayPhone,
+          normalizedMobile: verified.normalized,
+        });
+        if (taken && taken.id !== userId) {
+          sendError(
+            res,
+            'IDENTITY_IN_USE',
+            'That mobile number is already linked to another ServFex account.',
+            409
+          );
+          return;
+        }
+        nextPhone = verified.clean10Digit;
+      }
+    }
+
+    let nextEmail: string | undefined;
+    if (typeof email === 'string') {
+      const trimmed = email.trim().toLowerCase();
+      if (trimmed && !isPlaceholderEmail(trimmed)) {
+        const taken = await findCustomerByEmail(trimmed);
+        if (taken && taken.id !== userId) {
+          sendError(
+            res,
+            'IDENTITY_IN_USE',
+            'That email is already linked to another ServFex account.',
+            409
+          );
+          return;
+        }
+        nextEmail = trimmed;
+      }
+    }
 
     let hostedPhotoUrl: string | undefined;
     if (profilePhotoUrl !== undefined) {
@@ -264,21 +382,31 @@ export const updateCustomerProfile = async (req: Request, res: Response): Promis
       }
     }
 
+    const nextAlternate = normalizeOptionalContact(alternateContact ?? emergencyContact);
+
     const updated = await prisma.$transaction(async (tx) => {
       const user = await tx.user.update({
         where: { id: userId },
         data: {
           ...(name ? { name } : {}),
-          ...(phone ? { phone } : {}),
+          ...(nextPhone
+            ? {
+                phone: nextPhone,
+                ...(isPlaceholderEmail(current.email)
+                  ? { email: phonePlaceholderEmail(nextPhone) }
+                  : {}),
+              }
+            : {}),
+          ...(nextEmail ? { email: nextEmail } : {}),
           ...(hostedPhotoUrl !== undefined ? { profilePhotoUrl: hostedPhotoUrl } : {}),
           customerProfile: {
             upsert: {
               create: {
-                emergencyContact: emergencyContact || null,
+                emergencyContact: nextAlternate ?? null,
                 notes: notes || null,
               },
               update: {
-                ...(emergencyContact !== undefined ? { emergencyContact } : {}),
+                ...(nextAlternate !== undefined ? { emergencyContact: nextAlternate } : {}),
                 ...(notes !== undefined ? { notes } : {}),
               },
             },
@@ -291,7 +419,7 @@ export const updateCustomerProfile = async (req: Request, res: Response): Promis
       return user;
     });
 
-    sendSuccess(res, { customer: updated }, 200);
+    sendSuccess(res, { customer: publicCustomer(updated) }, 200);
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
   }
@@ -451,7 +579,15 @@ function calculateDistanceKm(lat1: number, lon1: number, lat2: number, lon2: num
 export const createBooking = async (req: Request, res: Response): Promise<void> => {
   try {
     const userId = req.user!.userId;
-    const { serviceId, packageId, addressId, scheduledDate, scheduledTimeSlot, paymentMethod, notes, vendorId } = req.body;
+    const { serviceId, packageId, addressId, scheduledDate, scheduledTimeSlot, paymentMethod, notes, vendorId, alternateContact } =
+      req.body;
+    const savedAlternate = normalizeOptionalContact(alternateContact);
+    const bookingNotes = [
+      notes?.trim() || '',
+      savedAlternate ? `Alternate contact: ${savedAlternate}` : '',
+    ]
+      .filter(Boolean)
+      .join('\n') || null;
 
     // Concurrently fetch address, service, customer profile, admins, and active providers in 1 single network flight
     const [existingAddress, service, customerProfile, admins, candidateVendors] = await Promise.all([
@@ -464,8 +600,8 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
       }),
       prisma.customerProfile.upsert({
         where: { userId },
-        create: { userId },
-        update: {},
+        create: { userId, emergencyContact: savedAlternate || null },
+        update: savedAlternate ? { emergencyContact: savedAlternate } : {},
       }),
       prisma.user.findMany({
         where: { role: 'SUPER_ADMIN', status: 'ACTIVE', deletedAt: null },
@@ -586,7 +722,7 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
             paymentStatus: 'PENDING',
             bookingSource: 'CUSTOMER_APP',
             qrChallengeToken: generateStartOtp(),
-            notes: notes || null,
+            notes: bookingNotes,
             statusHistory: {
               create: {
                 newStatus: 'PENDING',
