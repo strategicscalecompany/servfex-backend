@@ -44,6 +44,11 @@ export const createVendorSchema = z.object({
     warehouseImage: z.string().optional(),
     latitude: z.number().nullable().optional(),
     longitude: z.number().nullable().optional(),
+    serviceRadiusKm: z
+      .number()
+      .min(0.1, 'Coverage radius must be at least 0.1 km')
+      .max(200, 'Coverage radius cannot exceed 200 km')
+      .optional(),
     documents: z
       .array(
         z.object({
@@ -72,6 +77,12 @@ export const updateVendorSchema = z.object({
     warehouseLocation: z.string().nullable().optional(),
     warehousePhone: z.string().nullable().optional(),
     warehouseImageUrl: z.string().nullable().optional(),
+    serviceRadiusKm: z
+      .number()
+      .min(0.1, 'Coverage radius must be at least 0.1 km')
+      .max(200, 'Coverage radius cannot exceed 200 km')
+      .nullable()
+      .optional(),
     reason: z.string().optional(),
   }),
 });
@@ -343,8 +354,13 @@ export const createVendor = async (req: Request, res: Response, next: NextFuncti
       warehouseImage,
       latitude,
       longitude,
+      serviceRadiusKm,
       documents,
     } = req.body;
+    const parsedRadiusKm =
+      typeof serviceRadiusKm === 'number' && Number.isFinite(serviceRadiusKm) && serviceRadiusKm > 0
+        ? serviceRadiusKm
+        : undefined;
     const cleanEmail = email.toLowerCase().trim();
     const finalName = name || companyName || cleanEmail.split('@')[0];
     const finalCompanyName = companyName || warehouseName || name || cleanEmail.split('@')[0];
@@ -496,6 +512,7 @@ export const createVendor = async (req: Request, res: Response, next: NextFuncti
               warehouseImageUrl: uploadedWarehouseImage || null,
               latitude: latitude !== undefined ? latitude : null,
               longitude: longitude !== undefined ? longitude : null,
+              ...(parsedRadiusKm !== undefined ? { serviceRadiusKm: parsedRadiusKm } : {}),
               bio: bio || null,
               commissionRate: toMoney(commissionRate || 0.0),
               kycStatus: 'APPROVED',
@@ -516,6 +533,7 @@ export const createVendor = async (req: Request, res: Response, next: NextFuncti
               warehouseImageUrl: uploadedWarehouseImage || null,
               latitude: latitude !== undefined ? latitude : null,
               longitude: longitude !== undefined ? longitude : null,
+              ...(parsedRadiusKm !== undefined ? { serviceRadiusKm: parsedRadiusKm } : {}),
               bio: bio || null,
               commissionRate: toMoney(commissionRate || 0.0),
               kycStatus: 'APPROVED',
@@ -548,6 +566,7 @@ export const createVendor = async (req: Request, res: Response, next: NextFuncti
                 warehouseImageUrl: uploadedWarehouseImage || null,
                 latitude: latitude !== undefined ? latitude : null,
                 longitude: longitude !== undefined ? longitude : null,
+                ...(parsedRadiusKm !== undefined ? { serviceRadiusKm: parsedRadiusKm } : {}),
                 bio: bio || null,
                 commissionRate: toMoney(commissionRate || 0.0),
                 kycStatus: 'APPROVED',
@@ -832,6 +851,7 @@ export const updateVendor = async (req: Request, res: Response, next: NextFuncti
       warehouseLocation,
       warehousePhone,
       warehouseImageUrl,
+      serviceRadiusKm,
       reason,
     } = req.body;
 
@@ -859,6 +879,7 @@ export const updateVendor = async (req: Request, res: Response, next: NextFuncti
       if (warehouseLocation !== undefined) data.warehouseLocation = warehouseLocation;
       if (warehousePhone !== undefined) data.warehousePhone = warehousePhone;
       if (warehouseImageUrl !== undefined) data.warehouseImageUrl = warehouseImageUrl;
+      if (serviceRadiusKm !== undefined && serviceRadiusKm !== null) data.serviceRadiusKm = serviceRadiusKm;
 
       const v = await tx.vendorProfile.update({
         where: { id },
