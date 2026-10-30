@@ -5,6 +5,7 @@ import { DispatchError } from '../services/dispatch.errors';
 import {
   buildPaymentQr,
   chatAllowed,
+  confirmUpiCollection,
   getTrackingSnapshot,
   pingProfessionalLocation,
   saveProfessionalUpi,
@@ -42,6 +43,10 @@ export const availabilitySchema = z.object({
 
 export const upiSchema = z.object({
   upiId: z.string().min(5).max(320),
+});
+
+export const confirmUpiSchema = z.object({
+  utr: z.string().trim().min(8).max(32),
 });
 
 export const resolveEscalationSchema = z.object({
@@ -88,6 +93,16 @@ export const postOrderMessage = async (req: Request, res: Response): Promise<voi
   try {
     const message = await sendBookingMessage(req.user!.userId, paramId(req), req.body.body);
     sendSuccess(res, { message }, 201);
+  } catch (err: any) {
+    if (handleDispatchError(res, err)) return;
+    sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
+  }
+};
+
+export const confirmUpiPayment = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const payment = await confirmUpiCollection(req.user!.userId, paramId(req), req.body.utr);
+    sendSuccess(res, { payment });
   } catch (err: any) {
     if (handleDispatchError(res, err)) return;
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);

@@ -8,12 +8,12 @@ import {
   START_OTP_ELIGIBLE_STATUSES,
   TRACKABLE_STATUSES,
   addSeconds,
-  haversineKm,
   isValidCoordinate,
 } from './dispatch.rules';
 import { generateStartOtp, isValidStartOtp, normalizeStartOtp } from '../utils/start-otp';
-import { buildUpiPaymentUri, isValidUpiId, normalizeUpiId } from '../utils/upi';
-import { emitBookingRefresh, emitUserEvent } from '../utils/realtime';
+import { buildUpiPaymentUri, formatRupeeAmount, isValidUpiId, isValidUtr, normalizeUpiId, normalizeUtr } from '../utils/upi';
+import { getDrivingDirections } from './directions.service';
+import { emitBookingRefresh, emitToBookingRoom, emitUserEvent } from '../utils/realtime';
 import { notifyUsers } from './notify.service';
 
 const LOCATION_STATUSES: BookingStatus[] = TRACKABLE_STATUSES;
@@ -151,11 +151,9 @@ export async function pingProfessionalLocation(
     }),
   ]);
 
-  emitUserEvent(
-    'booking:location',
-    { bookingId, reason: 'LOCATION_UPDATED' },
-    [booking.customer.userId, userId]
-  );
+  const locationPayload = { bookingId, reason: 'LOCATION_UPDATED' };
+  emitUserEvent('booking:location', locationPayload, [booking.customer.userId, userId]);
+  emitToBookingRoom(bookingId, 'booking:location', locationPayload);
 
   return { throttled: false as const, latitude, longitude, updatedAt: now };
 }
@@ -174,18 +172,33 @@ export async function getTrackingSnapshot(userId: string, bookingId: string) {
   const proLat = booking.professionalLastLatitude ?? booking.employee?.lastLatitude ?? null;
   const proLng = booking.professionalLastLongitude ?? booking.employee?.lastLongitude ?? null;
   const sharing = trackingAllowed(booking.status, booking.locationSharingEnabled);
-  const distanceKm =
-    sharing && isValidCoordinate(customerLat, customerLng) && isValidCoordinate(proLat, proLng)
-      ? haversineKm(customerLat as number, customerLng as number, proLat as number, proLng as number)
-      : null;
+  let remainingDistanceKm: number | null = null;
+  let etaMinutes = booking.etaMinutes;
+  let encodedPolyline: string | null = null;
+  let routeSource: 'GOOGLE_DIRECTIONS' | 'HAVERSINE' | null = null;
+
+  if (sharing && isValidCoordinate(customerLat, customerLng) && isValidCoordinate(proLat, proLng)) {
+    const route = await getDrivingDirections(
+      proLat as number,
+      proLng as number,
+      customerLat as number,
+      customerLng as number
+    );
+    remainingDistanceKm = route.remainingDistanceKm;
+    etaMinutes = route.etaMinutes;
+    encodedPolyline = route.encodedPolyline;
+    routeSource = route.source;
+  }
 
   return {
     bookingId: booking.id,
     bookingNumber: booking.bookingNumber,
     status: booking.status,
     sharing,
-    etaMinutes: booking.etaMinutes,
-    remainingDistanceKm: distanceKm,
+    etaMinutes,
+    remainingDistanceKm,
+    encodedPolyline,
+    routeSource,
     customer: sharing
       ? {
           latitude: customerLat,
@@ -361,6 +374,100 @@ export async function saveProfessionalUpi(userId: string, upiIdRaw: unknown) {
     data: { upiId },
     select: { id: true, upiId: true },
   });
+}
+
+export async function confirmUpiCollection(userId: string, bookingId: string, utrRaw: unknown) {
+  const utr = normalizeUtr(utrRaw);
+  if (!isValidUtr(utr)) {
+    throw new DispatchError(
+      'INVALID_UTR',
+      'Enter the 12-22 character UPI transaction reference (UTR) from the payment app',
+      400
+    );
+  }
+
+  const booking = await prisma.booking.findUnique({
+    where: { id: bookingId },
+    include: {
+      employee: { select: { userId: true } },
+      payments: { select: { id: true, transactionRef: true, status: true, method: true } },
+    },
+  });
+  if (!booking) throw new DispatchError('NOT_FOUND', 'Order not found', 404);
+  if (booking.employee?.userId !== userId) {
+    throw new DispatchError('FORBIDDEN', 'Only the assigned professional can confirm UPI collection', 403);
+  }
+  if (!['IN_PROGRESS', 'AWAITING_CUSTOMER_CONFIRMATION', 'AWAITING_PAYMENT'].includes(booking.status)) {
+    throw new DispatchError('BAD_REQUEST', 'UPI can be confirmed after the service has started', 400);
+  }
+
+  const amount = formatRupeeAmount(booking.totalAmount);
+  const existing = booking.payments.find(
+    (p) => p.status === 'PAID' && (p.transactionRef === utr || p.method === 'UPI' || p.method === 'CASH')
+  );
+  if (booking.paymentStatus === 'PAID' || existing) {
+    return {
+      bookingId,
+      paymentStatus: 'PAID',
+      amount,
+      utr: existing?.transactionRef || utr,
+      alreadyRecorded: true,
+    };
+  }
+
+  try {
+    await prisma.$transaction(async (tx) => {
+      await tx.payment.create({
+        data: {
+          bookingId,
+          transactionRef: utr,
+          amount,
+          status: 'PAID',
+          method: 'UPI',
+          gatewayResponse: {
+            collectorUserId: userId,
+            collectionType: 'UPI_UTR',
+            confirmedAt: new Date().toISOString(),
+          },
+        },
+      });
+      await tx.booking.update({
+        where: { id: bookingId },
+        data: {
+          paymentStatus: 'PAID',
+          paymentMethod: 'UPI',
+          statusHistory: {
+            create: {
+              oldStatus: booking.status,
+              newStatus: booking.status,
+              changedBy: userId,
+              changedByRole: 'EMPLOYEE',
+              reason: `UPI collected and reconciled with UTR ${utr} for ₹${amount}`,
+            },
+          },
+        },
+      });
+    });
+  } catch (err: any) {
+    if (err?.code === 'P2002') {
+      const other = await prisma.payment.findUnique({ where: { transactionRef: utr }, select: { bookingId: true } });
+      if (other?.bookingId === bookingId) {
+        return { bookingId, paymentStatus: 'PAID', amount, utr, alreadyRecorded: true };
+      }
+      throw new DispatchError('DUPLICATE_UTR', 'This UTR is already recorded on another order', 409);
+    }
+    throw err;
+  }
+
+  void emitBookingRefresh(bookingId, { reason: 'UPI_PAID' });
+  return {
+    bookingId,
+    paymentStatus: 'PAID',
+    amount,
+    utr,
+    alreadyRecorded: false,
+    note: 'Service completion is separate from payment status.',
+  };
 }
 
 export async function setProfessionalAvailability(userId: string, isAvailable: boolean, acceptingRequests?: boolean) {

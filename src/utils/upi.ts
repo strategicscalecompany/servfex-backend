@@ -14,6 +14,16 @@ export function formatRupeeAmount(value: string | number): string {
   return numeric.toFixed(2);
 }
 
+const UTR_PATTERN = /^[A-Z0-9]{12,22}$/;
+
+export function normalizeUtr(value: unknown): string {
+  return typeof value === 'string' ? value.trim().toUpperCase().replace(/\s+/g, '') : '';
+}
+
+export function isValidUtr(value: unknown): boolean {
+  return UTR_PATTERN.test(normalizeUtr(value));
+}
+
 export function buildUpiPaymentUri(params: {
   upiId: string;
   payeeName: string;
