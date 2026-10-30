@@ -91,6 +91,9 @@ export const authenticate = async (
     // 1. Check for backend JWT access token first
     try {
       const jwtPayload = verifyAccessToken(token);
+      if ((jwtPayload as { purpose?: string }).purpose === 'CUSTOMER_ONBOARDING' || !jwtPayload.userId) {
+        throw new Error('Not a session token');
+      }
       const user = await prisma.user.findUnique({
         where: { id: jwtPayload.userId },
         select: AUTH_LOOKUP_SELECT,
@@ -328,6 +331,9 @@ export const requireSuperAdmin = async (
     // Check for backend JWT access token for SUPER_ADMIN first
     try {
       const jwtPayload = verifyAccessToken(token);
+      if ((jwtPayload as { purpose?: string }).purpose === 'CUSTOMER_ONBOARDING' || !jwtPayload.userId) {
+        throw new Error('Not a session token');
+      }
       const adminUser = await prisma.user.findUnique({
         where: { id: jwtPayload.userId },
         select: AUTH_LOOKUP_SELECT,

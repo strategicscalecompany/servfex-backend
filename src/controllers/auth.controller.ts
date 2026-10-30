@@ -8,9 +8,14 @@ import { hashPassword, verifyPassword } from '../utils/password';
 import { generateAccessToken, generateRefreshToken, verifyAccessToken } from '../utils/token';
 import { generateAndSendEmailOtp, verifyEmailOtp } from '../services/otp.service';
 import { isTestingWorkflowEnabled } from '../config/testing-workflow';
-import { sendOtpSms, maskMobile } from '../services/msg91.service';
-import { normalizeIndianMobile, generateNumericOtp, hashOtp, compareOtp } from '../utils/otp.util';
-import { env } from '../config/env';
+import {
+  sendCustomerEmailOtp,
+  sendCustomerMobileOtp,
+  verifyCustomerEmailOtp,
+  verifyCustomerMobileOtp,
+  resolveGoogleCustomer,
+  completeCustomerProfile,
+} from '../services/customer-onboarding.service';
 
 export const loginSchema = z.object({
   email: z.string().email('Valid email is required'),
@@ -271,6 +276,8 @@ export const googleLogin = async (
     let decodedName: string | undefined = clientName;
     let firebaseUid: string | undefined;
     let photoUrl: string | undefined;
+    let tokenVerified = !isFirebaseConfigured();
+    const targetRole = normalizePortalRole(role) || 'VENDOR';
 
     if (isFirebaseConfigured()) {
       try {
@@ -279,9 +286,15 @@ export const googleLogin = async (
         decodedName = decoded.name || clientName;
         firebaseUid = decoded.uid;
         photoUrl = decoded.picture;
+        tokenVerified = true;
       } catch (err: any) {
         logger.warn({ err: err.message }, 'Firebase ID token verification failed, using token payload fallback if in dev');
       }
+    }
+
+    if (targetRole === 'CUSTOMER' && isFirebaseConfigured() && !tokenVerified) {
+      sendError(res, 'INVALID_TOKEN', 'Google credentials could not be verified. Please try again.', 401);
+      return;
     }
 
     if (!decodedEmail) {
@@ -290,7 +303,6 @@ export const googleLogin = async (
     }
 
     const cleanEmail = decodedEmail.toLowerCase().trim();
-    const targetRole = normalizePortalRole(role) || 'VENDOR';
 
     let user = await prisma.user.findFirst({
       where: {
@@ -316,44 +328,41 @@ export const googleLogin = async (
 
     if (!user) {
       if (targetRole === 'CUSTOMER') {
-        const displayName = decodedName?.trim() || cleanEmail.split('@')[0];
-        user = await prisma.user.create({
-          data: {
-            email: cleanEmail,
-            name: displayName,
-            role: 'CUSTOMER',
-            status: 'ACTIVE',
-            isVerified: true,
-            firebaseUid: firebaseUid || null,
-            profilePhotoUrl: photoUrl || null,
-            lastLoginAt: new Date(),
-            customerProfile: {
-              create: {},
-            },
-          },
-          include: {
-            vendorProfile: true,
-            employeeProfile: {
-              include: {
-                vendor: true,
-              },
-            },
-            customerProfile: true,
-            managerProfile: {
-              include: { vendor: true },
-            },
-          },
+        const googleResult = await resolveGoogleCustomer({
+          email: cleanEmail,
+          name: decodedName,
+          firebaseUid,
+          photoUrl,
         });
-        logger.info({ userId: user.id, email: user.email }, 'Auto-created new Customer account via Google Sign-In');
-      } else {
-        sendError(
-          res,
-          'ACCOUNT_NOT_FOUND',
-          "Login failed. You don't have an account. Please contact Super Admin to get an account.",
-          403
-        );
+        if (!googleResult.success) {
+          sendError(res, googleResult.code, googleResult.message, googleResult.status);
+          return;
+        }
+        sendSuccess(res, googleResult.payload);
         return;
       }
+      sendError(
+        res,
+        'ACCOUNT_NOT_FOUND',
+        "Login failed. You don't have an account. Please contact Super Admin to get an account.",
+        403
+      );
+      return;
+    }
+
+    if (targetRole === 'CUSTOMER' && user.role === 'CUSTOMER') {
+      const googleResult = await resolveGoogleCustomer({
+        email: cleanEmail,
+        name: decodedName,
+        firebaseUid,
+        photoUrl,
+      });
+      if (!googleResult.success) {
+        sendError(res, googleResult.code, googleResult.message, googleResult.status);
+        return;
+      }
+      sendSuccess(res, googleResult.payload);
+      return;
     }
 
     // Super Admin stays on the admin website. Managers use the vendor-app Manager portal only.
@@ -463,6 +472,16 @@ export const verifyOtpSchema = z.object({
   mobile: z.string().optional(),
   otp: z.string().min(4, 'OTP must be at least 4 digits'),
   name: z.string().optional(),
+  onboardingToken: z.string().optional(),
+});
+
+export const completeCustomerProfileSchema = z.object({
+  onboardingToken: z.string().min(1, 'Onboarding session is required'),
+  name: z.string().min(2, 'Please enter your full name'),
+  phone: z.string().optional(),
+  mobile: z.string().optional(),
+  otp: z.string().optional(),
+  profilePhotoUrl: z.string().optional(),
 });
 
 /**
@@ -486,114 +505,36 @@ export const sendCustomerOtp = async (
       email = rawTarget;
     }
 
-    // 1. Email OTP Path via Hostinger SMTP
+    const reqMeta = {
+      ip: req.ip,
+      userAgent: (req.headers['user-agent'] as string) || undefined,
+    };
+
+    // 1. Email OTP Path via Hostinger SMTP (hashed challenge, no account-existence leak)
     if (email) {
-      const cleanEmail = email.toLowerCase().trim();
-      const result = await generateAndSendEmailOtp(cleanEmail);
+      const result = await sendCustomerEmailOtp(email, reqMeta);
       if (!result.success) {
-        sendError(res, 'OTP_SEND_FAILED', result.message, 400);
+        sendError(res, result.code, result.message, result.status);
         return;
       }
       sendSuccess(res, {
         message: result.message,
-        cooldownSeconds: result.cooldownSeconds || env.OTP_RESEND_COOLDOWN_SECONDS,
+        cooldownSeconds: result.cooldownSeconds,
       });
       return;
     }
 
-    // 2. Mobile OTP Path via MSG91 Flow SMS
+    // 2. Mobile OTP Path via MSG91 Flow SMS (hashed challenge, no account-existence leak)
     if (rawTarget) {
-      const mobileVal = normalizeIndianMobile(rawTarget);
-      if (!mobileVal.valid || !mobileVal.normalized) {
-        sendError(
-          res,
-          'INVALID_MOBILE_NUMBER',
-          mobileVal.error || 'Please enter a valid 10-digit Indian mobile number',
-          400
-        );
+      const result = await sendCustomerMobileOtp(rawTarget, reqMeta);
+      if (!result.success) {
+        sendError(res, result.code, result.message, result.status);
         return;
       }
-
-      const normalizedMobile = mobileVal.normalized;
-      const now = Date.now();
-
-      // Check active unconsumed challenge for resend cooldown (60 seconds)
-      const latestChallenge = await prisma.otpChallenge.findFirst({
-        where: {
-          mobile: normalizedMobile,
-          isConsumed: false,
-        },
-        orderBy: { createdAt: 'desc' },
-      });
-
-      if (latestChallenge && now < latestChallenge.resendUnlockAt.getTime()) {
-        const remainingSeconds = Math.ceil((latestChallenge.resendUnlockAt.getTime() - now) / 1000);
-        sendError(
-          res,
-          'OTP_RESEND_COOLDOWN',
-          `Please wait ${remainingSeconds} seconds before requesting a new OTP.`,
-          429
-        );
-        return;
-      }
-
-      // Generate cryptographically secure 6-digit numeric OTP using crypto.randomInt
-      const otp = generateNumericOtp();
-      const otpHash = hashOtp(otp);
-
-      // Invalidate any older unconsumed challenges for this mobile
-      await prisma.otpChallenge.updateMany({
-        where: {
-          mobile: normalizedMobile,
-          isConsumed: false,
-        },
-        data: {
-          isConsumed: true,
-        },
-      });
-
-      // Persist challenge securely in MongoDB (Keyed HMAC hash, never plaintext)
-      const expiresAt = new Date(now + env.OTP_EXPIRY_MINUTES * 60 * 1000);
-      const resendUnlockAt = new Date(now + env.OTP_RESEND_COOLDOWN_SECONDS * 1000);
-
-      const challenge = await prisma.otpChallenge.create({
-        data: {
-          mobile: normalizedMobile,
-          otpHash,
-          attempts: 0,
-          maxAttempts: env.OTP_MAX_ATTEMPTS,
-          isConsumed: false,
-          expiresAt,
-          resendUnlockAt,
-          ipAddress: req.ip || null,
-          userAgent: (req.headers['user-agent'] as string) || null,
-        },
-      });
-
-      // Dispatch real SMS via MSG91 Flow API
-      try {
-        await sendOtpSms(normalizedMobile, otp);
-      } catch (smsError: any) {
-        // Rollback challenge so an undelivered challenge is not left usable
-        await prisma.otpChallenge.update({
-          where: { id: challenge.id },
-          data: { isConsumed: true },
-        });
-        logger.error({ err: smsError.message, mobileMasked: maskMobile(normalizedMobile) }, 'MSG91 SMS delivery failed');
-        sendError(
-          res,
-          'SMS_DELIVERY_FAILED',
-          smsError.message || 'Failed to dispatch verification SMS. Please try again.',
-          502
-        );
-        return;
-      }
-
-      logger.info({ mobileMasked: maskMobile(normalizedMobile) }, 'Dispatched OTP SMS via MSG91');
       sendSuccess(res, {
-        message: `OTP sent successfully to ${maskMobile(normalizedMobile)}. Valid for ${env.OTP_EXPIRY_MINUTES} minutes.`,
-        mobile: maskMobile(normalizedMobile),
-        cooldownSeconds: env.OTP_RESEND_COOLDOWN_SECONDS,
+        message: result.message,
+        mobile: result.mobile,
+        cooldownSeconds: result.cooldownSeconds,
       });
       return;
     }
@@ -630,16 +571,15 @@ export const verifyCustomerOtp = async (
       return;
     }
 
-    // 1. Email OTP verification path
-    if (email) {
-      const cleanEmail = email.toLowerCase().trim();
-      const verification = verifyEmailOtp(cleanEmail, cleanOtp);
-      if (!verification.valid) {
-        sendError(res, 'INVALID_OTP', verification.message || 'Invalid or expired OTP', 400);
-        return;
-      }
+    const onboardingToken = (req.body?.onboardingToken as string | undefined) || undefined;
 
-      const result = await findOrCreateCustomerUser({ email: cleanEmail, name });
+    // 1. Email OTP verification — existing customers sign in; new identities get an onboarding token.
+    if (email) {
+      const result = await verifyCustomerEmailOtp({
+        email,
+        otp: cleanOtp,
+        onboardingToken,
+      });
       if (!result.success) {
         sendError(res, result.code, result.message, result.status);
         return;
@@ -648,131 +588,17 @@ export const verifyCustomerOtp = async (
       return;
     }
 
-    // 2. Mobile OTP verification path (MSG91 / OtpChallenge)
+    // 2. Mobile OTP verification — never creates an incomplete account.
     if (rawTarget) {
-      const mobileVal = normalizeIndianMobile(rawTarget);
-      if (!mobileVal.valid || !mobileVal.normalized) {
-        sendError(
-          res,
-          'INVALID_MOBILE_NUMBER',
-          mobileVal.error || 'Please enter a valid 10-digit Indian mobile number',
-          400
-        );
-        return;
-      }
-
-      const normalizedMobile = mobileVal.normalized;
-      const clean10 = mobileVal.clean10Digit!;
-      const displayPhone = mobileVal.displayPhone!;
-      const now = Date.now();
-
-      // Retrieve latest active challenge for this mobile
-      const challenge = await prisma.otpChallenge.findFirst({
-        where: {
-          mobile: normalizedMobile,
-          isConsumed: false,
-        },
-        orderBy: { createdAt: 'desc' },
+      const result = await verifyCustomerMobileOtp({
+        rawMobile: rawTarget,
+        otp: cleanOtp,
+        onboardingToken,
       });
-
-      if (!challenge) {
-        sendError(
-          res,
-          'OTP_NOT_FOUND',
-          'No active OTP request found for this mobile number. Please request a new OTP.',
-          400
-        );
-        return;
-      }
-
-      // Enforce 5-minute expiration
-      if (now > challenge.expiresAt.getTime()) {
-        await prisma.otpChallenge.update({
-          where: { id: challenge.id },
-          data: { isConsumed: true },
-        });
-        sendError(res, 'OTP_EXPIRED', 'Verification code has expired. Please request a new one.', 400);
-        return;
-      }
-
-      // Enforce max 5 attempts per challenge
-      if (challenge.attempts >= challenge.maxAttempts) {
-        await prisma.otpChallenge.update({
-          where: { id: challenge.id },
-          data: { isConsumed: true },
-        });
-        sendError(
-          res,
-          'OTP_MAX_ATTEMPTS_EXCEEDED',
-          'Maximum verification attempts exceeded. Please request a new verification code.',
-          400
-        );
-        return;
-      }
-
-      // Timing-safe HMAC comparison against stored hash
-      const isMatch = compareOtp(cleanOtp, challenge.otpHash);
-
-      if (!isMatch) {
-        const updated = await prisma.otpChallenge.update({
-          where: { id: challenge.id },
-          data: { attempts: { increment: 1 } },
-        });
-
-        const remaining = Math.max(0, updated.maxAttempts - updated.attempts);
-        if (remaining <= 0) {
-          await prisma.otpChallenge.update({
-            where: { id: challenge.id },
-            data: { isConsumed: true },
-          });
-          sendError(
-            res,
-            'OTP_MAX_ATTEMPTS_EXCEEDED',
-            'Maximum verification attempts exceeded. Please request a new verification code.',
-            400
-          );
-          return;
-        }
-
-        sendError(
-          res,
-          'INVALID_OTP',
-          `Incorrect verification code. ${remaining} attempt(s) remaining.`,
-          400
-        );
-        return;
-      }
-
-      // Atomic single-use consumption (concurrency & replay protection)
-      const consumeUpdate = await prisma.otpChallenge.updateMany({
-        where: {
-          id: challenge.id,
-          isConsumed: false,
-        },
-        data: {
-          isConsumed: true,
-        },
-      });
-
-      if (consumeUpdate.count === 0) {
-        sendError(res, 'OTP_ALREADY_USED', 'This OTP has already been verified.', 400);
-        return;
-      }
-
-      // Upsert and authenticate customer
-      const result = await findOrCreateCustomerUser({
-        phone: clean10,
-        displayPhone,
-        normalizedMobile,
-        email: `${clean10}@phone.servfex.com`,
-        name,
-      });
-
       if (!result.success) {
         sendError(res, result.code, result.message, result.status);
         return;
       }
-
       sendSuccess(res, result.payload);
       return;
     }
@@ -784,116 +610,33 @@ export const verifyCustomerOtp = async (
 };
 
 /**
- * Finds or auto-registers a Customer user following ServFex authentication rules.
- * Generates official application JWT access and refresh tokens.
+ * Completes customer onboarding after identity verification.
+ * Requires a verified mobile number before the account is created.
+ * Endpoint: POST /api/v1/auth/customer/complete-profile
  */
-async function findOrCreateCustomerUser(params: {
-  phone?: string;
-  displayPhone?: string;
-  normalizedMobile?: string;
-  email: string;
-  name?: string;
-}): Promise<
-  | { success: true; payload: any }
-  | { success: false; code: string; message: string; status: number }
-> {
-  const { phone, displayPhone, normalizedMobile, email, name } = params;
-
-  // Search existing user by phone variants or generated email
-  let user = await prisma.user.findFirst({
-    where: {
-      OR: [
-        { email },
-        ...(phone ? [{ phone }] : []),
-        ...(displayPhone ? [{ phone: displayPhone }] : []),
-        ...(normalizedMobile ? [{ phone: normalizedMobile }] : []),
-      ],
-      deletedAt: null,
-    },
-    include: {
-      customerProfile: true,
-    },
-  });
-
-  if (!user) {
-    const displayName = name?.trim() || (phone ? `Customer ${phone.slice(-4)}` : email.split('@')[0]);
-    user = await prisma.user.create({
-      data: {
-        email,
-        phone: phone || null,
-        name: displayName,
-        role: 'CUSTOMER',
-        status: 'ACTIVE',
-        isVerified: true,
-        lastLoginAt: new Date(),
-        customerProfile: {
-          create: {},
-        },
-      },
-      include: {
-        customerProfile: true,
-      },
+export const completeCustomerOnboarding = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const { onboardingToken, name, phone, mobile, otp, profilePhotoUrl } = req.body;
+    const result = await completeCustomerProfile({
+      onboardingToken,
+      name,
+      phone: phone || mobile,
+      otp,
+      profilePhotoUrl,
     });
-    logger.info({ userId: user.id, email: user.email, phone: user.phone }, 'Created new Customer account via MSG91 OTP verification');
-  } else {
-    if (user.status === 'SUSPENDED') {
-      return { success: false, code: 'ACCOUNT_SUSPENDED', message: 'Your ServFex account has been suspended.', status: 403 };
+    if (!result.success) {
+      sendError(res, result.code, result.message, result.status);
+      return;
     }
-
-    user = await prisma.user.update({
-      where: { id: user.id },
-      data: {
-        isVerified: true,
-        lastLoginAt: new Date(),
-        ...(name?.trim() ? { name: name.trim() } : {}),
-        ...(phone && !user.phone ? { phone } : {}),
-      },
-      include: {
-        customerProfile: true,
-      },
-    });
-
-    if (!user.customerProfile) {
-      await prisma.customerProfile.create({
-        data: { userId: user.id },
-      });
-    }
+    sendSuccess(res, result.payload, 200);
+  } catch (error) {
+    next(error);
   }
-
-  const token = generateAccessToken({
-    userId: user.id,
-    role: user.role,
-    email: user.email,
-  });
-  const refreshToken = generateRefreshToken({
-    userId: user.id,
-    role: user.role,
-    email: user.email,
-  });
-
-  const userPayload = {
-    id: user.id,
-    email: user.email,
-    phone: user.phone || phone || '',
-    name: user.name,
-    role: 'CUSTOMER',
-    actualRole: user.role,
-    status: user.status,
-    profilePhotoUrl: user.profilePhotoUrl,
-    isVerified: user.isVerified,
-  };
-
-  logger.info({ userId: user.id, phone: maskMobile(normalizedMobile || phone || '') }, 'Customer successfully authenticated via MSG91 OTP');
-
-  return {
-    success: true,
-    payload: {
-      user: userPayload,
-      token,
-      refreshToken,
-    },
-  };
-}
+};
 
 export const forgotPasswordSendOtpSchema = z.object({
   email: z.string().email('Please enter a valid email address'),

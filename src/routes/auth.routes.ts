@@ -10,6 +10,8 @@ import {
   sendOtpSchema,
   verifyCustomerOtp,
   verifyOtpSchema,
+  completeCustomerOnboarding,
+  completeCustomerProfileSchema,
   forgotPasswordSendOtp,
   forgotPasswordSendOtpSchema,
   forgotPasswordVerifyOtp,
@@ -26,6 +28,7 @@ const router = Router();
 // Customer & User OTP Authentication (MSG91 Flow SMS / Hostinger SMTP)
 router.post('/customer/send-otp', otpSendLimiter, validate(sendOtpSchema), sendCustomerOtp);
 router.post('/customer/verify-otp', otpVerifyLimiter, validate(verifyOtpSchema), verifyCustomerOtp);
+router.post('/customer/complete-profile', otpVerifyLimiter, validate(completeCustomerProfileSchema), completeCustomerOnboarding);
 router.post('/send-otp', otpSendLimiter, validate(sendOtpSchema), sendCustomerOtp);
 router.post('/verify-otp', otpVerifyLimiter, validate(verifyOtpSchema), verifyCustomerOtp);
 

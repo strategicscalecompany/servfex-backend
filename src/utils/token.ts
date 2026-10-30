@@ -8,7 +8,45 @@ export interface TokenPayload {
   userId: string;
   role: UserRole;
   email: string;
+  purpose?: string;
 }
+
+export const ONBOARDING_TOKEN_PURPOSE = 'CUSTOMER_ONBOARDING';
+
+export interface OnboardingTokenPayload {
+  purpose: typeof ONBOARDING_TOKEN_PURPOSE;
+  email?: string;
+  phone?: string;
+  displayPhone?: string;
+  normalizedMobile?: string;
+  googleUid?: string;
+  name?: string;
+  photoUrl?: string;
+  emailVerified: boolean;
+  phoneVerified: boolean;
+}
+
+export const generateOnboardingToken = (payload: Omit<OnboardingTokenPayload, 'purpose'>): string => {
+  return jwt.sign(
+    { ...payload, purpose: ONBOARDING_TOKEN_PURPOSE },
+    env.JWT_SECRET,
+    { expiresIn: '30m' }
+  );
+};
+
+export const verifyOnboardingToken = (token: string): OnboardingTokenPayload => {
+  const decoded = jwt.verify(token, env.JWT_SECRET) as OnboardingTokenPayload;
+  if (decoded.purpose !== ONBOARDING_TOKEN_PURPOSE) {
+    throw new Error('Invalid onboarding token');
+  }
+  return decoded;
+};
+
+export const isOnboardingTokenPayload = (
+  payload: TokenPayload | OnboardingTokenPayload | Record<string, unknown>
+): payload is OnboardingTokenPayload => {
+  return (payload as OnboardingTokenPayload).purpose === ONBOARDING_TOKEN_PURPOSE;
+};
 
 export const generateAccessToken = (payload: TokenPayload): string => {
   return jwt.sign(payload, env.JWT_SECRET, {
