@@ -1,9 +1,12 @@
 import { Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import { prisma } from '../config/prisma';
+import { getFirebaseAuth, isFirebaseConfigured } from '../config/firebase';
+import { logger } from '../config/logger';
 import { sendError, sendSuccess } from '../utils/response';
 import { hashPassword } from '../utils/password';
 import { logAuditEvent } from '../utils/audit';
+import { normalizeIndianMobile } from '../utils/otp.util';
 
 const RECENT_BOOKINGS_LIMIT = 8;
 
@@ -452,13 +455,14 @@ export const updateCustomer = async (req: Request, res: Response, next: NextFunc
   }
 };
 
-export const softDeleteCustomer = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+export const deleteCustomer = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const id = req.params.id as string;
-    const { reason } = req.body;
+    const { reason } = (req.body || {}) as { reason?: string };
 
     const user = await prisma.user.findFirst({
-      where: { id, role: 'CUSTOMER', deletedAt: null },
+      where: { id, role: 'CUSTOMER' },
+      include: { customerProfile: true },
     });
 
     if (!user) {
@@ -466,36 +470,104 @@ export const softDeleteCustomer = async (req: Request, res: Response, next: Next
       return;
     }
 
-    await prisma.$transaction(async (tx) => {
-      await tx.user.update({
-        where: { id },
-        data: {
-          deletedAt: new Date(),
-          status: 'INACTIVE',
-        },
-      });
+    const profileId = user.customerProfile?.id;
+    const firebaseUid = user.firebaseUid;
+    const otpKeys = new Set<string>();
+    if (user.phone) {
+      otpKeys.add(user.phone);
+      const mobileVal = normalizeIndianMobile(user.phone);
+      if (mobileVal.normalized) otpKeys.add(mobileVal.normalized);
+      if (mobileVal.clean10Digit) otpKeys.add(mobileVal.clean10Digit);
+    }
+    if (user.email) {
+      otpKeys.add(`email:${user.email.toLowerCase().trim()}`);
+    }
+    const otpKeyList = Array.from(otpKeys);
 
-      // Revoke any active sessions
-      await tx.session.updateMany({
-        where: { userId: id, isValid: true },
-        data: { isValid: false },
-      });
+    await prisma.$transaction(
+      async (tx) => {
+        const bookings = profileId
+          ? await tx.booking.findMany({
+              where: { customerId: profileId },
+              select: { id: true },
+            })
+          : [];
+        const bookingIds = bookings.map((booking) => booking.id);
 
-      await logAuditEvent({
-        superAdminId: req.user!.userId,
-        action: 'CUSTOMER_SOFT_DELETED',
-        entityType: 'User',
-        entityId: id,
-        before: { status: user.status },
-        after: { status: 'INACTIVE', deletedAt: new Date() },
-        reason: reason || 'Deleted by Super Admin',
-        ipAddress: req.ip,
-        userAgent: req.headers['user-agent'],
-        tx,
-      });
-    });
+        if (bookingIds.length > 0) {
+          const payments = await tx.payment.findMany({
+            where: { bookingId: { in: bookingIds } },
+            select: { id: true },
+          });
+          const paymentIds = payments.map((payment) => payment.id);
+          await tx.refund.deleteMany({
+            where: {
+              OR: [
+                { bookingId: { in: bookingIds } },
+                ...(paymentIds.length > 0 ? [{ paymentId: { in: paymentIds } }] : []),
+              ],
+            },
+          });
+          await tx.payment.deleteMany({ where: { bookingId: { in: bookingIds } } });
+          await tx.bookingStatusHistory.deleteMany({ where: { bookingId: { in: bookingIds } } });
+          await tx.bookingAssignment.deleteMany({ where: { bookingId: { in: bookingIds } } });
+          await tx.bookingCall.deleteMany({ where: { bookingId: { in: bookingIds } } });
+          await tx.review.deleteMany({ where: { bookingId: { in: bookingIds } } });
+          await tx.booking.deleteMany({ where: { id: { in: bookingIds } } });
+        }
 
-    sendSuccess(res, { message: 'Customer successfully deactivated and archived' });
+        await tx.review.deleteMany({ where: { customerId: id } });
+        await tx.employeeFeedback.deleteMany({ where: { userId: id } });
+        await tx.session.deleteMany({ where: { userId: id } });
+        await tx.document.deleteMany({ where: { userId: id } });
+        await tx.userAddress.deleteMany({ where: { userId: id } });
+        await tx.notification.deleteMany({ where: { targetUserId: id } });
+
+        if (otpKeyList.length > 0) {
+          await tx.otpChallenge.deleteMany({ where: { mobile: { in: otpKeyList } } });
+        }
+
+        if (profileId) {
+          await tx.customerProfile.delete({ where: { id: profileId } });
+        }
+
+        await logAuditEvent({
+          superAdminId: req.user!.userId,
+          action: 'CUSTOMER_DELETED',
+          entityType: 'User',
+          entityId: id,
+          before: {
+            name: user.name,
+            email: user.email,
+            phone: user.phone,
+            status: user.status,
+          },
+          after: { deleted: true },
+          reason: reason || 'Permanently deleted by Super Admin',
+          ipAddress: req.ip,
+          userAgent: req.headers['user-agent'],
+          tx,
+        });
+
+        await tx.user.delete({ where: { id } });
+      },
+      {
+        timeout: 30000,
+        maxWait: 15000,
+      }
+    );
+
+    if (firebaseUid && isFirebaseConfigured()) {
+      try {
+        await getFirebaseAuth().deleteUser(firebaseUid);
+      } catch (fbErr: any) {
+        if (fbErr?.code !== 'auth/user-not-found') {
+          logger.warn({ firebaseUid, err: fbErr?.message }, 'Firebase customer deletion warning');
+        }
+      }
+    }
+
+    sendSuccess(res, { message: 'Customer permanently deleted' });
   } catch (error) {
     next(error);
   }

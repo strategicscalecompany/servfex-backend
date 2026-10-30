@@ -12,7 +12,7 @@ import {
   getCustomerBookings,
   createCustomer,
   updateCustomer,
-  softDeleteCustomer,
+  deleteCustomer,
   listCustomersQuerySchema,
   listCustomerBookingsQuerySchema,
   createCustomerSchema,
@@ -188,7 +188,7 @@ router.post('/customers', validate(createCustomerSchema), createCustomer);
 router.get('/customers/:id/bookings', validate(listCustomerBookingsQuerySchema), getCustomerBookings);
 router.get('/customers/:id', getCustomerById);
 router.patch('/customers/:id', validate(updateCustomerSchema), updateCustomer);
-router.delete('/customers/:id', softDeleteCustomer);
+router.delete('/customers/:id', deleteCustomer);
 
 // ==========================================
 // MANAGEMENT - VENDORS
