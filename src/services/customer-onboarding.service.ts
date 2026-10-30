@@ -167,9 +167,13 @@ function suspended(): ServiceError {
 
 type CustomerUser = Awaited<ReturnType<typeof prisma.user.findFirst>>;
 
-function assertCustomerAccount(user: NonNullable<CustomerUser>): ServiceError | null {
+function assertCustomerAccount(
+  user: NonNullable<CustomerUser>,
+  opts?: { allowDeleted?: boolean }
+): ServiceError | null {
   if (user.role !== 'CUSTOMER') return forbiddenRole();
   if (user.status === 'SUSPENDED') return suspended();
+  if (opts?.allowDeleted && user.deletedAt) return null;
   if (user.status === 'INACTIVE' || user.status === 'PENDING_APPROVAL') {
     return {
       success: false,
@@ -181,34 +185,133 @@ function assertCustomerAccount(user: NonNullable<CustomerUser>): ServiceError | 
   return null;
 }
 
+function phoneIdentityOr(params: {
+  phone?: string;
+  displayPhone?: string;
+  normalizedMobile?: string;
+}): Array<Record<string, string>> {
+  const rawValues = [params.phone, params.displayPhone, params.normalizedMobile].filter(
+    (value): value is string => Boolean(value && value.trim())
+  );
+  const or: Array<Record<string, string>> = [];
+  const seen = new Set<string>();
+
+  const addPhone = (value: string) => {
+    if (!value || seen.has(`p:${value}`)) return;
+    seen.add(`p:${value}`);
+    or.push({ phone: value });
+  };
+  const addEmail = (value: string) => {
+    if (!value || seen.has(`e:${value}`)) return;
+    seen.add(`e:${value}`);
+    or.push({ email: value });
+  };
+
+  for (const raw of rawValues) {
+    addPhone(raw);
+    const mobileVal = normalizeIndianMobile(raw);
+    const clean10 = mobileVal.clean10Digit || raw.replace(/\D/g, '').slice(-10);
+    if (clean10.length === 10 && /^[6-9]\d{9}$/.test(clean10)) {
+      addPhone(clean10);
+      addPhone(`91${clean10}`);
+      addPhone(`+91${clean10}`);
+      addPhone(`+91 ${clean10}`);
+      addPhone(`+91 ${clean10.slice(0, 5)} ${clean10.slice(5)}`);
+      addPhone(`0${clean10}`);
+      addEmail(phonePlaceholderEmail(clean10));
+    }
+  }
+  return or;
+}
+
+async function findUserByIdentities(or: Array<Record<string, string>>) {
+  if (or.length === 0) return null;
+  return prisma.user.findFirst({
+    where: { OR: or },
+    include: { customerProfile: true },
+  });
+}
+
+async function unsetDeletedAt(userId: string) {
+  try {
+    await prisma.$runCommandRaw({
+      update: 'User',
+      updates: [{ q: { _id: userId }, u: { $unset: { deletedAt: '' } } }],
+    });
+  } catch (err: any) {
+    logger.warn({ userId, err: err?.message }, 'Failed to unset deletedAt on revived customer');
+  }
+}
+
+async function reuseCustomerAccount(
+  user: NonNullable<CustomerUser>,
+  patch: {
+    name?: string;
+    phone?: string;
+    email?: string;
+    googleUid?: string;
+    photoUrl?: string | null;
+  }
+): Promise<AuthSuccess | ServiceError> {
+  const recovering = Boolean(user.deletedAt);
+  const roleErr = assertCustomerAccount(user, { allowDeleted: recovering });
+  if (roleErr) return roleErr;
+
+  const incomingEmail =
+    patch.email && !isPlaceholderEmail(patch.email) ? patch.email.toLowerCase().trim() : undefined;
+  const nextEmail = recovering || isPlaceholderEmail(user.email) ? incomingEmail || user.email : user.email;
+
+  try {
+    const updated = await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        name: patch.name?.trim() || user.name,
+        phone: recovering ? patch.phone || user.phone : user.phone || patch.phone,
+        email: nextEmail,
+        firebaseUid: user.firebaseUid || patch.googleUid || undefined,
+        profilePhotoUrl: patch.photoUrl || user.profilePhotoUrl,
+        isVerified: true,
+        lastLoginAt: new Date(),
+        status: recovering && user.status !== 'SUSPENDED' ? 'ACTIVE' : user.status,
+        deletedAt: null,
+        customerProfile: {
+          upsert: {
+            create: {},
+            update: {},
+          },
+        },
+      },
+      include: { customerProfile: true },
+    });
+
+    if (recovering) {
+      await unsetDeletedAt(user.id);
+      logger.info({ userId: user.id }, 'Revived previously deleted customer account');
+    }
+
+    return issueSession(updated);
+  } catch (err: any) {
+    if (err?.code === 'P2002') {
+      if (recovering) await unsetDeletedAt(user.id);
+      logger.warn({ userId: user.id }, 'Identity patch collided; signing into existing customer as-is');
+      return issueSession(user);
+    }
+    throw err;
+  }
+}
+
 export async function findCustomerByPhone(params: {
   phone?: string;
   displayPhone?: string;
   normalizedMobile?: string;
 }) {
-  const { phone, displayPhone, normalizedMobile } = params;
-  const or: Array<Record<string, string>> = [];
-  if (phone) {
-    or.push({ phone });
-    or.push({ email: phonePlaceholderEmail(phone) });
-  }
-  if (displayPhone) or.push({ phone: displayPhone });
-  if (normalizedMobile) or.push({ phone: normalizedMobile });
-  if (or.length === 0) return null;
-
-  return prisma.user.findFirst({
-    where: { OR: or, deletedAt: null },
-    include: { customerProfile: true },
-  });
+  return findUserByIdentities(phoneIdentityOr(params));
 }
 
 export async function findCustomerByEmail(email: string) {
   const cleanEmail = email.toLowerCase().trim();
   if (!cleanEmail || isPlaceholderEmail(cleanEmail)) return null;
-  return prisma.user.findFirst({
-    where: { email: cleanEmail, deletedAt: null },
-    include: { customerProfile: true },
-  });
+  return findUserByIdentities([{ email: cleanEmail }]);
 }
 
 export async function findCustomerByGoogle(params: { firebaseUid?: string; email?: string }) {
@@ -217,11 +320,7 @@ export async function findCustomerByGoogle(params: { firebaseUid?: string; email
   if (params.email && !isPlaceholderEmail(params.email)) {
     or.push({ email: params.email.toLowerCase().trim() });
   }
-  if (or.length === 0) return null;
-  return prisma.user.findFirst({
-    where: { OR: or, deletedAt: null },
-    include: { customerProfile: true },
-  });
+  return findUserByIdentities(or);
 }
 
 async function consumeOtpChallenge(
@@ -498,24 +597,25 @@ export async function verifyCustomerEmailOtp(params: {
     return existingClaims;
   }
 
+  const user = await findCustomerByEmail(cleanEmail);
+  if (user) {
+    const claims = existingClaims && !('success' in existingClaims) ? existingClaims : null;
+    logger.info({ userId: user.id, email: cleanEmail }, 'Existing customer authenticated via email OTP');
+    return reuseCustomerAccount(user, {
+      name: claims?.name,
+      phone: claims?.phone,
+      email: cleanEmail,
+      googleUid: claims?.googleUid,
+      photoUrl: claims?.photoUrl,
+    });
+  }
+
   if (existingClaims && !('success' in existingClaims)) {
     const merged = mergeOnboardingClaims(existingClaims, {
       email: cleanEmail,
       emailVerified: true,
     });
     return { success: true, payload: onboardingPayload(merged) };
-  }
-
-  const user = await findCustomerByEmail(cleanEmail);
-  if (user) {
-    const roleErr = assertCustomerAccount(user);
-    if (roleErr) return roleErr;
-    await prisma.user.update({
-      where: { id: user.id },
-      data: { isVerified: true, lastLoginAt: new Date() },
-    });
-    logger.info({ userId: user.id, email: cleanEmail }, 'Existing customer authenticated via email OTP');
-    return issueSession({ ...user, isVerified: true });
   }
 
   logger.info({ email: cleanEmail }, 'New customer email identity verified; awaiting profile completion');
@@ -560,11 +660,6 @@ export async function verifyCustomerMobileOtp(params: {
     phoneVerified: true,
   };
 
-  if (existingClaims && !('success' in existingClaims)) {
-    const merged = mergeOnboardingClaims(existingClaims, phonePatch);
-    return { success: true, payload: onboardingPayload(merged) };
-  }
-
   const user = await findCustomerByPhone({
     phone: mobileVal.clean10Digit,
     displayPhone: mobileVal.displayPhone,
@@ -572,21 +667,23 @@ export async function verifyCustomerMobileOtp(params: {
   });
 
   if (user) {
-    const roleErr = assertCustomerAccount(user);
-    if (roleErr) return roleErr;
-    await prisma.user.update({
-      where: { id: user.id },
-      data: {
-        isVerified: true,
-        lastLoginAt: new Date(),
-        ...(user.phone ? {} : { phone: mobileVal.clean10Digit }),
-      },
-    });
+    const claims = existingClaims && !('success' in existingClaims) ? existingClaims : null;
     logger.info(
       { userId: user.id, mobileMasked: maskMobile(mobileVal.normalized) },
       'Existing customer authenticated via mobile OTP'
     );
-    return issueSession({ ...user, phone: user.phone || mobileVal.clean10Digit, isVerified: true });
+    return reuseCustomerAccount(user, {
+      name: claims?.name,
+      phone: mobileVal.clean10Digit,
+      email: claims?.email,
+      googleUid: claims?.googleUid,
+      photoUrl: claims?.photoUrl,
+    });
+  }
+
+  if (existingClaims && !('success' in existingClaims)) {
+    const merged = mergeOnboardingClaims(existingClaims, phonePatch);
+    return { success: true, payload: onboardingPayload(merged) };
   }
 
   logger.info(
@@ -617,22 +714,13 @@ export async function resolveGoogleCustomer(params: {
   const user = await findCustomerByGoogle({ firebaseUid: params.firebaseUid, email: cleanEmail });
 
   if (user) {
-    const roleErr = assertCustomerAccount(user);
-    if (roleErr) return roleErr;
-
-    const updated = await prisma.user.update({
-      where: { id: user.id },
-      data: {
-        lastLoginAt: new Date(),
-        ...(params.firebaseUid && !user.firebaseUid ? { firebaseUid: params.firebaseUid } : {}),
-        ...(params.photoUrl && !user.profilePhotoUrl ? { profilePhotoUrl: params.photoUrl } : {}),
-        ...(isPlaceholderEmail(user.email) ? { email: cleanEmail } : {}),
-      },
-      include: { customerProfile: true },
+    logger.info({ userId: user.id, email: cleanEmail }, 'Existing customer authenticated via Google');
+    return reuseCustomerAccount(user, {
+      name: params.name,
+      email: cleanEmail,
+      googleUid: params.firebaseUid,
+      photoUrl: params.photoUrl,
     });
-
-    logger.info({ userId: updated.id, email: updated.email }, 'Existing customer authenticated via Google');
-    return issueSession(updated);
   }
 
   logger.info({ email: cleanEmail }, 'New Google identity verified; awaiting profile completion');
@@ -766,47 +854,40 @@ export async function completeCustomerProfile(params: {
     (user, index, arr) => arr.findIndex((other) => other.id === user.id) === index
   );
 
-  if (uniqueCandidates.length > 1) {
-    return identityInUse('mobile number');
+  const recoverable = uniqueCandidates.filter((user) => user.role === 'CUSTOMER' && user.status !== 'SUSPENDED');
+  const blocking = uniqueCandidates.find((user) => user.role !== 'CUSTOMER' || user.status === 'SUSPENDED');
+  if (blocking && recoverable.length === 0) {
+    const roleErr = assertCustomerAccount(blocking, { allowDeleted: Boolean(blocking.deletedAt) });
+    return roleErr || identityInUse('mobile number');
   }
 
-  if (uniqueCandidates.length === 1) {
-    const existing = uniqueCandidates[0];
-    const roleErr = assertCustomerAccount(existing);
-    if (roleErr) return roleErr;
+  if (recoverable.length === 1) {
+    const existing = recoverable[0];
+    const recovering = Boolean(existing.deletedAt);
+    if (!recovering) {
+      if (realEmail && existing.email && !isPlaceholderEmail(existing.email) && existing.email !== realEmail) {
+        return identityInUse('email');
+      }
+      if (claims.googleUid && existing.firebaseUid && existing.firebaseUid !== claims.googleUid) {
+        return identityInUse('Google account');
+      }
+      if (existing.phone && claims.phone && existing.phone.replace(/\D/g, '').slice(-10) !== claims.phone) {
+        return identityInUse('mobile number');
+      }
+    }
 
-    if (realEmail && existing.email && !isPlaceholderEmail(existing.email) && existing.email !== realEmail) {
-      return identityInUse('email');
-    }
-    if (claims.googleUid && existing.firebaseUid && existing.firebaseUid !== claims.googleUid) {
-      return identityInUse('Google account');
-    }
-    if (existing.phone && claims.phone && existing.phone.replace(/\D/g, '').slice(-10) !== claims.phone) {
-      return identityInUse('mobile number');
-    }
-
-    const updated = await prisma.user.update({
-      where: { id: existing.id },
-      data: {
-        name,
-        phone: existing.phone || claims.phone,
-        email: realEmail && isPlaceholderEmail(existing.email) ? realEmail : existing.email,
-        firebaseUid: existing.firebaseUid || claims.googleUid || null,
-        profilePhotoUrl: photoUrl || existing.profilePhotoUrl,
-        isVerified: true,
-        lastLoginAt: new Date(),
-        customerProfile: {
-          upsert: {
-            create: {},
-            update: {},
-          },
-        },
-      },
-      include: { customerProfile: true },
+    logger.info({ userId: existing.id, recovering }, 'Reused existing customer during profile completion');
+    return reuseCustomerAccount(existing, {
+      name,
+      phone: claims.phone,
+      email: realEmail || undefined,
+      googleUid: claims.googleUid,
+      photoUrl,
     });
+  }
 
-    logger.info({ userId: updated.id }, 'Linked verified identity onto existing customer during profile completion');
-    return issueSession(updated);
+  if (uniqueCandidates.length > 1) {
+    return identityInUse('mobile number');
   }
 
   try {
@@ -837,6 +918,26 @@ export async function completeCustomerProfile(params: {
     return issueSession(created);
   } catch (err: any) {
     if (err?.code === 'P2002') {
+      const leftover = await findUserByIdentities([
+        ...phoneIdentityOr({
+          phone: claims.phone,
+          displayPhone: claims.displayPhone,
+          normalizedMobile: claims.normalizedMobile,
+        }),
+        ...(realEmail ? [{ email: realEmail }] : []),
+        { email: accountEmail },
+        ...(claims.googleUid ? [{ firebaseUid: claims.googleUid }] : []),
+      ]);
+      if (leftover) {
+        logger.warn({ userId: leftover.id }, 'Recovered leftover identity after unique constraint on profile create');
+        return reuseCustomerAccount(leftover, {
+          name,
+          phone: claims.phone,
+          email: realEmail || undefined,
+          googleUid: claims.googleUid,
+          photoUrl,
+        });
+      }
       return {
         success: false,
         code: 'IDENTITY_IN_USE',
