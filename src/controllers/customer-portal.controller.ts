@@ -16,6 +16,7 @@ import {
 import { releaseDispatchOnCancel, syncDispatchTimer } from '../services/dispatch.service';
 import { scheduleDispatch } from '../services/dispatch.scheduler';
 import { asDecimal, toMoney } from '../utils/money';
+import { hostProfilePhoto } from '../services/customer-onboarding.service';
 
 // -------------------------------------------------------------
 // Validation Schemas
@@ -30,7 +31,18 @@ export const registerCustomerSchema = z.object({
 export const updateCustomerProfileSchema = z.object({
   name: z.string().min(2).optional(),
   phone: z.string().min(10).optional(),
-  profilePhotoUrl: z.string().url().optional(),
+  profilePhotoUrl: z
+    .string()
+    .min(1)
+    .max(8_000_000)
+    .refine(
+      (value) =>
+        value.startsWith('http://') ||
+        value.startsWith('https://') ||
+        value.startsWith('data:image/'),
+      'Profile photo must be an image URL or image data'
+    )
+    .optional(),
   emergencyContact: z.string().optional(),
   notes: z.string().optional(),
 });
@@ -235,13 +247,30 @@ export const updateCustomerProfile = async (req: Request, res: Response): Promis
     const userId = req.user!.userId;
     const { name, phone, profilePhotoUrl, emergencyContact, notes } = req.body;
 
+    let hostedPhotoUrl: string | undefined;
+    if (profilePhotoUrl !== undefined) {
+      try {
+        hostedPhotoUrl = (await hostProfilePhoto(profilePhotoUrl)) || undefined;
+      } catch (err: any) {
+        if (err?.code === 'PAYLOAD_TOO_LARGE') {
+          sendError(res, 'PAYLOAD_TOO_LARGE', err.message, 413);
+          return;
+        }
+        throw err;
+      }
+      if (!hostedPhotoUrl) {
+        sendError(res, 'UPLOAD_FAILED', 'Could not save your profile photo. Please try again.', 422);
+        return;
+      }
+    }
+
     const updated = await prisma.$transaction(async (tx) => {
       const user = await tx.user.update({
         where: { id: userId },
         data: {
           ...(name ? { name } : {}),
           ...(phone ? { phone } : {}),
-          ...(profilePhotoUrl !== undefined ? { profilePhotoUrl } : {}),
+          ...(hostedPhotoUrl !== undefined ? { profilePhotoUrl: hostedPhotoUrl } : {}),
           customerProfile: {
             upsert: {
               create: {

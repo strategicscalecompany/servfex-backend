@@ -738,7 +738,7 @@ export async function resolveGoogleCustomer(params: {
   };
 }
 
-async function hostProfilePhoto(raw?: string | null): Promise<string | null> {
+export async function hostProfilePhoto(raw?: string | null): Promise<string | null> {
   if (!raw || !raw.trim()) return null;
   const value = raw.trim();
   if (value.startsWith('http://') || value.startsWith('https://')) {
