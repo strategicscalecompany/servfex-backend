@@ -121,6 +121,9 @@ export const updateOrderStatusSchema = z.object({
   ]),
   note: z.string().optional(),
   etaMinutes: z.number().int().min(1).max(240).optional(),
+  helperEmployeeId: z.string().uuid().optional().nullable(),
+  helperPayoutAmount: z.number().min(0).optional(),
+  leadPayoutAmount: z.number().min(0).optional(),
 });
 
 export const verifyOrderQrSchema = z
@@ -231,6 +234,13 @@ const ORDER_LIST_INCLUDE = {
     },
   },
   employee: {
+    select: {
+      id: true,
+      userId: true,
+      user: { select: { name: true, phone: true } },
+    },
+  },
+  helperEmployee: {
     select: {
       id: true,
       userId: true,
@@ -967,7 +977,9 @@ export const searchDeskServices = async (req: Request, res: Response): Promise<v
 function sanitizeOrderForViewer(order: any, viewer: { isVendor: boolean; employeeId?: string; isManager?: boolean }) {
   if (!order) return order;
   const withoutOtp = stripStartOtp(order);
-  const isAssigned = !!viewer.employeeId && order.employeeId === viewer.employeeId;
+  const isAssigned =
+    !!viewer.employeeId &&
+    (order.employeeId === viewer.employeeId || order.helperEmployeeId === viewer.employeeId);
   const role: LocationViewerRole = viewer.isVendor || viewer.isManager
     ? 'VENDOR_OWNER'
     : isAssigned
@@ -1043,6 +1055,7 @@ export const getVendorOrders = async (req: Request, res: Response): Promise<void
         // Original Service Professional flow: assigned jobs plus unassigned hub jobs to swipe-accept.
         where.OR = [
           { employeeId: user.employeeProfile.id },
+          { helperEmployeeId: user.employeeProfile.id },
           {
             vendorId: user.employeeProfile.vendorId,
             employeeId: null,
@@ -1113,6 +1126,7 @@ export const getVendorOrderById = async (req: Request, res: Response): Promise<v
       } else {
         where.OR = [
           { employeeId: user.employeeProfile.id },
+          { helperEmployeeId: user.employeeProfile.id },
           { vendorId: user.employeeProfile.vendorId },
         ];
       }
@@ -1148,7 +1162,7 @@ export const updateOrderStatus = async (req: Request, res: Response): Promise<vo
   try {
     const userId = req.user!.userId;
     const id = req.params.id as string;
-    const { status, note, etaMinutes } = req.body;
+    const { status, note, etaMinutes, helperEmployeeId, helperPayoutAmount, leadPayoutAmount } = req.body;
 
     const user = await prisma.user.findUnique({
       where: { id: userId },
@@ -1200,7 +1214,18 @@ export const updateOrderStatus = async (req: Request, res: Response): Promise<vo
         return;
       }
       if (status === 'ACCEPTED') {
-        await acceptAssignment(userId, id, etaMinutes);
+        await acceptAssignment(
+          userId,
+          id,
+          etaMinutes,
+          helperEmployeeId
+            ? {
+                helperEmployeeId,
+                helperPayoutAmount: helperPayoutAmount ?? 0,
+                leadPayoutAmount,
+              }
+            : null
+        );
         const order = await prisma.booking.findUnique({
           where: { id },
           include: ORDER_LIST_INCLUDE,

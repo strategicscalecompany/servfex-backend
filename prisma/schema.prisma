@@ -291,6 +291,7 @@ model EmployeeProfile {
   updatedAt      DateTime        @updatedAt
 
   bookings       Booking[]       @relation("EmployeeBookings")
+  helperBookings Booking[]       @relation("BookingHelper")
   reviews        Review[]        @relation("EmployeeReviews")
   feedback       EmployeeFeedback[]
   assignments    BookingAssignment[]
@@ -526,6 +527,14 @@ model Booking {
   employeeId         String?
   employee           EmployeeProfile?     @relation("EmployeeBookings", fields: [employeeId], references: [id], onDelete: SetNull)
 
+  // Optional teammate tagged by the assigned (lead) professional at accept time.
+  // Job control (PIN, photos, QR, status) always stays with `employeeId`.
+  helperEmployeeId   String?
+  helperEmployee     EmployeeProfile?     @relation("BookingHelper", fields: [helperEmployeeId], references: [id], onDelete: SetNull)
+  helperPayoutAmount String?
+  leadPayoutAmount   String?
+  helperTaggedAt     DateTime?
+
   scheduledDate      String               // YYYY-MM-DD
   scheduledTimeSlot  String               // e.g. 10:00 AM - 12:00 PM
 
@@ -608,6 +617,7 @@ model Booking {
   @@index([customerId])
   @@index([vendorId])
   @@index([employeeId])
+  @@index([helperEmployeeId])
   @@index([status])
   @@index([scheduledDate])
   @@index([createdAt])
@@ -617,6 +627,7 @@ model Booking {
   @@index([status, createdAt(sort: Desc)])
   @@index([status, dispatchDueAt])
   @@index([employeeId, status])
+  @@index([helperEmployeeId, status])
   @@index([vendorId, scheduledDate])
   @@index([employeeId, scheduledDate, scheduledTimeSlot])
   @@index([vendorId, bookingSource, createdAt(sort: Desc)])

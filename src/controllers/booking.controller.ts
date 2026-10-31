@@ -176,6 +176,11 @@ export const getBookings = async (req: Request, res: Response, next: NextFunctio
               user: { select: { name: true, phone: true } },
             },
           },
+          helperEmployee: {
+            include: {
+              user: { select: { name: true, phone: true } },
+            },
+          },
           address: true,
         },
       }),
@@ -212,6 +217,11 @@ export const getBookingById = async (req: Request, res: Response, next: NextFunc
           },
         },
         employee: {
+          include: {
+            user: { select: { name: true, phone: true, profilePhotoUrl: true } },
+          },
+        },
+        helperEmployee: {
           include: {
             user: { select: { name: true, phone: true, profilePhotoUrl: true } },
           },
@@ -710,10 +720,10 @@ export const assignEmployee = async (req: Request, res: Response, next: NextFunc
     const overlappingBooking = await prisma.booking.findFirst({
       where: {
         id: { not: id },
-        employeeId,
         scheduledDate: booking.scheduledDate,
         scheduledTimeSlot: booking.scheduledTimeSlot,
-        status: { in: ['ASSIGNED', 'ON_THE_WAY', 'ARRIVED', 'IN_PROGRESS'] },
+        status: { in: ['ASSIGNED', 'ACCEPTED', 'ON_THE_WAY', 'ARRIVED', 'IN_PROGRESS'] },
+        OR: [{ employeeId }, { helperEmployeeId: employeeId }],
       },
     });
 
@@ -733,6 +743,10 @@ export const assignEmployee = async (req: Request, res: Response, next: NextFunc
         data: {
           employeeId,
           status: 'ASSIGNED',
+          helperEmployeeId: null,
+          helperPayoutAmount: null,
+          leadPayoutAmount: null,
+          helperTaggedAt: null,
         },
       });
 

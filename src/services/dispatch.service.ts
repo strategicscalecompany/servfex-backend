@@ -21,7 +21,7 @@ import {
   type ScoredExpertCandidate,
 } from './dispatch.rules';
 import { isTestingWorkflowEnabled } from '../config/testing-workflow';
-import { toMoney } from '../utils/money';
+import { asDecimal, toMoney } from '../utils/money';
 import { notifyUsers } from './notify.service';
 import { DispatchError } from './dispatch.errors';
 
@@ -60,7 +60,7 @@ async function lockEmployee(tx: Tx, employeeId: string): Promise<void> {
 // Workload
 // ---------------------------------------------------------------------------
 
-/** Open jobs an expert already holds in the same date + time slot (double-booking prevention). */
+/** Open jobs an expert already holds as lead or tagged teammate in the same date + time slot. */
 async function countActiveJobsInSlot(
   tx: Tx,
   employeeId: string,
@@ -68,13 +68,95 @@ async function countActiveJobsInSlot(
 ): Promise<number> {
   return tx.booking.count({
     where: {
-      employeeId,
       id: { not: slot.excludeBookingId },
       status: { in: ACTIVE_JOB_STATUSES },
       scheduledDate: slot.scheduledDate,
       scheduledTimeSlot: slot.scheduledTimeSlot,
+      OR: [{ employeeId }, { helperEmployeeId: employeeId }],
     },
   });
+}
+
+const CLEAR_HELPER_FIELDS = {
+  helperEmployeeId: null,
+  helperPayoutAmount: null,
+  leadPayoutAmount: null,
+  helperTaggedAt: null,
+} as const;
+
+export interface AcceptHelperInput {
+  helperEmployeeId: string;
+  helperPayoutAmount: number | string;
+  leadPayoutAmount?: number | string | null;
+}
+
+function resolveTeammateSplit(
+  poolRaw: string | null | undefined,
+  helperAmountRaw: number | string,
+  leadAmountRaw?: number | string | null
+): { helper: string; lead: string } {
+  const pool = asDecimal(poolRaw);
+  const helper = asDecimal(helperAmountRaw);
+  if (helper.lessThan(0)) {
+    throw new DispatchError('INVALID_PAYOUT_SPLIT', 'Teammate share cannot be negative', 400);
+  }
+  const lead =
+    leadAmountRaw != null && String(leadAmountRaw).trim() !== ''
+      ? asDecimal(leadAmountRaw)
+      : pool.minus(helper);
+  if (lead.lessThan(0)) {
+    throw new DispatchError('INVALID_PAYOUT_SPLIT', 'Lead share cannot be negative', 400);
+  }
+  if (pool.greaterThan(0) && !helper.plus(lead).equals(pool)) {
+    throw new DispatchError(
+      'INVALID_PAYOUT_SPLIT',
+      `Lead and teammate shares must add up to ₹${toMoney(pool)}`,
+      400
+    );
+  }
+  return { helper: toMoney(helper), lead: toMoney(lead) };
+}
+
+async function loadBusyByExpert(
+  tx: Tx,
+  expertIds: string[],
+  booking: { id: string; scheduledDate: string; scheduledTimeSlot: string }
+): Promise<Map<string, number>> {
+  const busyByExpert = new Map<string, number>();
+  if (expertIds.length === 0) return busyByExpert;
+  const [asLead, asHelper] = await Promise.all([
+    tx.booking.groupBy({
+      by: ['employeeId'],
+      where: {
+        employeeId: { in: expertIds },
+        id: { not: booking.id },
+        status: { in: ACTIVE_JOB_STATUSES },
+        scheduledDate: booking.scheduledDate,
+        scheduledTimeSlot: booking.scheduledTimeSlot,
+      },
+      _count: { _all: true },
+    }),
+    tx.booking.groupBy({
+      by: ['helperEmployeeId'],
+      where: {
+        helperEmployeeId: { in: expertIds },
+        id: { not: booking.id },
+        status: { in: ACTIVE_JOB_STATUSES },
+        scheduledDate: booking.scheduledDate,
+        scheduledTimeSlot: booking.scheduledTimeSlot,
+      },
+      _count: { _all: true },
+    }),
+  ]);
+  for (const row of asLead) {
+    if (!row.employeeId) continue;
+    busyByExpert.set(row.employeeId, (busyByExpert.get(row.employeeId) ?? 0) + row._count._all);
+  }
+  for (const row of asHelper) {
+    if (!row.helperEmployeeId) continue;
+    busyByExpert.set(row.helperEmployeeId, (busyByExpert.get(row.helperEmployeeId) ?? 0) + row._count._all);
+  }
+  return busyByExpert;
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +243,9 @@ const BOOKING_FOR_DISPATCH = {
   status: true,
   vendorId: true,
   employeeId: true,
+  helperEmployeeId: true,
+  expertPayout: true,
+  totalAmount: true,
   scheduledDate: true,
   scheduledTimeSlot: true,
   dispatchDueAt: true,
@@ -231,6 +316,7 @@ export async function offerToExpertInTx(tx: Tx, p: OfferParams): Promise<void> {
       assignmentMethod: p.method,
       assignedAt: now,
       dispatchDueAt: addSeconds(now, env.EXPERT_ACCEPT_WINDOW_SECONDS),
+      ...CLEAR_HELPER_FIELDS,
       ...(booking.vendorId ? { vendorId: booking.vendorId } : {}),
       ...(p.expertPayout ? { expertPayout: toMoney(p.expertPayout) } : {}),
       ...(p.dispatchNote ? { notes: p.dispatchNote } : {}),
@@ -332,27 +418,13 @@ async function loadExpertCandidates(
   });
 
   const expertIds = experts.map((e) => e.id);
-  const [busy, previous] = await Promise.all([
-    expertIds.length
-      ? tx.booking.groupBy({
-          by: ['employeeId'],
-          where: {
-            employeeId: { in: expertIds },
-            id: { not: booking.id },
-            status: { in: ACTIVE_JOB_STATUSES },
-            scheduledDate: booking.scheduledDate,
-            scheduledTimeSlot: booking.scheduledTimeSlot,
-          },
-          _count: { _all: true },
-        })
-      : Promise.resolve([] as Array<{ employeeId: string | null; _count: { _all: number } }>),
+  const [busyByExpert, previous] = await Promise.all([
+    loadBusyByExpert(tx, expertIds, booking),
     tx.bookingAssignment.findMany({
       where: { bookingId: booking.id, status: { in: ['REJECTED', 'EXPIRED'] } },
       select: { employeeId: true },
     }),
   ]);
-
-  const busyByExpert = new Map(busy.map((b) => [b.employeeId as string, b._count._all]));
   const excluded = new Set(previous.map((a) => a.employeeId));
 
   const candidates: ExpertCandidate[] = experts.map((e) => ({
@@ -408,26 +480,13 @@ async function loadNearbyScoredExperts(
   });
 
   const expertIds = vendors.flatMap((v) => v.employees.map((e) => e.id));
-  const [busy, previous] = await Promise.all([
-    expertIds.length
-      ? tx.booking.groupBy({
-          by: ['employeeId'],
-          where: {
-            employeeId: { in: expertIds },
-            id: { not: booking.id },
-            status: { in: ACTIVE_JOB_STATUSES },
-            scheduledDate: booking.scheduledDate,
-            scheduledTimeSlot: booking.scheduledTimeSlot,
-          },
-          _count: { _all: true },
-        })
-      : Promise.resolve([] as Array<{ employeeId: string | null; _count: { _all: number } }>),
+  const [busyByExpert, previous] = await Promise.all([
+    loadBusyByExpert(tx, expertIds, booking),
     tx.bookingAssignment.findMany({
       where: { bookingId: booking.id, status: { in: ['REJECTED', 'EXPIRED'] } },
       select: { employeeId: true },
     }),
   ]);
-  const busyByExpert = new Map(busy.map((b) => [b.employeeId as string, b._count._all]));
   const excluded = new Set(previous.map((a) => a.employeeId));
   const nameById = new Map<string, string>();
   const scoredInput: Array<Omit<ScoredExpertCandidate, 'score' | 'etaMinutes'> & { etaMinutes?: number | null }> = [];
@@ -816,7 +875,12 @@ async function loadExpertContext(tx: Tx, userId: string) {
  * (re-assigned, expired, cancelled) is refused with 409 instead of silently succeeding.
  * Repeating the call after success is idempotent (returns success, no duplicate events).
  */
-export async function acceptAssignment(userId: string, bookingId: string, etaMinutes?: number | null) {
+export async function acceptAssignment(
+  userId: string,
+  bookingId: string,
+  etaMinutes?: number | null,
+  helper?: AcceptHelperInput | null
+) {
   const now = new Date();
   const effects: Effects = { refreshBookingId: bookingId, reason: 'EXPERT_ACCEPTED' };
   const confirmedEta =
@@ -842,6 +906,51 @@ export async function acceptAssignment(userId: string, bookingId: string, etaMin
       throw new DispatchError('BOOKING_NOT_ACCEPTABLE', `Booking is ${booking.status} and cannot be accepted`, 409);
     }
 
+    let helperTag: {
+      helperEmployeeId: string;
+      helperUserId: string;
+      helperName: string;
+      helperPayoutAmount: string;
+      leadPayoutAmount: string;
+    } | null = null;
+
+    if (helper?.helperEmployeeId) {
+      if (helper.helperEmployeeId === expert.id) {
+        throw new DispatchError('INVALID_TEAMMATE', 'You cannot tag yourself as the teammate', 400);
+      }
+      const teammate = await tx.employeeProfile.findUnique({
+        where: { id: helper.helperEmployeeId },
+        include: { user: { select: { id: true, name: true, status: true, deletedAt: true } } },
+      });
+      if (!teammate || teammate.vendorId !== expert.vendorId) {
+        throw new DispatchError('INVALID_TEAMMATE', 'Teammate must belong to the same partner hub', 400);
+      }
+      if (isTestingWorkflowEnabled() && teammate.expertKind === 'SALES_MANAGER') {
+        throw new DispatchError('INVALID_TEAMMATE', 'A Sales Manager cannot be tagged as a teammate', 400);
+      }
+      if (!teammate.isAvailable || teammate.user.status !== 'ACTIVE' || teammate.user.deletedAt) {
+        throw new DispatchError('TEAMMATE_UNAVAILABLE', `${teammate.user.name} is currently unavailable`, 409);
+      }
+      await lockEmployee(tx, teammate.id);
+      const clash = await countActiveJobsInSlot(tx, teammate.id, {
+        scheduledDate: booking.scheduledDate,
+        scheduledTimeSlot: booking.scheduledTimeSlot,
+        excludeBookingId: booking.id,
+      });
+      if (clash >= MAX_ACTIVE_JOBS_PER_EXPERT) {
+        throw new DispatchError('EXPERT_BUSY', `${teammate.user.name} already has a job in this time slot`, 409);
+      }
+      const pool = booking.expertPayout || booking.totalAmount;
+      const split = resolveTeammateSplit(pool, helper.helperPayoutAmount, helper.leadPayoutAmount);
+      helperTag = {
+        helperEmployeeId: teammate.id,
+        helperUserId: teammate.userId,
+        helperName: teammate.user.name,
+        helperPayoutAmount: split.helper,
+        leadPayoutAmount: split.lead,
+      };
+    }
+
     const flipped = await tx.booking.updateMany({
       where: { id: bookingId, status: 'ASSIGNED', employeeId: expert.id },
       data: {
@@ -851,6 +960,14 @@ export async function acceptAssignment(userId: string, bookingId: string, etaMin
         dispatchAttempts: 0,
         locationSharingEnabled: true,
         ...(confirmedEta ? { etaMinutes: confirmedEta, etaConfirmedAt: now } : {}),
+        ...(helperTag
+          ? {
+              helperEmployeeId: helperTag.helperEmployeeId,
+              helperPayoutAmount: helperTag.helperPayoutAmount,
+              leadPayoutAmount: helperTag.leadPayoutAmount,
+              helperTaggedAt: now,
+            }
+          : CLEAR_HELPER_FIELDS),
       },
     });
     if (flipped.count !== 1) {
@@ -860,26 +977,54 @@ export async function acceptAssignment(userId: string, bookingId: string, etaMin
       where: { bookingId, employeeId: expert.id, status: 'OFFERED' },
       data: { status: 'ACCEPTED', respondedAt: now },
     });
-    await recordHistory(tx, bookingId, 'ASSIGNED', 'ACCEPTED', userId, 'EMPLOYEE', `Order accepted by ${expert.user.name}`);
+    const teammateHistory = helperTag
+      ? ` with teammate ${helperTag.helperName} (split ₹${helperTag.leadPayoutAmount} / ₹${helperTag.helperPayoutAmount})`
+      : '';
+    await recordHistory(
+      tx,
+      bookingId,
+      'ASSIGNED',
+      'ACCEPTED',
+      userId,
+      'EMPLOYEE',
+      `Order accepted by ${expert.user.name}${teammateHistory}`
+    );
 
-    const etaText = confirmedEta ? ` They will reach your location in about ${confirmedEta} minutes.` : ' They will reach your location at the estimated arrival time.';
+    const etaText = confirmedEta
+      ? ` They will reach your location in about ${confirmedEta} minutes.`
+      : ' They will reach your location at the estimated arrival time.';
+    const teammateCustomerText = helperTag ? ` They are bringing teammate ${helperTag.helperName}.` : '';
     await tx.notification.create({
       data: {
         title: 'Your service professional has been assigned',
-        message: `${expert.user.name} accepted your ${booking.service.name} booking.${etaText}`,
+        message: `${expert.user.name} accepted your ${booking.service.name} booking.${etaText}${teammateCustomerText}`,
         target: 'SPECIFIC_USER',
         targetUserId: booking.customer.userId,
       },
     });
     if (booking.vendor?.userId) {
+      const vendorTeammateText = helperTag
+        ? ` Teammate ${helperTag.helperName} is tagged. Split: lead ₹${helperTag.leadPayoutAmount} / teammate ₹${helperTag.helperPayoutAmount}.`
+        : '';
       await tx.notification.create({
         data: {
           title: `Job Accepted #${booking.bookingNumber}`,
-          message: `Expert ${expert.user.name} has accepted order #${booking.bookingNumber} (${booking.service.name}).`,
+          message: `Expert ${expert.user.name} has accepted order #${booking.bookingNumber} (${booking.service.name}).${vendorTeammateText}`,
           target: 'SPECIFIC_USER',
           targetUserId: booking.vendor.userId,
         },
       });
+    }
+    if (helperTag) {
+      await tx.notification.create({
+        data: {
+          title: `Tagged as teammate #${booking.bookingNumber}`,
+          message: `${expert.user.name} tagged you on ${booking.service.name}. Your agreed share is ₹${helperTag.helperPayoutAmount}. Job control stays with ${expert.user.name}.`,
+          target: 'SPECIFIC_USER',
+          targetUserId: helperTag.helperUserId,
+        },
+      });
+      effects.extraUserIds = [helperTag.helperUserId];
     }
     return { alreadyAccepted: false };
   }, TX_OPTIONS);
@@ -934,6 +1079,7 @@ export async function rejectAssignment(userId: string, bookingId: string, reason
         locationSharingEnabled: false,
         dispatchDueAt: keepDirect ? null : now,
         dispatchAttempts: 0,
+        ...CLEAR_HELPER_FIELDS,
       },
     });
     await recordHistory(
