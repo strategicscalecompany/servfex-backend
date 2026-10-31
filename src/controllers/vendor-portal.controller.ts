@@ -922,6 +922,9 @@ export const getDeskContext = async (req: Request, res: Response): Promise<void>
       phone: string;
       vendorId: string;
       ongoingOrderCount: number;
+      isOnline: boolean;
+      isAvailable: boolean;
+      acceptingRequests: boolean;
     }> = [];
 
     if ((actor.isSalesManager || actor.isManager || actor.isVendor) && actor.vendorId) {
@@ -932,7 +935,9 @@ export const getDeskContext = async (req: Request, res: Response): Promise<void>
           expertKind: 'SERVICE_PROFESSIONAL',
           user: { status: 'ACTIVE', deletedAt: null },
         },
-        include: { user: { select: { name: true, phone: true } } },
+        include: {
+          user: { select: { name: true, phone: true } },
+        },
         orderBy: { createdAt: 'desc' },
       });
 
@@ -972,13 +977,20 @@ export const getDeskContext = async (req: Request, res: Response): Promise<void>
         }
       }
 
-      technicians = employees.map((emp) => ({
-        id: emp.id,
-        name: emp.user.name,
-        phone: emp.phone || emp.user.phone || '',
-        vendorId: emp.vendorId,
-        ongoingOrderCount: ongoingCounts.get(emp.id) || 0,
-      }));
+      technicians = employees.map((emp) => {
+        const isAvailable = emp.isAvailable !== false;
+        const acceptingRequests = emp.acceptingRequests !== false;
+        return {
+          id: emp.id,
+          name: emp.user.name,
+          phone: emp.phone || emp.user.phone || '',
+          vendorId: emp.vendorId,
+          ongoingOrderCount: ongoingCounts.get(emp.id) || 0,
+          isAvailable,
+          acceptingRequests,
+          isOnline: isAvailable && acceptingRequests,
+        };
+      });
     }
 
     sendSuccess(res, {
@@ -1246,15 +1258,54 @@ export const updateOrderStatus = async (req: Request, res: Response): Promise<vo
         sendError(res, 'FORBIDDEN', 'Sales Managers cannot accept or complete service jobs', 403);
         return;
       }
-      if (status === 'COMPLETED' || status === 'AWAITING_CUSTOMER_CONFIRMATION' || status === 'IN_PROGRESS') {
-        sendError(
-          res,
-          'INVALID_TRANSITION',
-          status === 'IN_PROGRESS'
-            ? 'Use the start OTP endpoint to begin work'
-            : 'Swipe to complete and upload at least 4 photographs',
-          400
-        );
+      if (status === 'COMPLETED' || status === 'AWAITING_CUSTOMER_CONFIRMATION') {
+        sendError(res, 'INVALID_TRANSITION', 'Swipe to complete and upload at least 4 photographs', 400);
+        return;
+      }
+      if (status === 'IN_PROGRESS') {
+        const bookingForStart = await prisma.booking.findFirst({
+          where: { id, employeeId: user.employeeProfile.id },
+          select: { id: true, status: true, bookingSource: true, bookingNumber: true },
+        });
+        if (!bookingForStart) {
+          sendError(res, 'NOT_FOUND', 'Order not found or unauthorized', 404);
+          return;
+        }
+        const deskManaged =
+          bookingForStart.bookingSource === 'SALES_MANAGER' || bookingForStart.bookingSource === 'PHONE_HUB';
+        if (!deskManaged) {
+          sendError(res, 'INVALID_TRANSITION', 'Use the start OTP endpoint to begin work', 400);
+          return;
+        }
+        if (!['ARRIVED', 'ON_THE_WAY', 'ACCEPTED'].includes(bookingForStart.status)) {
+          sendError(
+            res,
+            'INVALID_TRANSITION',
+            `Cannot start work from ${bookingForStart.status}. Mark arrived first.`,
+            409
+          );
+          return;
+        }
+        const started = await prisma.booking.update({
+          where: { id },
+          data: {
+            status: 'IN_PROGRESS',
+            qrVerifiedAt: new Date(),
+            qrChallengeToken: null,
+            statusHistory: {
+              create: {
+                oldStatus: bookingForStart.status,
+                newStatus: 'IN_PROGRESS',
+                changedBy: userId,
+                changedByRole: 'EMPLOYEE',
+                reason: 'Desk-assigned job started without customer OTP (Sales Manager / Hub Operation Manager booking)',
+              },
+            },
+          },
+          include: ORDER_LIST_INCLUDE,
+        });
+        void emitBookingRefresh(id, { reason: 'SERVICE_STARTED' });
+        sendSuccess(res, { order: started }, 200);
         return;
       }
       if (status === 'ACCEPTED') {
@@ -1546,7 +1597,9 @@ export const completeOrder = async (req: Request, res: Response): Promise<void> 
       sendError(res, 'BAD_REQUEST', `Cannot complete order in ${booking.status} status. Job must be IN_PROGRESS.`, 400);
       return;
     }
-    if (!booking.qrVerifiedAt) {
+    const deskManaged =
+      booking.bookingSource === 'SALES_MANAGER' || booking.bookingSource === 'PHONE_HUB';
+    if (!booking.qrVerifiedAt && !deskManaged) {
       sendError(res, 'BAD_REQUEST', 'Cannot complete order without verified start OTP', 400);
       return;
     }
@@ -1578,7 +1631,9 @@ export const completeOrder = async (req: Request, res: Response): Promise<void> 
         if (current.status !== 'IN_PROGRESS') {
           throw Object.assign(new Error(`Cannot complete order in ${current.status} status.`), { code: 'BAD_REQUEST' });
         }
-        if (!current.qrVerifiedAt) {
+        const currentDeskManaged =
+          current.bookingSource === 'SALES_MANAGER' || current.bookingSource === 'PHONE_HUB';
+        if (!current.qrVerifiedAt && !currentDeskManaged) {
           throw Object.assign(new Error('Cannot complete order without verified start OTP'), { code: 'BAD_REQUEST' });
         }
         if (!hasRequiredCompletionPhotos(current.completionPhotoUrls)) {
@@ -1588,14 +1643,23 @@ export const completeOrder = async (req: Request, res: Response): Promise<void> 
           );
         }
 
+        // Desk-managed jobs (Sales Manager / Hub OM) close immediately — no customer-app confirmation.
+        const nextStatus = currentDeskManaged ? 'COMPLETED' : 'AWAITING_CUSTOMER_CONFIRMATION';
         const flipped = await tx.booking.updateMany({
           where: {
             id,
             status: { in: [...COMPLETABLE_JOB_STATUSES] as BookingStatus[] },
           },
           data: {
-            status: 'AWAITING_CUSTOMER_CONFIRMATION',
+            status: nextStatus,
             completionRequestedAt: new Date(),
+            ...(currentDeskManaged
+              ? {
+                  customerConfirmedAt: new Date(),
+                  paymentStatus: 'PAID',
+                  qrVerifiedAt: current.qrVerifiedAt || new Date(),
+                }
+              : {}),
           },
         });
         if (flipped.count !== 1) {
@@ -1606,12 +1670,22 @@ export const completeOrder = async (req: Request, res: Response): Promise<void> 
           data: {
             bookingId: id,
             oldStatus: current.status,
-            newStatus: 'AWAITING_CUSTOMER_CONFIRMATION',
+            newStatus: nextStatus,
             changedBy: userId,
             changedByRole: (user?.role as any) || 'EMPLOYEE',
-            reason: completionReason || 'Technician completed service delivery. Awaiting customer confirmation.',
+            reason:
+              completionReason ||
+              (currentDeskManaged
+                ? 'Working Professional completed desk-assigned job and confirmed on-site UPI collection.'
+                : 'Technician completed service delivery. Awaiting customer confirmation.'),
           },
         });
+        if (currentDeskManaged && (current.employeeId || booking.employeeId)) {
+          await tx.employeeProfile.update({
+            where: { id: (current.employeeId || booking.employeeId)! },
+            data: { completedJobs: { increment: 1 } },
+          });
+        }
       }, { maxWait: 20_000, timeout: 45_000 });
     } catch (err: any) {
       if (err.code === 'COMPLETION_PHOTOS_REQUIRED' || err.code === 'BAD_REQUEST' || err.code === 'ASSIGNMENT_CONFLICT' || err.code === 'NOT_FOUND') {
@@ -1638,7 +1712,16 @@ export const completeOrder = async (req: Request, res: Response): Promise<void> 
 
     await setLocationSharing(id, false);
     void emitBookingRefresh(id, { reason: 'SERVICE_COMPLETED' });
-    sendSuccess(res, { order: updated, message: 'Completion submitted. Awaiting customer confirmation.' }, 200);
+    sendSuccess(
+      res,
+      {
+        order: updated,
+        message: deskManaged
+          ? 'Job completed. Payment confirmed by the Working Professional.'
+          : 'Completion submitted. Awaiting customer confirmation.',
+      },
+      200
+    );
   } catch (err: any) {
     if (err.code === 'COMPLETION_PHOTOS_REQUIRED' || err.code === 'BAD_REQUEST' || err.code === 'ASSIGNMENT_CONFLICT') {
       sendError(res, err.code, err.message, err.code === 'ASSIGNMENT_CONFLICT' ? 409 : 400);
@@ -2348,15 +2431,30 @@ export const createHubBooking = async (req: Request, res: Response): Promise<voi
           expertKind: 'SERVICE_PROFESSIONAL',
           OR: [{ id: employeeId }, { userId: employeeId }],
         },
-        select: { id: true, userId: true },
+        select: {
+          id: true,
+          userId: true,
+          isAvailable: true,
+          acceptingRequests: true,
+          user: { select: { name: true } },
+        },
       });
       if (!technician) {
-        sendError(res, 'FORBIDDEN', 'You can only assign this order to a Service Professional in your hub', 403);
+        sendError(res, 'FORBIDDEN', 'You can only assign this order to a Working Professional in your hub', 403);
         return;
       }
-      technicianToAssign = technician;
+      if (!technician.isAvailable || !technician.acceptingRequests) {
+        sendError(
+          res,
+          'EXPERT_OFFLINE',
+          `${technician.user.name} is offline. You cannot assign any order until they turn Online.`,
+          409
+        );
+        return;
+      }
+      technicianToAssign = { id: technician.id, userId: technician.userId };
     } else if (isSalesManager && !employeeId) {
-      sendError(res, 'BAD_REQUEST', 'Select a Service Professional in your hub', 400);
+      sendError(res, 'BAD_REQUEST', 'Select a Working Professional in your hub', 400);
       return;
     }
 

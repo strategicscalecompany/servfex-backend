@@ -822,8 +822,12 @@ export async function assignExpertManually(input: ManualAssignInput) {
         400
       );
     }
-    if (!employee.isAvailable || employee.user.status !== 'ACTIVE' || employee.user.deletedAt) {
-      throw new DispatchError('EXPERT_UNAVAILABLE', `${employee.user.name} is currently unavailable`, 409);
+    if (!employee.isAvailable || !employee.acceptingRequests || employee.user.status !== 'ACTIVE' || employee.user.deletedAt) {
+      throw new DispatchError(
+        'EXPERT_OFFLINE',
+        `${employee.user.name} is offline and cannot be assigned any order. Ask them to turn Online first.`,
+        409
+      );
     }
 
     const note = (input.note || '').trim();
@@ -1157,17 +1161,47 @@ export async function advanceTravelStatus(userId: string, bookingId: string, tar
       tx, bookingId, booking.status, target, userId, 'EMPLOYEE',
       target === 'ON_THE_WAY' ? `${expert.user.name} is on the way` : `${expert.user.name} has arrived`
     );
-    await tx.notification.create({
-      data: {
-        title: target === 'ON_THE_WAY' ? `Expert is on the way #${booking.bookingNumber}` : `Expert has arrived #${booking.bookingNumber}`,
-        message:
-          target === 'ON_THE_WAY'
-            ? `${expert.user.name} is heading to your location.`
-            : 'Your service professional has arrived. Please be available to start your service.',
-        target: 'SPECIFIC_USER',
-        targetUserId: booking.customer.userId,
-      },
-    });
+    const isDeskBooking =
+      booking.bookingSource === 'SALES_MANAGER' || booking.bookingSource === 'PHONE_HUB';
+
+    if (!isDeskBooking) {
+      await tx.notification.create({
+        data: {
+          title: target === 'ON_THE_WAY' ? `Expert is on the way #${booking.bookingNumber}` : `Expert has arrived #${booking.bookingNumber}`,
+          message:
+            target === 'ON_THE_WAY'
+              ? `${expert.user.name} is heading to your location.`
+              : 'Your service professional has arrived. Please be available to start your service.',
+          target: 'SPECIFIC_USER',
+          targetUserId: booking.customer.userId,
+        },
+      });
+    }
+
+    // Desk bookings: notify the Sales Manager / Hub Operation Manager who created or assigned the job.
+    if (isDeskBooking && target === 'ARRIVED') {
+      const creatorHistory = await tx.bookingStatusHistory.findFirst({
+        where: { bookingId },
+        orderBy: { createdAt: 'asc' },
+        select: { changedBy: true },
+      });
+      const notifyIds = new Set<string>();
+      if (creatorHistory?.changedBy && creatorHistory.changedBy !== 'SYSTEM') {
+        notifyIds.add(creatorHistory.changedBy);
+      }
+      if (booking.vendor?.userId) notifyIds.add(booking.vendor.userId);
+      for (const targetUserId of notifyIds) {
+        await tx.notification.create({
+          data: {
+            title: `Working Professional reached #${booking.bookingNumber}`,
+            message: `${expert.user.name} has reached the customer location. Call the customer to receive them and begin the service.`,
+            target: 'SPECIFIC_USER',
+            targetUserId,
+          },
+        });
+      }
+    }
+
     return { changed: true };
   }, TX_OPTIONS);
 
