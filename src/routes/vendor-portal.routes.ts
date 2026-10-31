@@ -91,7 +91,7 @@ router.post('/auth/register', validate(registerVendorSchema), registerVendor);
 // Protected Vendor Endpoints (Roles: VENDOR, EMPLOYEE)
 // -------------------------------------------------------------
 router.use(authenticate);
-router.use(requireRole('VENDOR', 'EMPLOYEE', 'OPERATIONS_MANAGER'));
+router.use(requireRole('VENDOR', 'EMPLOYEE', 'OPERATIONS_MANAGER', 'BUSINESS_DEVELOPMENT'));
 
 // Profile
 router.get('/profile', getVendorProfile);
