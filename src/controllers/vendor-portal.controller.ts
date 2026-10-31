@@ -916,7 +916,13 @@ export const getDeskContext = async (req: Request, res: Response): Promise<void>
     }
 
     const hubs = assignedHubsForActor(actor);
-    let technicians: Array<{ id: string; name: string; phone: string; vendorId: string }> = [];
+    let technicians: Array<{
+      id: string;
+      name: string;
+      phone: string;
+      vendorId: string;
+      ongoingOrderCount: number;
+    }> = [];
 
     if ((actor.isSalesManager || actor.isManager || actor.isVendor) && actor.vendorId) {
       const technicianHubIds = actor.isManager ? hubs.map((h) => h.id) : [actor.vendorId];
@@ -929,11 +935,49 @@ export const getDeskContext = async (req: Request, res: Response): Promise<void>
         include: { user: { select: { name: true, phone: true } } },
         orderBy: { createdAt: 'desc' },
       });
+
+      const ongoingStatuses = [
+        'ACCEPTED',
+        'ASSIGNED',
+        'ON_THE_WAY',
+        'ARRIVED',
+        'IN_PROGRESS',
+        'AWAITING_CUSTOMER_CONFIRMATION',
+        'AWAITING_PAYMENT',
+      ] as const;
+      const employeeIds = employees.map((emp) => emp.id);
+      const ongoingCounts = new Map<string, number>();
+      if (employeeIds.length > 0) {
+        const ongoingBookings = await prisma.booking.findMany({
+          where: {
+            status: { in: [...ongoingStatuses] },
+            OR: [{ employeeId: { in: employeeIds } }, { helperEmployeeId: { in: employeeIds } }],
+          },
+          select: { employeeId: true, helperEmployeeId: true },
+        });
+        for (const booking of ongoingBookings) {
+          if (booking.employeeId && employeeIds.includes(booking.employeeId)) {
+            ongoingCounts.set(booking.employeeId, (ongoingCounts.get(booking.employeeId) || 0) + 1);
+          }
+          if (
+            booking.helperEmployeeId &&
+            employeeIds.includes(booking.helperEmployeeId) &&
+            booking.helperEmployeeId !== booking.employeeId
+          ) {
+            ongoingCounts.set(
+              booking.helperEmployeeId,
+              (ongoingCounts.get(booking.helperEmployeeId) || 0) + 1
+            );
+          }
+        }
+      }
+
       technicians = employees.map((emp) => ({
         id: emp.id,
         name: emp.user.name,
         phone: emp.phone || emp.user.phone || '',
         vendorId: emp.vendorId,
+        ongoingOrderCount: ongoingCounts.get(emp.id) || 0,
       }));
     }
 
