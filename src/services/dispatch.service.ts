@@ -362,8 +362,8 @@ async function notifyOffer(tx: Tx, p: OfferParams): Promise<void> {
   });
   await tx.notification.create({
     data: {
-      title: `Your service professional has been assigned`,
-      message: `${employee.userName} has been assigned to your ${booking.service.name} booking. They will reach your location at the estimated arrival time.`,
+      title: `Working Professional assigned #${booking.bookingNumber}`,
+      message: `${employee.userName} has been assigned to your ${booking.service.name} booking. You can now see their details in the app.`,
       target: 'SPECIFIC_USER',
       targetUserId: booking.customer.userId,
     },

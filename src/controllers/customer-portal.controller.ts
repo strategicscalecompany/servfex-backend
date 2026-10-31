@@ -813,17 +813,21 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
       );
     }
 
-    // Notify customer that booking is routed directly to the service partner
+    // Customer confirmation — WP details are shared only after the Provider assigns a professional.
     prisma.notification.create({
       data: {
-        title: `Booking Confirmed #${bookingNumber}`,
-        message: matchedVendor
-          ? `Your booking for ${service.name} has been routed to ${matchedVendor.warehouseName || matchedVendor.companyName}. Finding an expert...`
-          : `Your booking for ${service.name} has been placed.`,
+        title: `Order Confirmed #${bookingNumber}`,
+        message: `Your order for ${service.name} is confirmed. You will be assigned a Working Professional soon.`,
         target: 'SPECIFIC_USER',
         targetUserId: userId,
       },
     }).catch((e) => console.error('Failed to create customer notification:', e));
+    void notifyUsers(
+      [userId],
+      `Order Confirmed #${bookingNumber}`,
+      `Your order for ${service.name} is confirmed. You will be assigned a Working Professional soon.`,
+      { bookingId: newBooking.id, type: 'booking:confirmed' }
+    );
 
     // Non-blocking informational notification to admins (for transparency / audit)
     if (admins.length > 0) {
