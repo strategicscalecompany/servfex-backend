@@ -6,7 +6,10 @@ import {
   buildPaymentQr,
   chatAllowed,
   confirmUpiCollection,
+  getHubAttendanceStatus,
   getTrackingSnapshot,
+  hubCheckIn,
+  hubCheckOut,
   pingProfessionalLocation,
   saveProfessionalUpi,
   setProfessionalAvailability,
@@ -152,6 +155,11 @@ export const getMyProfessionalProfile = async (req: Request, res: Response): Pro
         isAvailable: true,
         acceptingRequests: true,
         upiId: true,
+        workRadiusMeters: true,
+        hubCheckedInAt: true,
+        hubCheckedOutAt: true,
+        lastHubCheckInAt: true,
+        lastHubCheckOutAt: true,
         lastLatitude: true,
         lastLongitude: true,
         lastLocationAt: true,
@@ -166,6 +174,44 @@ export const getMyProfessionalProfile = async (req: Request, res: Response): Pro
     }
     sendSuccess(res, { profile });
   } catch (err: any) {
+    sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
+  }
+};
+
+export const getMyHubAttendance = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const attendance = await getHubAttendanceStatus(req.user!.userId);
+    sendSuccess(res, { attendance });
+  } catch (err: any) {
+    if (handleDispatchError(res, err)) return;
+    sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
+  }
+};
+
+export const postHubCheckIn = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const attendance = await hubCheckIn(
+      req.user!.userId,
+      Number(req.body.latitude),
+      Number(req.body.longitude)
+    );
+    sendSuccess(res, { attendance });
+  } catch (err: any) {
+    if (handleDispatchError(res, err)) return;
+    sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
+  }
+};
+
+export const postHubCheckOut = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const attendance = await hubCheckOut(
+      req.user!.userId,
+      Number(req.body.latitude),
+      Number(req.body.longitude)
+    );
+    sendSuccess(res, { attendance });
+  } catch (err: any) {
+    if (handleDispatchError(res, err)) return;
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
   }
 };

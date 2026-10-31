@@ -56,6 +56,7 @@ import {
   chatMessageSchema,
   confirmUpiPayment,
   confirmUpiSchema,
+  getMyHubAttendance,
   getMyProfessionalProfile,
   getOrderMessages,
   getOrderTracking,
@@ -63,6 +64,8 @@ import {
   listEscalations,
   locationPingSchema,
   pingOrderLocation,
+  postHubCheckIn,
+  postHubCheckOut,
   postOrderMessage,
   resolveEscalationSchema,
   resolveEscalationTicket,
@@ -131,6 +134,9 @@ router.post('/orders/:id/messages', validate(chatMessageSchema), postOrderMessag
 router.get('/orders/:id/payment-qr', getPaymentQr);
 router.post('/orders/:id/confirm-upi', validate(confirmUpiSchema), confirmUpiPayment);
 router.get('/me/professional', getMyProfessionalProfile);
+router.get('/me/hub-attendance', getMyHubAttendance);
+router.post('/me/hub-check-in', validate(locationPingSchema), postHubCheckIn);
+router.post('/me/hub-check-out', validate(locationPingSchema), postHubCheckOut);
 router.patch('/me/availability', validate(availabilitySchema), updateMyAvailability);
 router.patch('/me/upi', validate(upiSchema), updateMyUpi);
 router.get('/escalations', listEscalations);

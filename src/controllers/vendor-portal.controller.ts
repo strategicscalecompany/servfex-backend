@@ -247,7 +247,23 @@ const ORDER_LIST_INCLUDE = {
       user: { select: { name: true, phone: true } },
     },
   },
-  vendor: { select: { id: true, userId: true, companyName: true } },
+  vendor: {
+    select: {
+      id: true,
+      userId: true,
+      companyName: true,
+      warehousePhone: true,
+      latitude: true,
+      longitude: true,
+      serviceRadiusKm: true,
+      user: { select: { phone: true, name: true } },
+      managers: {
+        where: { kind: 'OPERATIONS' },
+        take: 3,
+        select: { user: { select: { phone: true, name: true } } },
+      },
+    },
+  },
 } as const;
 
 const SAFE_USER_SELECT = { id: true, name: true, phone: true, email: true, profilePhotoUrl: true } as const;
@@ -1030,9 +1046,21 @@ export const searchDeskServices = async (req: Request, res: Response): Promise<v
   }
 };
 
+function resolveHubManagerPhone(order: any): string {
+  const managers = order?.vendor?.managers || [];
+  for (const mgr of managers) {
+    const phone = String(mgr?.user?.phone || '').trim();
+    if (phone) return phone;
+  }
+  const warehousePhone = String(order?.vendor?.warehousePhone || '').trim();
+  if (warehousePhone) return warehousePhone;
+  return String(order?.vendor?.user?.phone || '').trim();
+}
+
 function sanitizeOrderForViewer(order: any, viewer: { isVendor: boolean; employeeId?: string; isManager?: boolean }) {
   if (!order) return order;
   const withoutOtp = stripStartOtp(order);
+  const hubManagerPhone = resolveHubManagerPhone(order);
   const isAssigned =
     !!viewer.employeeId &&
     (order.employeeId === viewer.employeeId || order.helperEmployeeId === viewer.employeeId);
@@ -1059,7 +1087,7 @@ function sanitizeOrderForViewer(order: any, viewer: { isVendor: boolean; employe
     : order.customer;
 
   if (exactAllowed) {
-    return stripStartOtp({ ...withoutOtp, customer: sanitizedCustomer });
+    return stripStartOtp({ ...withoutOtp, customer: sanitizedCustomer, hubManagerPhone });
   }
 
   const sanitizedAddress = order.address
@@ -1079,6 +1107,7 @@ function sanitizeOrderForViewer(order: any, viewer: { isVendor: boolean; employe
     customer: sanitizedCustomer,
     serviceLatitude: approximateCoordinate(order.serviceLatitude),
     serviceLongitude: approximateCoordinate(order.serviceLongitude),
+    hubManagerPhone,
   });
 }
 
@@ -2423,8 +2452,11 @@ export const createHubBooking = async (req: Request, res: Response): Promise<voi
       return;
     }
 
+    // Desk bookings (Sales Manager / Hub OM) go to the hub Provider first.
+    // The Provider assigns a Working Professional and sets the expert payout.
+    // Optional employeeId is still honored when an online WP is passed explicitly.
     let technicianToAssign: { id: string; userId: string } | null = null;
-    if ((isSalesManager || isManager) && employeeId) {
+    if (employeeId) {
       const technician = await prisma.employeeProfile.findFirst({
         where: {
           vendorId: targetVendorId,
@@ -2453,9 +2485,6 @@ export const createHubBooking = async (req: Request, res: Response): Promise<voi
         return;
       }
       technicianToAssign = { id: technician.id, userId: technician.userId };
-    } else if (isSalesManager && !employeeId) {
-      sendError(res, 'BAD_REQUEST', 'Select a Working Professional in your hub', 400);
-      return;
     }
 
     const resolvedCity = cityFromAddress(addressLine1, city);

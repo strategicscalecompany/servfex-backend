@@ -282,6 +282,12 @@ model EmployeeProfile {
   phone          String
   isAvailable    Boolean         @default(true)
   acceptingRequests Boolean      @default(true)
+  /// Geofence for hub check-in / check-out (meters). Hub coverage itself stays on VendorProfile.serviceRadiusKm.
+  workRadiusMeters Float         @default(200)
+  hubCheckedInAt DateTime?
+  hubCheckedOutAt DateTime?
+  lastHubCheckInAt DateTime?
+  lastHubCheckOutAt DateTime?
   lastAssignedAt DateTime?
   lastLatitude   Float?
   lastLongitude  Float?

@@ -8,8 +8,12 @@ import {
   START_OTP_ELIGIBLE_STATUSES,
   TRACKABLE_STATUSES,
   addSeconds,
+  haversineKm,
   isValidCoordinate,
 } from './dispatch.rules';
+
+const DEFAULT_WORK_RADIUS_METERS = 200;
+const MIN_SHIFT_HOURS = 8;
 import { generateStartOtp, isValidStartOtp, normalizeStartOtp } from '../utils/start-otp';
 import { buildUpiPaymentUri, formatRupeeAmount, isValidUpiId, isValidUtr, normalizeUpiId, normalizeUtr } from '../utils/upi';
 import { getDrivingDirections } from './directions.service';
@@ -473,12 +477,183 @@ export async function confirmUpiCollection(userId: string, bookingId: string, ut
 export async function setProfessionalAvailability(userId: string, isAvailable: boolean, acceptingRequests?: boolean) {
   const profile = await prisma.employeeProfile.findUnique({ where: { userId } });
   if (!profile) throw new DispatchError('FORBIDDEN', 'Only service professionals can update availability', 403);
+  const goingOnline = isAvailable || acceptingRequests === true;
+  if (goingOnline && !profile.hubCheckedInAt) {
+    throw new DispatchError(
+      'HUB_CHECKIN_REQUIRED',
+      'Check in at your hub location first. Your app stays locked until you are inside the hub work radius.',
+      409
+    );
+  }
   return prisma.employeeProfile.update({
     where: { id: profile.id },
     data: {
       isAvailable,
       acceptingRequests: acceptingRequests ?? isAvailable,
     },
-    select: { id: true, isAvailable: true, acceptingRequests: true },
+    select: { id: true, isAvailable: true, acceptingRequests: true, hubCheckedInAt: true },
   });
+}
+
+function metersBetween(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  return haversineKm(lat1, lon1, lat2, lon2) * 1000;
+}
+
+export async function getHubAttendanceStatus(userId: string) {
+  const profile = await prisma.employeeProfile.findUnique({
+    where: { userId },
+    select: {
+      id: true,
+      workRadiusMeters: true,
+      hubCheckedInAt: true,
+      hubCheckedOutAt: true,
+      lastHubCheckInAt: true,
+      lastHubCheckOutAt: true,
+      isAvailable: true,
+      acceptingRequests: true,
+      vendor: {
+        select: {
+          id: true,
+          companyName: true,
+          latitude: true,
+          longitude: true,
+          serviceRadiusKm: true,
+          location: true,
+        },
+      },
+    },
+  });
+  if (!profile) throw new DispatchError('FORBIDDEN', 'Only Working Professionals can use hub attendance', 403);
+  const workRadiusMeters = profile.workRadiusMeters > 0 ? profile.workRadiusMeters : DEFAULT_WORK_RADIUS_METERS;
+  const checkedIn = Boolean(profile.hubCheckedInAt);
+  let workedHours = 0;
+  if (profile.hubCheckedInAt) {
+    workedHours = (Date.now() - new Date(profile.hubCheckedInAt).getTime()) / (1000 * 60 * 60);
+  }
+  return {
+    checkedIn,
+    canGoOnline: checkedIn,
+    workRadiusMeters,
+    hubServiceRadiusKm: profile.vendor.serviceRadiusKm ?? 15,
+    hub: {
+      id: profile.vendor.id,
+      name: profile.vendor.companyName,
+      location: profile.vendor.location,
+      latitude: profile.vendor.latitude,
+      longitude: profile.vendor.longitude,
+    },
+    hubCheckedInAt: profile.hubCheckedInAt,
+    hubCheckedOutAt: profile.hubCheckedOutAt,
+    lastHubCheckInAt: profile.lastHubCheckInAt,
+    lastHubCheckOutAt: profile.lastHubCheckOutAt,
+    workedHours: Math.round(workedHours * 10) / 10,
+    minShiftHours: MIN_SHIFT_HOURS,
+    canCheckOut: checkedIn && workedHours >= MIN_SHIFT_HOURS,
+    isAvailable: profile.isAvailable,
+    acceptingRequests: profile.acceptingRequests,
+  };
+}
+
+export async function hubCheckIn(userId: string, latitude: number, longitude: number) {
+  if (!isValidCoordinate(latitude, longitude)) {
+    throw new DispatchError('BAD_REQUEST', 'Valid GPS coordinates are required for hub check-in', 400);
+  }
+  const profile = await prisma.employeeProfile.findUnique({
+    where: { userId },
+    select: {
+      id: true,
+      workRadiusMeters: true,
+      hubCheckedInAt: true,
+      vendor: { select: { latitude: true, longitude: true, companyName: true } },
+    },
+  });
+  if (!profile) throw new DispatchError('FORBIDDEN', 'Only Working Professionals can check in', 403);
+  if (profile.hubCheckedInAt) {
+    return getHubAttendanceStatus(userId);
+  }
+  const hubLat = profile.vendor.latitude;
+  const hubLng = profile.vendor.longitude;
+  if (!isValidCoordinate(hubLat, hubLng)) {
+    throw new DispatchError('HUB_LOCATION_MISSING', 'Hub GPS is not set. Ask Super Admin / Development Manager to pin the hub.', 409);
+  }
+  const radiusM = profile.workRadiusMeters > 0 ? profile.workRadiusMeters : DEFAULT_WORK_RADIUS_METERS;
+  const distanceM = metersBetween(latitude, longitude, hubLat as number, hubLng as number);
+  if (distanceM > radiusM) {
+    throw new DispatchError(
+      'OUTSIDE_HUB_RADIUS',
+      `You must be within ${Math.round(radiusM)} m of ${profile.vendor.companyName} to check in. You are about ${Math.round(distanceM)} m away.`,
+      409
+    );
+  }
+  const now = new Date();
+  await prisma.employeeProfile.update({
+    where: { id: profile.id },
+    data: {
+      hubCheckedInAt: now,
+      hubCheckedOutAt: null,
+      lastHubCheckInAt: now,
+      lastLatitude: latitude,
+      lastLongitude: longitude,
+      lastLocationAt: now,
+      isAvailable: true,
+      acceptingRequests: true,
+    },
+  });
+  return getHubAttendanceStatus(userId);
+}
+
+export async function hubCheckOut(userId: string, latitude: number, longitude: number) {
+  if (!isValidCoordinate(latitude, longitude)) {
+    throw new DispatchError('BAD_REQUEST', 'Valid GPS coordinates are required for hub check-out', 400);
+  }
+  const profile = await prisma.employeeProfile.findUnique({
+    where: { userId },
+    select: {
+      id: true,
+      workRadiusMeters: true,
+      hubCheckedInAt: true,
+      vendor: { select: { latitude: true, longitude: true, companyName: true } },
+    },
+  });
+  if (!profile) throw new DispatchError('FORBIDDEN', 'Only Working Professionals can check out', 403);
+  if (!profile.hubCheckedInAt) {
+    throw new DispatchError('NOT_CHECKED_IN', 'You are not checked in at the hub', 409);
+  }
+  const workedHours = (Date.now() - new Date(profile.hubCheckedInAt).getTime()) / (1000 * 60 * 60);
+  if (workedHours < MIN_SHIFT_HOURS) {
+    throw new DispatchError(
+      'SHIFT_TOO_SHORT',
+      `Minimum shift is ${MIN_SHIFT_HOURS} hours. Worked so far: ${workedHours.toFixed(1)} h.`,
+      409
+    );
+  }
+  const hubLat = profile.vendor.latitude;
+  const hubLng = profile.vendor.longitude;
+  if (!isValidCoordinate(hubLat, hubLng)) {
+    throw new DispatchError('HUB_LOCATION_MISSING', 'Hub GPS is not set', 409);
+  }
+  const radiusM = profile.workRadiusMeters > 0 ? profile.workRadiusMeters : DEFAULT_WORK_RADIUS_METERS;
+  const distanceM = metersBetween(latitude, longitude, hubLat as number, hubLng as number);
+  if (distanceM > radiusM) {
+    throw new DispatchError(
+      'OUTSIDE_HUB_RADIUS',
+      `Return to within ${Math.round(radiusM)} m of ${profile.vendor.companyName} to check out. You are about ${Math.round(distanceM)} m away.`,
+      409
+    );
+  }
+  const now = new Date();
+  await prisma.employeeProfile.update({
+    where: { id: profile.id },
+    data: {
+      hubCheckedInAt: null,
+      hubCheckedOutAt: now,
+      lastHubCheckOutAt: now,
+      lastLatitude: latitude,
+      lastLongitude: longitude,
+      lastLocationAt: now,
+      isAvailable: false,
+      acceptingRequests: false,
+    },
+  });
+  return getHubAttendanceStatus(userId);
 }
