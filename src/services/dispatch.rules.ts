@@ -196,15 +196,32 @@ export interface ExpertCandidate {
   excludedForBooking: boolean;
   acceptingRequests?: boolean;
   vendorActive?: boolean;
+  /** Must be checked in at hub before any order can be assigned. */
+  hubCheckedIn?: boolean;
 }
 
 export function isExpertEligible(e: ExpertCandidate, maxActiveJobs = MAX_ACTIVE_JOBS_PER_EXPERT): boolean {
   if (!e.isAvailable) return false;
   if (e.acceptingRequests === false) return false;
+  if (e.hubCheckedIn === false) return false;
   if (!e.userActive) return false;
   if (e.vendorActive === false) return false;
   if (e.excludedForBooking) return false;
   return e.activeJobs < maxActiveJobs;
+}
+
+/** True only when the WP is online and currently hub-checked-in. */
+export function isExpertAssignableNow(e: {
+  isAvailable?: boolean | null;
+  acceptingRequests?: boolean | null;
+  hubCheckedInAt?: Date | string | null;
+  user?: { status?: string | null; deletedAt?: Date | string | null } | null;
+}): boolean {
+  if (e.isAvailable === false) return false;
+  if (e.acceptingRequests === false) return false;
+  if (!e.hubCheckedInAt) return false;
+  if (e.user && (e.user.status !== 'ACTIVE' || e.user.deletedAt)) return false;
+  return true;
 }
 
 export interface ScoredExpertCandidate extends ExpertCandidate {

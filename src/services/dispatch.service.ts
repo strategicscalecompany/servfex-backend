@@ -13,6 +13,7 @@ import {
   haversineKm,
   isValidCoordinate,
   isValidExpertTravelTransition,
+  isExpertAssignableNow,
   rankEligibleExperts,
   rankExpertsByScore,
   usesCustomerAssignmentWorkflow,
@@ -409,6 +410,7 @@ async function loadExpertCandidates(
       userId: true,
       isAvailable: true,
       acceptingRequests: true,
+      hubCheckedInAt: true,
       lastAssignedAt: true,
       completedJobs: true,
       expertKind: true,
@@ -432,6 +434,7 @@ async function loadExpertCandidates(
     userId: e.userId,
     isAvailable: e.isAvailable,
     acceptingRequests: e.acceptingRequests,
+    hubCheckedIn: Boolean(e.hubCheckedInAt),
     vendorActive: e.vendor?.isActive !== false,
     userActive: e.user.status === 'ACTIVE' && e.user.deletedAt === null,
     lastAssignedAt: e.lastAssignedAt,
@@ -462,12 +465,14 @@ async function loadNearbyScoredExperts(
           expertKind: 'SERVICE_PROFESSIONAL',
           isAvailable: true,
           acceptingRequests: true,
+          hubCheckedInAt: { not: null },
         },
         select: {
           id: true,
           userId: true,
           isAvailable: true,
           acceptingRequests: true,
+          hubCheckedInAt: true,
           lastAssignedAt: true,
           completedJobs: true,
           lastLatitude: true,
@@ -510,6 +515,7 @@ async function loadNearbyScoredExperts(
         vendorId: vendor.id,
         isAvailable: expert.isAvailable,
         acceptingRequests: expert.acceptingRequests,
+        hubCheckedIn: Boolean(expert.hubCheckedInAt),
         vendorActive: vendor.isActive,
         userActive: expert.user.status === 'ACTIVE' && expert.user.deletedAt === null,
         lastAssignedAt: expert.lastAssignedAt,
@@ -822,10 +828,12 @@ export async function assignExpertManually(input: ManualAssignInput) {
         400
       );
     }
-    if (!employee.isAvailable || !employee.acceptingRequests || employee.user.status !== 'ACTIVE' || employee.user.deletedAt) {
+    if (!isExpertAssignableNow(employee)) {
       throw new DispatchError(
         'EXPERT_OFFLINE',
-        `${employee.user.name} is offline and cannot be assigned any order. Ask them to turn Online first.`,
+        !employee.hubCheckedInAt
+          ? `${employee.user.name} has not checked in at the hub. Orders cannot be assigned until they check in.`
+          : `${employee.user.name} is offline and cannot be assigned any order. Ask them to check in and turn Online first.`,
         409
       );
     }
@@ -932,8 +940,14 @@ export async function acceptAssignment(
       if (isTestingWorkflowEnabled() && teammate.expertKind === 'SALES_MANAGER') {
         throw new DispatchError('INVALID_TEAMMATE', 'A Sales Manager cannot be tagged as a teammate', 400);
       }
-      if (!teammate.isAvailable || teammate.user.status !== 'ACTIVE' || teammate.user.deletedAt) {
-        throw new DispatchError('TEAMMATE_UNAVAILABLE', `${teammate.user.name} is currently unavailable`, 409);
+      if (!isExpertAssignableNow(teammate)) {
+        throw new DispatchError(
+          'TEAMMATE_UNAVAILABLE',
+          !teammate.hubCheckedInAt
+            ? `${teammate.user.name} has not checked in at the hub and cannot be tagged yet`
+            : `${teammate.user.name} is currently unavailable`,
+          409
+        );
       }
       await lockEmployee(tx, teammate.id);
       const clash = await countActiveJobsInSlot(tx, teammate.id, {

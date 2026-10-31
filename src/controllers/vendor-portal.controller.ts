@@ -996,6 +996,7 @@ export const getDeskContext = async (req: Request, res: Response): Promise<void>
       technicians = employees.map((emp) => {
         const isAvailable = emp.isAvailable !== false;
         const acceptingRequests = emp.acceptingRequests !== false;
+        const checkedIn = Boolean(emp.hubCheckedInAt);
         return {
           id: emp.id,
           name: emp.user.name,
@@ -1004,7 +1005,9 @@ export const getDeskContext = async (req: Request, res: Response): Promise<void>
           ongoingOrderCount: ongoingCounts.get(emp.id) || 0,
           isAvailable,
           acceptingRequests,
-          isOnline: isAvailable && acceptingRequests,
+          // Assignable only when checked in at hub AND online
+          isOnline: checkedIn && isAvailable && acceptingRequests,
+          checkedIn,
         };
       });
     }
@@ -2026,7 +2029,15 @@ export const getVendorEmployees = async (req: Request, res: Response): Promise<v
     const employees = await prisma.employeeProfile.findMany({
       where: {
         vendorId,
-        ...(isTestingWorkflowEnabled() && eligibleOnly ? { expertKind: 'SERVICE_PROFESSIONAL' } : {}),
+        ...(isTestingWorkflowEnabled() && eligibleOnly
+          ? {
+              expertKind: 'SERVICE_PROFESSIONAL',
+              // Only hub-checked-in, online Working Professionals can be assigned orders
+              hubCheckedInAt: { not: null },
+              isAvailable: true,
+              acceptingRequests: true,
+            }
+          : {}),
       },
       include: {
         user: {
@@ -2037,7 +2048,17 @@ export const getVendorEmployees = async (req: Request, res: Response): Promise<v
       orderBy: { createdAt: 'desc' },
     });
 
-    sendSuccess(res, { employees }, 200);
+    sendSuccess(
+      res,
+      {
+        employees: employees.map((emp) => ({
+          ...emp,
+          checkedIn: Boolean(emp.hubCheckedInAt),
+          assignable: Boolean(emp.hubCheckedInAt) && emp.isAvailable !== false && emp.acceptingRequests !== false,
+        })),
+      },
+      200
+    );
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
   }
@@ -2468,6 +2489,7 @@ export const createHubBooking = async (req: Request, res: Response): Promise<voi
           userId: true,
           isAvailable: true,
           acceptingRequests: true,
+          hubCheckedInAt: true,
           user: { select: { name: true } },
         },
       });
@@ -2475,11 +2497,20 @@ export const createHubBooking = async (req: Request, res: Response): Promise<voi
         sendError(res, 'FORBIDDEN', 'You can only assign this order to a Working Professional in your hub', 403);
         return;
       }
+      if (!technician.hubCheckedInAt) {
+        sendError(
+          res,
+          'EXPERT_OFFLINE',
+          `${technician.user.name} has not checked in at the hub. Orders cannot be assigned until they check in.`,
+          409
+        );
+        return;
+      }
       if (!technician.isAvailable || !technician.acceptingRequests) {
         sendError(
           res,
           'EXPERT_OFFLINE',
-          `${technician.user.name} is offline. You cannot assign any order until they turn Online.`,
+          `${technician.user.name} is offline. You cannot assign any order until they check in and turn Online.`,
           409
         );
         return;
