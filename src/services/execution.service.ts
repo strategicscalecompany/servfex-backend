@@ -179,7 +179,7 @@ export async function getTrackingSnapshot(userId: string, bookingId: string) {
   let remainingDistanceKm: number | null = null;
   let etaMinutes = booking.etaMinutes;
   let encodedPolyline: string | null = null;
-  let routeSource: 'GOOGLE_DIRECTIONS' | 'HAVERSINE' | null = null;
+  let routeSource: 'GOOGLE_DIRECTIONS' | 'OSRM' | 'HAVERSINE' | null = null;
 
   if (sharing && isValidCoordinate(customerLat, customerLng) && isValidCoordinate(proLat, proLng)) {
     const route = await getDrivingDirections(
