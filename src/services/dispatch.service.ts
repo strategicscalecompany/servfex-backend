@@ -25,7 +25,7 @@ import { isTestingWorkflowEnabled } from '../config/testing-workflow';
 import { asDecimal, toMoney } from '../utils/money';
 import { notifyUsers } from './notify.service';
 import { DispatchError } from './dispatch.errors';
-import { isValidUpiId, normalizeUpiId } from '../utils/upi';'
+import { isValidUpiId, normalizeUpiId } from '../utils/upi';
 
 export { DispatchError };
 
