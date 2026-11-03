@@ -1265,7 +1265,19 @@ export async function rejectAssignment(userId: string, bookingId: string, reason
 // Expert travel status (ON_THE_WAY / ARRIVED)
 // ---------------------------------------------------------------------------
 
-const ARRIVE_GEOFENCE_METERS = 80;
+const ARRIVE_GEOFENCE_METERS = 50;
+
+/** Precise meters for doorstep geofence (do not use rounded haversineKm). */
+function distanceMetersPrecise(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const R = 6371000;
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
 
 /** Strictly ACCEPTED -> ON_THE_WAY -> ARRIVED, only by the assigned expert. Repeats are idempotent. */
 export async function advanceTravelStatus(
@@ -1330,7 +1342,7 @@ export async function advanceTravelStatus(
           400
         );
       }
-      const distanceM = haversineKm(lat, lng, serviceLat as number, serviceLng as number) * 1000;
+      const distanceM = distanceMetersPrecise(lat, lng, serviceLat as number, serviceLng as number);
       if (distanceM > ARRIVE_GEOFENCE_METERS) {
         throw new DispatchError(
           'TOO_FAR_FROM_CUSTOMER',
