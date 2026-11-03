@@ -1029,38 +1029,42 @@ export const searchDeskServices = async (req: Request, res: Response): Promise<v
       return;
     }
 
-    // Only services admin-assigned to the actor's hub/warehouse (VendorService).
+    // Two-step filter (Mongo-safe): name match first, then require VendorService assignment.
+    const nameMatches = await prisma.service.findMany({
+      where: {
+        isActive: true,
+        deletedAt: null,
+        name: { contains: term, mode: 'insensitive' },
+      },
+      select: { id: true, name: true, startingPrice: true },
+      take: 50,
+    });
+    if (nameMatches.length === 0) {
+      sendSuccess(res, { services: [] });
+      return;
+    }
+
+    const nameMatchIds = nameMatches.map((service) => service.id);
     const assignments = await prisma.vendorService.findMany({
       where: {
         vendorId: { in: hubIds },
         isActive: true,
-        service: {
-          isActive: true,
-          deletedAt: null,
-          name: { contains: term, mode: 'insensitive' },
-        },
+        serviceId: { in: nameMatchIds },
       },
-      include: {
-        service: { select: { id: true, name: true, startingPrice: true } },
-      },
-      take: 40,
+      select: { serviceId: true },
     });
+    const assignedIds = new Set(assignments.map((row) => row.serviceId));
 
-    const seen = new Set<string>();
-    const services: Array<{ id: string; name: string; startingPrice: string | null }> = [];
-    for (const row of assignments) {
-      const service = row.service;
-      if (!service || seen.has(service.id)) continue;
-      seen.add(service.id);
-      services.push({
+    const services = nameMatches
+      .filter((service) => assignedIds.has(service.id))
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .slice(0, 20)
+      .map((service) => ({
         id: service.id,
         name: service.name,
         startingPrice: service.startingPrice,
-      });
-      if (services.length >= 20) break;
-    }
+      }));
 
-    services.sort((a, b) => a.name.localeCompare(b.name));
     sendSuccess(res, { services });
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
