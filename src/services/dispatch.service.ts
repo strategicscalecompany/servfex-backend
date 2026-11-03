@@ -25,6 +25,7 @@ import { isTestingWorkflowEnabled } from '../config/testing-workflow';
 import { asDecimal, toMoney } from '../utils/money';
 import { notifyUsers } from './notify.service';
 import { DispatchError } from './dispatch.errors';
+import { isValidUpiId, normalizeUpiId } from '../utils/upi';'
 
 export { DispatchError };
 
@@ -934,6 +935,13 @@ export async function acceptAssignment(
 
   const result = await prisma.$transaction(async (tx) => {
     const expert = await loadExpertContext(tx, userId);
+    if (!isValidUpiId(normalizeUpiId(expert.upiId))) {
+      throw new DispatchError(
+        'UPI_REQUIRED',
+        'Add your UPI ID before accepting orders so you can receive online payments',
+        400
+      );
+    }
     await lockBooking(tx, bookingId);
     const booking = await readBookingForDispatch(tx, bookingId);
     if (!booking) throw new DispatchError('NOT_FOUND', 'Order not found', 404);
