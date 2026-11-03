@@ -14,7 +14,14 @@ import {
 
 const DEFAULT_WORK_RADIUS_METERS = 200;
 const MIN_SHIFT_HOURS = 8;
-import { generateStartOtp, isValidStartOtp, normalizeStartOtp } from '../utils/start-otp';
+import {
+  generateCompletionOtp,
+  generateStartOtp,
+  isValidCompletionOtp,
+  isValidStartOtp,
+  normalizeCompletionOtp,
+  normalizeStartOtp,
+} from '../utils/start-otp';
 import { buildUpiPaymentUri, formatRupeeAmount, isValidUpiId, isValidUtr, normalizeUpiId, normalizeUtr } from '../utils/upi';
 import { getDrivingDirections } from './directions.service';
 import { emitBookingRefresh, emitToBookingRoom, emitUserEvent } from '../utils/realtime';
@@ -296,6 +303,7 @@ export async function verifyStartOtpForExpert(userId: string, bookingId: string,
     );
   }
 
+  const completionToken = generateCompletionOtp();
   const updated = await prisma.booking.update({
     where: { id: bookingId },
     data: {
@@ -304,6 +312,11 @@ export async function verifyStartOtpForExpert(userId: string, bookingId: string,
       qrChallengeToken: null,
       startOtpAttempts: 0,
       startOtpLockedUntil: null,
+      // Issue completion PIN immediately so customer can show it when work ends.
+      completionOtpToken: completionToken,
+      completionOtpExpiresAt: addSeconds(new Date(), env.START_OTP_EXPIRY_MINUTES * 60),
+      completionOtpVerifiedAt: null,
+      completionOtpAttempts: 0,
       statusHistory: {
         create: {
           oldStatus: booking.status,
@@ -319,11 +332,101 @@ export async function verifyStartOtpForExpert(userId: string, bookingId: string,
   await notifyUsers(
     [booking.customer.userId],
     `Service started #${booking.bookingNumber}`,
-    'Your service professional has verified the PIN and started the work.',
+    'Your service professional has verified the start PIN and started the work. A completion PIN is ready when the job ends.',
     { bookingId, type: 'booking:started' }
   );
   void emitBookingRefresh(bookingId, { reason: 'SERVICE_STARTED' });
   return updated;
+}
+
+export async function issueCompletionOtp(bookingId: string, forceNew = false) {
+  const booking = await prisma.booking.findUnique({ where: { id: bookingId } });
+  if (!booking) throw new DispatchError('NOT_FOUND', 'Booking not found', 404);
+  if (!booking.qrVerifiedAt) {
+    throw new DispatchError('BAD_REQUEST', 'Start PIN must be verified before a completion PIN is issued', 400);
+  }
+  if (booking.completionOtpVerifiedAt) {
+    throw new DispatchError('OTP_ALREADY_USED', 'Completion PIN has already been used', 400);
+  }
+  if (!['IN_PROGRESS', 'AWAITING_CUSTOMER_CONFIRMATION'].includes(booking.status)) {
+    throw new DispatchError('BAD_REQUEST', `Cannot issue a completion PIN while booking is ${booking.status}`, 400);
+  }
+  const existing = booking.completionOtpToken;
+  const expired = booking.completionOtpExpiresAt
+    ? booking.completionOtpExpiresAt.getTime() < Date.now()
+    : false;
+  if (!forceNew && existing && !expired) {
+    return existing;
+  }
+  const token = generateCompletionOtp();
+  await prisma.booking.update({
+    where: { id: bookingId },
+    data: {
+      completionOtpToken: token,
+      completionOtpExpiresAt: addSeconds(new Date(), env.START_OTP_EXPIRY_MINUTES * 60),
+      completionOtpAttempts: 0,
+    },
+  });
+  return token;
+}
+
+/**
+ * Professional enters the customer's completion PIN to finish a customer-app booking.
+ * Returns true when the PIN matches (caller then advances booking status).
+ */
+export async function assertCompletionOtpForExpert(
+  userId: string,
+  bookingId: string,
+  rawOtp: unknown
+): Promise<void> {
+  const otp = normalizeCompletionOtp(rawOtp);
+  const booking = await prisma.booking.findUnique({
+    where: { id: bookingId },
+    include: { employee: { select: { userId: true } } },
+  });
+  if (!booking) throw new DispatchError('NOT_FOUND', 'Order not found', 404);
+  if (booking.employee?.userId !== userId) {
+    throw new DispatchError('FORBIDDEN', 'Only the assigned professional can verify the completion PIN', 403);
+  }
+  if (booking.completionOtpVerifiedAt) {
+    return; // already verified in a prior attempt that didn't finish status flip
+  }
+  if (!isValidCompletionOtp(otp)) {
+    throw new DispatchError('INVALID_OTP', 'Enter the 4-digit completion PIN shown on the customer app', 400);
+  }
+  if (!booking.completionOtpToken) {
+    // Lazy-issue if start was verified but token missing (older bookings).
+    const issued = await issueCompletionOtp(bookingId, true);
+    if (issued !== otp) {
+      throw new DispatchError(
+        'INVALID_OTP',
+        'Completion PIN refreshed. Ask the customer to open the booking and share the new code.',
+        400
+      );
+    }
+  } else if (booking.completionOtpExpiresAt && booking.completionOtpExpiresAt.getTime() < Date.now()) {
+    throw new DispatchError('OTP_EXPIRED', 'Completion PIN expired. Ask the customer to refresh it.', 400);
+  } else if (booking.completionOtpToken !== otp) {
+    const attempts = (booking.completionOtpAttempts || 0) + 1;
+    await prisma.booking.update({
+      where: { id: bookingId },
+      data: { completionOtpAttempts: attempts },
+    });
+    throw new DispatchError(
+      'INVALID_OTP',
+      'Completion PIN does not match. Ask the customer for the 4-digit end code',
+      400
+    );
+  }
+
+  await prisma.booking.update({
+    where: { id: bookingId },
+    data: {
+      completionOtpVerifiedAt: new Date(),
+      completionOtpToken: null,
+      completionOtpAttempts: 0,
+    },
+  });
 }
 
 export async function buildPaymentQr(userId: string, bookingId: string) {

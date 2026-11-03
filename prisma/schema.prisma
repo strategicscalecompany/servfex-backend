@@ -565,6 +565,11 @@ model Booking {
   qrChallengeToken       String?
   qrChallengeExpiresAt   DateTime?
   qrVerifiedAt           DateTime?
+  // 4-digit completion PIN — issued after start OTP succeeds; professional enters it to finish.
+  completionOtpToken       String?
+  completionOtpExpiresAt   DateTime?
+  completionOtpVerifiedAt  DateTime?
+  completionOtpAttempts    Int       @default(0)
   completionRequestedAt  DateTime?
   customerConfirmedAt    DateTime?
   disputeReason          String?

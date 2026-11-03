@@ -1613,8 +1613,9 @@ export const completeOrder = async (req: Request, res: Response): Promise<void> 
   try {
     const userId = req.user!.userId;
     const id = req.params.id as string;
-    const { note, completionNotes } = req.body || {};
+    const { note, completionNotes, completionOtp, completionPin, otp } = req.body || {};
     const completionReason = note || completionNotes;
+    const completionPinRaw = completionOtp || completionPin || otp;
 
     const user = await prisma.user.findUnique({
       where: { id: userId },
@@ -1669,6 +1670,19 @@ export const completeOrder = async (req: Request, res: Response): Promise<void> 
     if (!booking.qrVerifiedAt && !deskManaged) {
       sendError(res, 'BAD_REQUEST', 'Cannot complete order without verified start OTP', 400);
       return;
+    }
+
+    // Customer-app jobs require the professional to enter the customer's completion PIN.
+    if (!deskManaged) {
+      try {
+        const { assertCompletionOtpForExpert } = await import('../services/execution.service');
+        await assertCompletionOtpForExpert(userId, id, completionPinRaw);
+      } catch (pinErr: any) {
+        const code = pinErr?.code || 'INVALID_OTP';
+        const status = pinErr?.httpStatus || 400;
+        sendError(res, code, pinErr?.message || 'Invalid completion PIN', status);
+        return;
+      }
     }
 
     if (!hasRequiredCompletionPhotos(booking.completionPhotoUrls)) {

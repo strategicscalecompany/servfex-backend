@@ -1,7 +1,7 @@
 import { Request, Response } from 'express';
 import { z } from 'zod';
 import { prisma } from '../config/prisma';
-import { generateStartOtp, customerStartOtpPayload } from '../utils/start-otp';
+import { generateStartOtp, customerStartOtpPayload, customerCompletionOtpPayload } from '../utils/start-otp';
 import { sendSuccess, sendError } from '../utils/response';
 import { emitBookingRefresh } from '../utils/realtime';
 import { Prisma, BookingStatus } from '@prisma/client';
@@ -14,7 +14,7 @@ import {
   type WarehouseCandidate,
 } from '../services/dispatch.rules';
 import { releaseDispatchOnCancel, syncDispatchTimer } from '../services/dispatch.service';
-import { issueStartOtp, setLocationSharing } from '../services/execution.service';
+import { issueCompletionOtp, issueStartOtp, setLocationSharing } from '../services/execution.service';
 import { notifyUsers } from '../services/notify.service';
 import { scheduleDispatch } from '../services/dispatch.scheduler';
 import { asDecimal, toMoney } from '../utils/money';
@@ -961,12 +961,15 @@ export const getCustomerBookingById = async (req: Request, res: Response): Promi
     }
 
     const startOtp = customerStartOtpPayload(booking);
+    const completionOtp = customerCompletionOtpPayload(booking);
     sendSuccess(res, {
       booking: {
         ...booking,
         employee: publicProfessional(booking.employee),
         startOtp,
-        qrChallengeToken: startOtp,
+        completionOtp,
+        qrChallengeToken: startOtp || completionOtp,
+        pinType: startOtp ? 'START' : completionOtp ? 'COMPLETION' : null,
       },
     }, 200);
   } catch (err: any) {
@@ -1207,7 +1210,7 @@ export const submitCustomerReview = async (req: Request, res: Response): Promise
 };
 
 // -------------------------------------------------------------
-// Rapido-style 4-digit start OTP
+// Rapido-style 4-digit PINs: start OTP before work, completion OTP after work
 // -------------------------------------------------------------
 
 export const getBookingStartOtp = async (req: Request, res: Response): Promise<void> => {
@@ -1236,12 +1239,32 @@ export const getBookingStartOtp = async (req: Request, res: Response): Promise<v
     }
 
     if (['COMPLETED', 'CANCELLED', 'DECLINED'].includes(booking.status)) {
-      sendError(res, 'BAD_REQUEST', `Cannot issue a start OTP for a ${booking.status} booking`, 400);
+      sendError(res, 'BAD_REQUEST', `Cannot issue a PIN for a ${booking.status} booking`, 400);
       return;
     }
 
+    // After start PIN is used → serve / refresh the completion PIN for end-of-job verification.
     if (booking.qrVerifiedAt) {
-      sendError(res, 'BAD_REQUEST', 'Start OTP has already been used. The expert has commenced this job.', 400);
+      if (booking.completionOtpVerifiedAt) {
+        sendError(res, 'BAD_REQUEST', 'Both start and completion PINs have already been used for this booking.', 400);
+        return;
+      }
+      if (!['IN_PROGRESS', 'AWAITING_CUSTOMER_CONFIRMATION'].includes(booking.status)) {
+        sendError(res, 'BAD_REQUEST', 'Completion PIN is only available while work is in progress.', 400);
+        return;
+      }
+      const completionToken = await issueCompletionOtp(id, refresh);
+      sendSuccess(res, {
+        bookingId: id,
+        bookingNumber: booking.bookingNumber,
+        serviceName: booking.service.name,
+        pinType: 'COMPLETION',
+        completionOtp: completionToken,
+        startOtp: null,
+        token: completionToken,
+        qrChallengeToken: completionToken,
+        otp: completionToken,
+      });
       return;
     }
 
@@ -1251,13 +1274,17 @@ export const getBookingStartOtp = async (req: Request, res: Response): Promise<v
       bookingId: id,
       bookingNumber: booking.bookingNumber,
       serviceName: booking.service.name,
+      pinType: 'START',
       startOtp: token,
+      completionOtp: null,
       token,
       qrChallengeToken: token,
       otp: token,
     });
   } catch (err: any) {
-    sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
+    const code = err?.code || 'INTERNAL_SERVER_ERROR';
+    const status = err?.httpStatus || 500;
+    sendError(res, code, err.message, status);
   }
 };
 

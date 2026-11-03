@@ -15,7 +15,13 @@ export function isValidStartOtp(value: unknown): boolean {
 
 export function stripStartOtp<T extends Record<string, any>>(order: T): T {
   if (!order) return order;
-  const { qrChallengeToken: _token, qrChallengeExpiresAt: _expires, ...rest } = order;
+  const {
+    qrChallengeToken: _token,
+    qrChallengeExpiresAt: _expires,
+    completionOtpToken: _cToken,
+    completionOtpExpiresAt: _cExpires,
+    ...rest
+  } = order;
   return rest as T;
 }
 
@@ -27,3 +33,18 @@ export function customerStartOtpPayload(booking: {
   const token = booking.qrChallengeToken || null;
   return token && /^\d{4}$/.test(token) ? token : token;
 }
+
+export function customerCompletionOtpPayload(booking: {
+  completionOtpToken?: string | null;
+  completionOtpVerifiedAt?: Date | null;
+  qrVerifiedAt?: Date | null;
+}): string | null {
+  if (!booking.qrVerifiedAt || booking.completionOtpVerifiedAt) return null;
+  const token = booking.completionOtpToken || null;
+  return token && /^\d{4}$/.test(token) ? token : null;
+}
+
+/** Alias — same 4-digit generator used for start and completion PINs. */
+export const generateCompletionOtp = generateStartOtp;
+export const normalizeCompletionOtp = normalizeStartOtp;
+export const isValidCompletionOtp = isValidStartOtp;
