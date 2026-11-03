@@ -1265,7 +1265,7 @@ export async function rejectAssignment(userId: string, bookingId: string, reason
 // Expert travel status (ON_THE_WAY / ARRIVED)
 // ---------------------------------------------------------------------------
 
-const ARRIVE_GEOFENCE_METERS = 150;
+const ARRIVE_GEOFENCE_METERS = 80;
 
 /** Strictly ACCEPTED -> ON_THE_WAY -> ARRIVED, only by the assigned expert. Repeats are idempotent. */
 export async function advanceTravelStatus(
@@ -1298,38 +1298,45 @@ export async function advanceTravelStatus(
     }
 
     // Rapido-style: ARRIVED only when professional GPS is near customer doorstep.
+    // Never skip the geofence when doorstep coords are missing — that used to unlock Arrived from anywhere.
     if (target === 'ARRIVED') {
       const serviceLat = booking.serviceLatitude ?? booking.address?.latitude ?? null;
       const serviceLng = booking.serviceLongitude ?? booking.address?.longitude ?? null;
       const lat = coords?.latitude;
       const lng = coords?.longitude;
-      if (
+      const hasDoorstep =
         typeof serviceLat === 'number' &&
         typeof serviceLng === 'number' &&
         Number.isFinite(serviceLat) &&
         Number.isFinite(serviceLng) &&
-        !(serviceLat === 0 && serviceLng === 0)
+        !(serviceLat === 0 && serviceLng === 0);
+
+      if (!hasDoorstep) {
+        throw new DispatchError(
+          'CUSTOMER_LOCATION_MISSING',
+          'This booking has no customer doorstep GPS. Ask the hub to update the service address pin before marking arrived.',
+          400
+        );
+      }
+      if (
+        typeof lat !== 'number' ||
+        typeof lng !== 'number' ||
+        !Number.isFinite(lat) ||
+        !Number.isFinite(lng)
       ) {
-        if (
-          typeof lat !== 'number' ||
-          typeof lng !== 'number' ||
-          !Number.isFinite(lat) ||
-          !Number.isFinite(lng)
-        ) {
-          throw new DispatchError(
-            'LOCATION_REQUIRED',
-            'Enable GPS and move to the customer location before marking arrived',
-            400
-          );
-        }
-        const distanceM = haversineKm(lat, lng, serviceLat, serviceLng) * 1000;
-        if (distanceM > ARRIVE_GEOFENCE_METERS) {
-          throw new DispatchError(
-            'TOO_FAR_FROM_CUSTOMER',
-            `You must be within ${ARRIVE_GEOFENCE_METERS} m of the customer to mark arrived. You are about ${Math.round(distanceM)} m away.`,
-            409
-          );
-        }
+        throw new DispatchError(
+          'LOCATION_REQUIRED',
+          'Enable GPS and move to the customer location before marking arrived',
+          400
+        );
+      }
+      const distanceM = haversineKm(lat, lng, serviceLat as number, serviceLng as number) * 1000;
+      if (distanceM > ARRIVE_GEOFENCE_METERS) {
+        throw new DispatchError(
+          'TOO_FAR_FROM_CUSTOMER',
+          `You must be within ${ARRIVE_GEOFENCE_METERS} m of the customer to mark arrived. You are about ${Math.round(distanceM)} m away.`,
+          409
+        );
       }
     }
 
