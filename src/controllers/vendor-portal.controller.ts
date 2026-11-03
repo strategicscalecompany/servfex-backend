@@ -129,6 +129,9 @@ export const updateOrderStatusSchema = z.object({
       .max(43_200, 'ETA cannot exceed 30 days')
       .optional()
   ),
+  // Live GPS used when marking ARRIVED (Rapido-style doorstep geofence).
+  latitude: z.coerce.number().min(-90).max(90).optional(),
+  longitude: z.coerce.number().min(-180).max(180).optional(),
   helperEmployeeId: z.string().uuid().optional().nullable(),
   helperPayoutAmount: z.number().min(0).optional(),
   leadPayoutAmount: z.number().min(0).optional(),
@@ -1281,7 +1284,8 @@ export const updateOrderStatus = async (req: Request, res: Response): Promise<vo
   try {
     const userId = req.user!.userId;
     const id = req.params.id as string;
-    const { status, note, etaMinutes, helperEmployeeId, helperPayoutAmount, leadPayoutAmount } = req.body;
+    const { status, note, etaMinutes, helperEmployeeId, helperPayoutAmount, leadPayoutAmount, latitude, longitude } =
+      req.body;
 
     const user = await prisma.user.findUnique({
       where: { id: userId },
@@ -1401,7 +1405,7 @@ export const updateOrderStatus = async (req: Request, res: Response): Promise<vo
         return;
       }
       if (status === 'ON_THE_WAY' || status === 'ARRIVED') {
-        await advanceTravelStatus(userId, id, status);
+        await advanceTravelStatus(userId, id, status, { latitude, longitude });
         const order = await prisma.booking.findUnique({
           where: { id },
           include: ORDER_LIST_INCLUDE,

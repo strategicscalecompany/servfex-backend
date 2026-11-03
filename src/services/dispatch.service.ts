@@ -288,7 +288,7 @@ const BOOKING_FOR_DISPATCH = {
   serviceId: true,
   serviceLatitude: true,
   serviceLongitude: true,
-  address: { select: { latitude: true, longitude: true, city: true } },
+  address: { select: { latitude: true, longitude: true, city: true, addressLine1: true } },
   service: { select: { name: true } },
   customer: { select: { userId: true } },
   vendor: { select: { userId: true, companyName: true, warehouseName: true } },
@@ -1257,8 +1257,15 @@ export async function rejectAssignment(userId: string, bookingId: string, reason
 // Expert travel status (ON_THE_WAY / ARRIVED)
 // ---------------------------------------------------------------------------
 
+const ARRIVE_GEOFENCE_METERS = 150;
+
 /** Strictly ACCEPTED -> ON_THE_WAY -> ARRIVED, only by the assigned expert. Repeats are idempotent. */
-export async function advanceTravelStatus(userId: string, bookingId: string, target: 'ON_THE_WAY' | 'ARRIVED') {
+export async function advanceTravelStatus(
+  userId: string,
+  bookingId: string,
+  target: 'ON_THE_WAY' | 'ARRIVED',
+  coords?: { latitude?: number | null; longitude?: number | null } | null
+) {
   const now = new Date();
   const effects: Effects = {
     refreshBookingId: bookingId,
@@ -1280,6 +1287,42 @@ export async function advanceTravelStatus(userId: string, bookingId: string, tar
         `Cannot move booking from ${booking.status} to ${target}`,
         409
       );
+    }
+
+    // Rapido-style: ARRIVED only when professional GPS is near customer doorstep.
+    if (target === 'ARRIVED') {
+      const serviceLat = booking.serviceLatitude ?? booking.address?.latitude ?? null;
+      const serviceLng = booking.serviceLongitude ?? booking.address?.longitude ?? null;
+      const lat = coords?.latitude;
+      const lng = coords?.longitude;
+      if (
+        typeof serviceLat === 'number' &&
+        typeof serviceLng === 'number' &&
+        Number.isFinite(serviceLat) &&
+        Number.isFinite(serviceLng) &&
+        !(serviceLat === 0 && serviceLng === 0)
+      ) {
+        if (
+          typeof lat !== 'number' ||
+          typeof lng !== 'number' ||
+          !Number.isFinite(lat) ||
+          !Number.isFinite(lng)
+        ) {
+          throw new DispatchError(
+            'LOCATION_REQUIRED',
+            'Enable GPS and move to the customer location before marking arrived',
+            400
+          );
+        }
+        const distanceM = haversineKm(lat, lng, serviceLat, serviceLng) * 1000;
+        if (distanceM > ARRIVE_GEOFENCE_METERS) {
+          throw new DispatchError(
+            'TOO_FAR_FROM_CUSTOMER',
+            `You must be within ${ARRIVE_GEOFENCE_METERS} m of the customer to mark arrived. You are about ${Math.round(distanceM)} m away.`,
+            409
+          );
+        }
+      }
     }
 
     await tx.booking.update({
