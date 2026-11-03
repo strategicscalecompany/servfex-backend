@@ -717,8 +717,10 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
     const bookingNumber = `SFX-${Date.now().toString().slice(-6)}-${Math.floor(100 + Math.random() * 900)}`;
     const now = new Date();
     const inRadius = Boolean(matchedVendor);
+    // In-radius: hub Provider assigns manually — no 60s auto-assign to a professional.
+    // Out-of-radius: keep immediate nearest-expert search.
     const assignmentStrategy = inRadius ? 'VENDOR_WINDOW' : 'NEAREST_EXPERT';
-    const dispatchDueAt = inRadius ? addSeconds(now, env.PROVIDER_RESPONSE_WINDOW_SECONDS) : now;
+    const dispatchDueAt = inRadius ? null : now;
     const servicePoint = isValidCoordinate(address.latitude, address.longitude)
       ? { lat: address.latitude as number, lng: address.longitude as number }
       : null;
@@ -740,7 +742,7 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
             dispatchAttempts: 0,
             assignmentStrategy,
             outOfRadiusDispatch: !inRadius,
-            providerDeadlineAt: inRadius ? dispatchDueAt : null,
+            providerDeadlineAt: null,
             serviceLatitude: servicePoint?.lat ?? null,
             serviceLongitude: servicePoint?.lng ?? null,
             serviceFormattedAddress: [address.addressLine1, address.landmark, address.city].filter(Boolean).join(', '),
@@ -797,18 +799,18 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
       return booking;
     }, { maxWait: 8000, timeout: 15000 });
 
-    // Arm precise in-process timer for 60-second provider response window
+    // Only arm auto-dispatch for out-of-radius nearest-expert search.
     if (newBooking.dispatchDueAt) {
       scheduleDispatch(newBooking.id, newBooking.dispatchDueAt);
       void syncDispatchTimer(newBooking.id);
     }
 
-    // Directly notify the assigned provider to dispatch an expert
+    // Hub Provider assigns a Working Professional manually (no timed auto-assign).
     if (matchedVendor?.user) {
       void notifyUsers(
         [matchedVendor.user.id],
-        `New booking assigned #${bookingNumber}`,
-        `New booking for ${service.name}. Respond within ${Math.round(env.PROVIDER_RESPONSE_WINDOW_SECONDS / 60)} minutes.`,
+        `New booking #${bookingNumber}`,
+        `New booking for ${service.name}. Assign a checked-in Working Professional.`,
         { bookingId: newBooking.id, type: 'booking:new' }
       );
     }

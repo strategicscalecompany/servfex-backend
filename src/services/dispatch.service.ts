@@ -707,14 +707,16 @@ export async function processBookingDispatch(
     }
     if (
       booking.assignmentStrategy === 'DIRECT_EXPERT' ||
+      booking.assignmentStrategy === 'VENDOR_WINDOW' ||
       usesDirectExpertAssignment(booking.bookingSource) ||
       !usesCustomerAssignmentWorkflow(booking.bookingSource)
     ) {
+      // Hub Provider assigns manually — never auto-assign after a timed window.
       await tx.booking.updateMany({
         where: { id: bookingId },
-        data: { dispatchDueAt: null },
+        data: { dispatchDueAt: null, providerDeadlineAt: null },
       });
-      logger.info({ bookingId, source: booking.bookingSource }, 'Auto-dispatch skipped for manager/direct assignment booking');
+      logger.info({ bookingId, source: booking.bookingSource, strategy: booking.assignmentStrategy }, 'Auto-dispatch skipped for hub/manual assignment booking');
       result = 'SKIPPED_DIRECT_ASSIGNMENT';
       return;
     }
