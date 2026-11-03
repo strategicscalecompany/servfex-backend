@@ -899,7 +899,7 @@ export async function acceptAssignment(
   const effects: Effects = { refreshBookingId: bookingId, reason: 'EXPERT_ACCEPTED' };
   const confirmedEta =
     typeof etaMinutes === 'number' && Number.isFinite(etaMinutes)
-      ? Math.max(1, Math.min(Math.round(etaMinutes), 240))
+      ? Math.max(1, Math.min(Math.round(etaMinutes), 43_200)) // max 30 days
       : null;
 
   const result = await prisma.$transaction(async (tx) => {

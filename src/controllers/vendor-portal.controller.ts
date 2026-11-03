@@ -119,7 +119,8 @@ export const updateOrderStatusSchema = z.object({
     'DECLINED',
   ]),
   note: z.string().optional(),
-  etaMinutes: z.number().int().min(1).max(240).optional(),
+  // Up to 30 days when professional schedules multi-day arrival.
+  etaMinutes: z.number().int().min(1).max(43_200).optional(),
   helperEmployeeId: z.string().uuid().optional().nullable(),
   helperPayoutAmount: z.number().min(0).optional(),
   leadPayoutAmount: z.number().min(0).optional(),
