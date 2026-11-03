@@ -119,8 +119,16 @@ export const updateOrderStatusSchema = z.object({
     'DECLINED',
   ]),
   note: z.string().optional(),
-  // Up to 30 days when professional schedules multi-day arrival.
-  etaMinutes: z.number().int().min(1).max(43_200).optional(),
+  // Up to 30 days when professional schedules multi-day arrival (minutes / hours / calendar date).
+  etaMinutes: z.preprocess(
+    (val) => (val === '' || val === null || val === undefined ? undefined : val),
+    z.coerce
+      .number({ invalid_type_error: 'ETA must be a number of minutes' })
+      .int()
+      .min(1, 'ETA must be at least 1 minute')
+      .max(43_200, 'ETA cannot exceed 30 days')
+      .optional()
+  ),
   helperEmployeeId: z.string().uuid().optional().nullable(),
   helperPayoutAmount: z.number().min(0).optional(),
   leadPayoutAmount: z.number().min(0).optional(),
