@@ -169,6 +169,33 @@ interface Effects {
   reason?: string;
   offerToUserId?: string | null;
   extraUserIds?: Array<string | null | undefined>;
+  /** Post-commit in-app + FCM pushes (never fire if the transaction rolled back). */
+  pushNotices?: Array<{
+    userIds: Array<string | null | undefined>;
+    title: string;
+    message: string;
+    data?: Record<string, string>;
+  }>;
+}
+
+/** Human-readable arrival promise for customer notifications (minutes → hours/date). */
+export function formatEtaForCustomer(minutes: number): string {
+  const eta = Math.max(1, Math.round(minutes));
+  if (eta < 60) {
+    return `in about ${eta} minute${eta === 1 ? '' : 's'}`;
+  }
+  if (eta < 24 * 60) {
+    const hours = Math.max(1, Math.round(eta / 60));
+    return `in about ${hours} hour${hours === 1 ? '' : 's'}`;
+  }
+  const arrival = new Date(Date.now() + eta * 60_000);
+  const when = arrival.toLocaleDateString('en-IN', {
+    weekday: 'short',
+    day: 'numeric',
+    month: 'short',
+    year: arrival.getFullYear() !== new Date().getFullYear() ? 'numeric' : undefined,
+  });
+  return `on ${when}`;
 }
 
 /**
@@ -192,6 +219,9 @@ export async function syncDispatchTimer(bookingId: string): Promise<void> {
 }
 
 async function runEffects(effects: Effects): Promise<void> {
+  for (const notice of effects.pushNotices ?? []) {
+    void notifyUsers(notice.userIds, notice.title, notice.message, notice.data);
+  }
   if (!effects.refreshBookingId) return;
   await syncDispatchTimer(effects.refreshBookingId);
   if (effects.offerToUserId) {
@@ -908,16 +938,55 @@ export async function acceptAssignment(
     const booking = await readBookingForDispatch(tx, bookingId);
     if (!booking) throw new DispatchError('NOT_FOUND', 'Order not found', 404);
 
-    if (booking.employeeId !== expert.id) {
+    if (booking.status === 'ACCEPTED' && booking.employeeId === expert.id) {
+      return { alreadyAccepted: true as const, customerUserId: null as string | null, eta: null as number | null, serviceName: '', expertName: '', bookingNumber: '', teammateName: null as string | null };
+    }
+
+    // Provider-assigned offer OR unassigned customer/hub job the professional can claim + accept.
+    const isAssignedOffer = booking.status === 'ASSIGNED' && booking.employeeId === expert.id;
+    const isUnassignedHubClaim =
+      booking.status === 'PENDING' &&
+      !booking.employeeId &&
+      Boolean(booking.vendorId) &&
+      booking.vendorId === expert.vendorId;
+
+    if (!isAssignedOffer && !isUnassignedHubClaim) {
+      if (booking.employeeId && booking.employeeId !== expert.id) {
+        throw new DispatchError(
+          'NOT_ASSIGNED_TO_YOU',
+          'This booking is not assigned to you (it may have been reassigned or taken).',
+          409
+        );
+      }
       throw new DispatchError(
-        'NOT_ASSIGNED_TO_YOU',
-        'This booking is not assigned to you (it may have been reassigned or taken).',
+        'BOOKING_NOT_ACCEPTABLE',
+        `Booking is ${booking.status} and cannot be accepted`,
         409
       );
     }
-    if (booking.status === 'ACCEPTED') return { alreadyAccepted: true };
-    if (booking.status !== 'ASSIGNED') {
-      throw new DispatchError('BOOKING_NOT_ACCEPTABLE', `Booking is ${booking.status} and cannot be accepted`, 409);
+
+    if (isUnassignedHubClaim) {
+      const expertRow = await tx.employeeProfile.findUnique({
+        where: { id: expert.id },
+        include: { user: { select: { name: true, status: true, deletedAt: true } } },
+      });
+      if (!expertRow || !isExpertAssignableNow(expertRow)) {
+        throw new DispatchError(
+          'EXPERT_OFFLINE',
+          !expertRow?.hubCheckedInAt
+            ? 'Check in at the hub before accepting customer orders'
+            : 'Go Online before accepting customer orders',
+          409
+        );
+      }
+      const clash = await countActiveJobsInSlot(tx, expert.id, {
+        scheduledDate: booking.scheduledDate,
+        scheduledTimeSlot: booking.scheduledTimeSlot,
+        excludeBookingId: booking.id,
+      });
+      if (clash >= MAX_ACTIVE_JOBS_PER_EXPERT) {
+        throw new DispatchError('EXPERT_BUSY', 'You already have a job in this time slot', 409);
+      }
     }
 
     let helperTag: {
@@ -972,10 +1041,16 @@ export async function acceptAssignment(
     }
 
     const flipped = await tx.booking.updateMany({
-      where: { id: bookingId, status: 'ASSIGNED', employeeId: expert.id },
+      where: isAssignedOffer
+        ? { id: bookingId, status: 'ASSIGNED', employeeId: expert.id }
+        : { id: bookingId, status: 'PENDING', employeeId: null, vendorId: expert.vendorId },
       data: {
         status: 'ACCEPTED',
+        employeeId: expert.id,
         acceptedAt: now,
+        ...(isUnassignedHubClaim
+          ? { assignedAt: now, assignmentMethod: 'PROVIDER' as const }
+          : {}),
         dispatchDueAt: null,
         dispatchAttempts: 0,
         locationSharingEnabled: true,
@@ -993,63 +1068,101 @@ export async function acceptAssignment(
     if (flipped.count !== 1) {
       throw new DispatchError('ASSIGNMENT_CONFLICT', 'Assignment changed while accepting. Please refresh.', 409);
     }
-    await tx.bookingAssignment.updateMany({
-      where: { bookingId, employeeId: expert.id, status: 'OFFERED' },
-      data: { status: 'ACCEPTED', respondedAt: now },
-    });
+
+    if (isUnassignedHubClaim) {
+      await tx.bookingAssignment.create({
+        data: {
+          bookingId,
+          employeeId: expert.id,
+          method: 'PROVIDER',
+          status: 'ACCEPTED',
+          assignedBy: userId,
+          reason: 'Professional self-accepted customer hub order',
+          offeredAt: now,
+          respondedAt: now,
+        },
+      });
+      await tx.employeeProfile.update({ where: { id: expert.id }, data: { lastAssignedAt: now } });
+    } else {
+      await tx.bookingAssignment.updateMany({
+        where: { bookingId, employeeId: expert.id, status: 'OFFERED' },
+        data: { status: 'ACCEPTED', respondedAt: now },
+      });
+    }
+
     const teammateHistory = helperTag
       ? ` with teammate ${helperTag.helperName} (split ₹${helperTag.leadPayoutAmount} / ₹${helperTag.helperPayoutAmount})`
       : '';
     await recordHistory(
       tx,
       bookingId,
-      'ASSIGNED',
+      booking.status,
       'ACCEPTED',
       userId,
       'EMPLOYEE',
       `Order accepted by ${expert.user.name}${teammateHistory}`
     );
 
-    const etaText = confirmedEta
-      ? ` They will reach your location in about ${confirmedEta} minutes.`
-      : ' They will reach your location at the estimated arrival time.';
-    const teammateCustomerText = helperTag ? ` They are bringing teammate ${helperTag.helperName}.` : '';
-    await tx.notification.create({
-      data: {
-        title: 'Your service professional has been assigned',
-        message: `${expert.user.name} accepted your ${booking.service.name} booking.${etaText}${teammateCustomerText}`,
-        target: 'SPECIFIC_USER',
-        targetUserId: booking.customer.userId,
-      },
-    });
-    if (booking.vendor?.userId) {
-      const vendorTeammateText = helperTag
-        ? ` Teammate ${helperTag.helperName} is tagged. Split: lead ₹${helperTag.leadPayoutAmount} / teammate ₹${helperTag.helperPayoutAmount}.`
-        : '';
-      await tx.notification.create({
-        data: {
-          title: `Job Accepted #${booking.bookingNumber}`,
-          message: `Expert ${expert.user.name} has accepted order #${booking.bookingNumber} (${booking.service.name}).${vendorTeammateText}`,
-          target: 'SPECIFIC_USER',
-          targetUserId: booking.vendor.userId,
-        },
-      });
-    }
     if (helperTag) {
-      await tx.notification.create({
-        data: {
-          title: `Tagged as teammate #${booking.bookingNumber}`,
-          message: `${expert.user.name} tagged you on ${booking.service.name}. Your agreed share is ₹${helperTag.helperPayoutAmount}. Job control stays with ${expert.user.name}.`,
-          target: 'SPECIFIC_USER',
-          targetUserId: helperTag.helperUserId,
-        },
-      });
       effects.extraUserIds = [helperTag.helperUserId];
     }
-    return { alreadyAccepted: false };
+
+    return {
+      alreadyAccepted: false as const,
+      customerUserId: booking.customer.userId,
+      vendorUserId: booking.vendor?.userId ?? null,
+      eta: confirmedEta,
+      serviceName: booking.service.name,
+      expertName: expert.user.name,
+      bookingNumber: booking.bookingNumber,
+      teammateName: helperTag?.helperName ?? null,
+      helperUserId: helperTag?.helperUserId ?? null,
+      helperPayout: helperTag?.helperPayoutAmount ?? null,
+      leadPayout: helperTag?.leadPayoutAmount ?? null,
+    };
   }, TX_OPTIONS);
 
-  if (result.alreadyAccepted) effects.refreshBookingId = undefined;
+  if (result.alreadyAccepted) {
+    effects.refreshBookingId = undefined;
+  } else {
+    const etaPhrase = result.eta
+      ? ` They will arrive ${formatEtaForCustomer(result.eta)}.`
+      : ' They will share live arrival updates in the app.';
+    const teammateCustomerText = result.teammateName
+      ? ` They are bringing teammate ${result.teammateName}.`
+      : '';
+    effects.pushNotices = [
+      {
+        userIds: [result.customerUserId],
+        title: 'Professional accepted your booking',
+        message: `${result.expertName} accepted your ${result.serviceName} booking.${etaPhrase}${teammateCustomerText}`,
+        data: {
+          bookingId,
+          type: 'booking:accepted',
+          ...(result.eta ? { etaMinutes: String(result.eta) } : {}),
+        },
+      },
+    ];
+    if (result.vendorUserId) {
+      const vendorTeammateText = result.teammateName
+        ? ` Teammate ${result.teammateName} is tagged. Split: lead ₹${result.leadPayout} / teammate ₹${result.helperPayout}.`
+        : '';
+      effects.pushNotices.push({
+        userIds: [result.vendorUserId],
+        title: `Job Accepted #${result.bookingNumber}`,
+        message: `Expert ${result.expertName} has accepted order #${result.bookingNumber} (${result.serviceName}).${vendorTeammateText}`,
+        data: { bookingId, type: 'booking:accepted' },
+      });
+    }
+    if (result.helperUserId && result.teammateName) {
+      effects.pushNotices.push({
+        userIds: [result.helperUserId],
+        title: `Tagged as teammate #${result.bookingNumber}`,
+        message: `${result.expertName} tagged you on ${result.serviceName}. Your agreed share is ₹${result.helperPayout}. Job control stays with ${result.expertName}.`,
+        data: { bookingId, type: 'booking:teammate' },
+      });
+    }
+  }
   void runEffects(effects);
   cancelDispatchTimer(bookingId);
   return result;
