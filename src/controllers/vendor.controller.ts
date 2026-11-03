@@ -315,11 +315,22 @@ export const getVendorById = async (req: Request, res: Response, next: NextFunct
         },
         vendorServices: {
           include: {
-            service: { select: { id: true, name: true, startingPrice: true } },
+            service: {
+              select: {
+                id: true,
+                name: true,
+                startingPrice: true,
+                priceUnit: true,
+                isActive: true,
+                deletedAt: true,
+                category: { select: { id: true, name: true } },
+              },
+            },
           },
+          orderBy: { createdAt: 'desc' },
         },
         _count: {
-          select: { bookings: true, reviews: true },
+          select: { bookings: true, reviews: true, vendorServices: true },
         },
       },
     });
@@ -329,7 +340,13 @@ export const getVendorById = async (req: Request, res: Response, next: NextFunct
       return;
     }
 
-    sendSuccess(res, vendor);
+    // Drop orphan links whose catalog service was hard-removed; keep disabled ones
+    // so Super Admin can still see/reactivate them in Partner Onboarding.
+    const vendorServices = (vendor.vendorServices || []).filter(
+      (vs) => vs.service && !vs.service.deletedAt
+    );
+
+    sendSuccess(res, { ...vendor, vendorServices });
   } catch (error) {
     next(error);
   }

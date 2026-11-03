@@ -608,7 +608,14 @@ export const getVendorServices = async (req: Request, res: Response): Promise<vo
     }
 
     const services = await prisma.vendorService.findMany({
-      where: { vendorId },
+      where: {
+        vendorId,
+        isActive: true,
+        service: {
+          isActive: true,
+          deletedAt: null,
+        },
+      },
       include: {
         service: {
           include: { category: true, packages: true },
