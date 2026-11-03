@@ -9,6 +9,7 @@ import { getFirebaseAuth } from '../config/firebase';
 import { estimatePayloadBytes, MAX_DOCUMENT_BYTES, resolveHostedUrl } from '../utils/cloudinary';
 import { sendProviderWelcomeEmail } from '../services/email.service';
 import { toMoney } from '../utils/money';
+import { invalidateCatalogCache } from './catalog.controller';
 
 const MAX_ONBOARDING_DOCUMENTS = 30;
 
@@ -1175,6 +1176,7 @@ export const assignVendorService = async (req: Request, res: Response, next: Nex
       userAgent: req.headers['user-agent'],
     });
 
+    invalidateCatalogCache();
     sendSuccess(res, vendorService, 201);
   } catch (error) {
     next(error);
@@ -1202,6 +1204,7 @@ export const removeVendorService = async (req: Request, res: Response, next: Nex
       userAgent: req.headers['user-agent'],
     });
 
+    invalidateCatalogCache();
     sendSuccess(res, { message: 'Service removed from vendor successfully' });
   } catch (error) {
     next(error);

@@ -3,6 +3,7 @@ import { Request, Response } from 'express';
 import { Prisma } from '@prisma/client';
 import { prisma } from '../config/prisma';
 import { sendSuccess, sendError } from '../utils/response';
+import { haversineKm, isValidCoordinate } from '../services/dispatch.rules';
 
 interface CacheEntry<T> {
   data: T;
@@ -15,6 +16,68 @@ const CACHE_TTL_MS = 2 * 60 * 1000; // 2 minutes in-memory cache
 
 export const invalidateCatalogCache = (): void => {
   catalogMemoryCache.clear();
+};
+
+const parseCoord = (raw: unknown): number | null => {
+  if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
+  if (typeof raw === 'string' && raw.trim().length > 0) {
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+};
+
+/**
+ * Service IDs that at least one active partner offers.
+ * When customer lat/lng are provided, only partners whose hub covers that point
+ * (within VendorProfile.serviceRadiusKm) contribute their assigned services.
+ */
+const resolveReachableServiceIds = async (
+  latitude: number | null,
+  longitude: number | null
+): Promise<Set<string>> => {
+  const assignments = await prisma.vendorService.findMany({
+    where: {
+      isActive: true,
+      vendor: { isActive: true },
+    },
+    select: {
+      serviceId: true,
+      vendor: {
+        select: {
+          latitude: true,
+          longitude: true,
+          serviceRadiusKm: true,
+        },
+      },
+    },
+  });
+
+  const hasCustomerPoint = isValidCoordinate(latitude, longitude);
+  const ids = new Set<string>();
+
+  for (const row of assignments) {
+    if (!hasCustomerPoint) {
+      // No GPS yet: still hide pure catalog orphans — only assigned services.
+      ids.add(row.serviceId);
+      continue;
+    }
+
+    const vLat = row.vendor.latitude;
+    const vLng = row.vendor.longitude;
+    if (!isValidCoordinate(vLat, vLng)) continue;
+
+    const radiusKm =
+      typeof row.vendor.serviceRadiusKm === 'number' && row.vendor.serviceRadiusKm > 0
+        ? row.vendor.serviceRadiusKm
+        : 15;
+    const distanceKm = haversineKm(latitude as number, longitude as number, vLat as number, vLng as number);
+    if (distanceKm <= radiusKm) {
+      ids.add(row.serviceId);
+    }
+  }
+
+  return ids;
 };
 
 const CATALOG_SERVICE_INCLUDE = {
@@ -76,18 +139,36 @@ const attachHomeSectionServices = async (
 };
 
 /**
- * List all active service categories.
+ * List active service categories that have at least one partner-assigned service
+ * reachable from the customer's location (radius filter when lat/lng provided).
  * Public - no authentication required.
  */
-export const getCatalogCategories = async (_req: Request, res: Response): Promise<void> => {
+export const getCatalogCategories = async (req: Request, res: Response): Promise<void> => {
   try {
-    const cacheKey = 'categories:all';
+    const latitude = parseCoord(req.query.latitude ?? req.query.lat);
+    const longitude = parseCoord(req.query.longitude ?? req.query.lng);
+    const locKey =
+      isValidCoordinate(latitude, longitude)
+        ? `${(latitude as number).toFixed(3)}:${(longitude as number).toFixed(3)}`
+        : 'noloc';
+    const cacheKey = `categories:assigned:${locKey}`;
     const cached = catalogMemoryCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) {
       res.setHeader('Cache-Control', 'private, max-age=60, stale-while-revalidate=120');
       sendSuccess(res, cached.data, 200);
       return;
     }
+
+    const reachableServiceIds = await resolveReachableServiceIds(latitude, longitude);
+    if (reachableServiceIds.size === 0) {
+      const empty = { categories: [] as any[] };
+      catalogMemoryCache.set(cacheKey, { data: empty, expiresAt: Date.now() + CACHE_TTL_MS });
+      res.setHeader('Cache-Control', 'private, max-age=60, stale-while-revalidate=120');
+      sendSuccess(res, empty, 200);
+      return;
+    }
+
+    const reachableList = [...reachableServiceIds];
 
     const categories = await prisma.serviceCategory.findMany({
       where: {
@@ -96,6 +177,13 @@ export const getCatalogCategories = async (_req: Request, res: Response): Promis
           { deletedAt: null },
           { deletedAt: { isSet: false } },
         ],
+        services: {
+          some: {
+            id: { in: reachableList },
+            isActive: true,
+            deletedAt: null,
+          },
+        },
       },
       orderBy: {
         displayOrder: 'asc',
@@ -107,6 +195,7 @@ export const getCatalogCategories = async (_req: Request, res: Response): Promis
           include: {
             services: {
               where: {
+                id: { in: reachableList },
                 isActive: true,
                 OR: [
                   { deletedAt: null },
@@ -132,16 +221,37 @@ export const getCatalogCategories = async (_req: Request, res: Response): Promis
           },
         },
         _count: {
-          select: { services: true },
+          select: {
+            services: {
+              where: {
+                id: { in: reachableList },
+                isActive: true,
+                deletedAt: null,
+              },
+            },
+          },
         },
       },
     });
 
-    const sanitizedCategories = categories.map((cat) => ({
-      ...cat,
-      icon: cat.icon && cat.icon.startsWith('data:') && cat.icon.length > 2000 ? (cat.iconUrl || '') : cat.icon,
-      iconUrl: cat.iconUrl && cat.iconUrl.startsWith('data:') && cat.iconUrl.length > 2000 ? null : cat.iconUrl,
-    }));
+    const sanitizedCategories = categories
+      .map((cat) => {
+        const subCategories = (cat.subCategories || [])
+          .map((sub) => ({ ...sub, services: sub.services || [] }))
+          .filter((sub) => sub.services.length > 0);
+        const serviceCount =
+          typeof cat._count?.services === 'number'
+            ? cat._count.services
+            : subCategories.reduce((sum, sub) => sum + sub.services.length, 0);
+        return {
+          ...cat,
+          subCategories,
+          _count: { ...(cat._count || {}), services: serviceCount },
+          icon: cat.icon && cat.icon.startsWith('data:') && cat.icon.length > 2000 ? (cat.iconUrl || '') : cat.icon,
+          iconUrl: cat.iconUrl && cat.iconUrl.startsWith('data:') && cat.iconUrl.length > 2000 ? null : cat.iconUrl,
+        };
+      })
+      .filter((cat) => (cat._count?.services || 0) > 0 || cat.subCategories.some((s) => s.services.length > 0));
 
     const resultData = { categories: sanitizedCategories };
     catalogMemoryCache.set(cacheKey, { data: resultData, expiresAt: Date.now() + CACHE_TTL_MS });
@@ -165,11 +275,17 @@ export const getCatalogServices = async (req: Request, res: Response): Promise<v
     const search = typeof req.query.search === 'string' ? req.query.search : undefined;
     const isPopular = req.query.isPopular === 'true';
     const requestedIds = parseRequestedIds(req.query.ids);
+    const latitude = parseCoord(req.query.latitude ?? req.query.lat);
+    const longitude = parseCoord(req.query.longitude ?? req.query.lng);
     const page = parseInt(String(req.query.page || '1'), 10) || 1;
     const limit = Math.min(Math.max(parseInt(String(req.query.limit || '100'), 10) || 100, 1), 100);
     const skip = (page - 1) * limit;
 
-    const cacheKey = `services:${categoryId || ''}:${subCategoryId || ''}:${categorySlug || ''}:${search || ''}:${isPopular}:${requestedIds.join(',')}:${page}:${limit}`;
+    const locKey =
+      isValidCoordinate(latitude, longitude)
+        ? `${(latitude as number).toFixed(3)}:${(longitude as number).toFixed(3)}`
+        : 'noloc';
+    const cacheKey = `services:assigned:${locKey}:${categoryId || ''}:${subCategoryId || ''}:${categorySlug || ''}:${search || ''}:${isPopular}:${requestedIds.join(',')}:${page}:${limit}`;
     const cached = catalogMemoryCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) {
       res.setHeader('Cache-Control', 'private, max-age=60, stale-while-revalidate=120');
@@ -177,9 +293,24 @@ export const getCatalogServices = async (req: Request, res: Response): Promise<v
       return;
     }
 
+    const reachableServiceIds = await resolveReachableServiceIds(latitude, longitude);
+    if (reachableServiceIds.size === 0) {
+      const empty = { services: [] as any[] };
+      const meta = { total: 0, page, limit, totalPages: 0 };
+      catalogMemoryCache.set(cacheKey, { data: empty, meta, expiresAt: Date.now() + CACHE_TTL_MS });
+      res.setHeader('Cache-Control', 'private, max-age=60, stale-while-revalidate=120');
+      sendSuccess(res, empty, 200, meta);
+      return;
+    }
+
+    const reachableList = [...reachableServiceIds];
+    const filteredRequestedIds =
+      requestedIds.length > 0 ? requestedIds.filter((id) => reachableServiceIds.has(id)) : [];
+
     const where: any = {
       isActive: true,
       deletedAt: null,
+      id: { in: filteredRequestedIds.length > 0 ? filteredRequestedIds : reachableList },
     };
 
     if (categoryId) {
@@ -196,10 +327,6 @@ export const getCatalogServices = async (req: Request, res: Response): Promise<v
       where.isPopular = true;
     }
 
-    if (requestedIds.length > 0) {
-      where.id = { in: requestedIds };
-    }
-
     if (search && search.trim().length > 0) {
       const term = search.trim();
       where.OR = [
@@ -211,8 +338,8 @@ export const getCatalogServices = async (req: Request, res: Response): Promise<v
     const [services, total] = await Promise.all([
       prisma.service.findMany({
         where,
-        take: requestedIds.length > 0 ? Math.min(Math.max(requestedIds.length, 1), 100) : limit,
-        skip: requestedIds.length > 0 ? 0 : skip,
+        take: filteredRequestedIds.length > 0 ? Math.min(Math.max(filteredRequestedIds.length, 1), 100) : limit,
+        skip: filteredRequestedIds.length > 0 ? 0 : skip,
         orderBy: [{ isPopular: 'desc' }, { rating: 'desc' }],
         include: CATALOG_SERVICE_INCLUDE,
       }),
@@ -221,8 +348,8 @@ export const getCatalogServices = async (req: Request, res: Response): Promise<v
 
     const servicesById = new Map(services.map((s) => [s.id, s]));
     const sanitizedServices =
-      requestedIds.length > 0
-        ? requestedIds
+      filteredRequestedIds.length > 0
+        ? filteredRequestedIds
             .map((id) => servicesById.get(id))
             .filter((s): s is NonNullable<typeof s> => s != null)
             .map(sanitizeCatalogService)
@@ -315,6 +442,13 @@ export const getCatalogServiceById = async (req: Request, res: Response): Promis
 export const getPopularServices = async (req: Request, res: Response): Promise<void> => {
   try {
     const requestedLimit = Math.min(Math.max(parseInt(String(req.query.limit || '10'), 10) || 10, 1), 50);
+    const latitude = parseCoord(req.query.latitude ?? req.query.lat);
+    const longitude = parseCoord(req.query.longitude ?? req.query.lng);
+    const locKey =
+      isValidCoordinate(latitude, longitude)
+        ? `${(latitude as number).toFixed(3)}:${(longitude as number).toFixed(3)}`
+        : 'noloc';
+    const reachableServiceIds = await resolveReachableServiceIds(latitude, longitude);
 
     const layoutConfig = await prisma.appConfiguration.findUnique({
       where: { key: 'HOME_LAYOUT' },
@@ -323,18 +457,28 @@ export const getPopularServices = async (req: Request, res: Response): Promise<v
     const firstEnabled = Array.isArray(layoutValue.serviceSections)
       ? layoutValue.serviceSections.find((section: any) => section.enabled !== false)
       : null;
-    const selectedIds: string[] = Array.isArray(firstEnabled?.serviceIds)
-      ? firstEnabled.serviceIds.filter((id: unknown) => typeof id === 'string' && id.length > 0)
-      : Array.isArray(layoutValue.popularServiceIds)
-        ? layoutValue.popularServiceIds.filter((id: unknown) => typeof id === 'string' && id.length > 0)
-        : [];
+    const selectedIds: string[] = (
+      Array.isArray(firstEnabled?.serviceIds)
+        ? firstEnabled.serviceIds.filter((id: unknown) => typeof id === 'string' && id.length > 0)
+        : Array.isArray(layoutValue.popularServiceIds)
+          ? layoutValue.popularServiceIds.filter((id: unknown) => typeof id === 'string' && id.length > 0)
+          : []
+    ).filter((id: string) => reachableServiceIds.has(id));
     const limit = selectedIds.length > 0 ? Math.min(Math.max(selectedIds.length, 1), 50) : requestedLimit;
 
-    const cacheKey = `services:popular:${limit}:${selectedIds.join(',')}`;
+    const cacheKey = `services:popular:assigned:${locKey}:${limit}:${selectedIds.join(',')}`;
     const cached = catalogMemoryCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) {
       res.setHeader('Cache-Control', 'private, max-age=60, stale-while-revalidate=120');
       sendSuccess(res, cached.data, 200);
+      return;
+    }
+
+    if (reachableServiceIds.size === 0) {
+      const empty = { services: [] as any[] };
+      catalogMemoryCache.set(cacheKey, { data: empty, expiresAt: Date.now() + CACHE_TTL_MS });
+      res.setHeader('Cache-Control', 'private, max-age=60, stale-while-revalidate=120');
+      sendSuccess(res, empty, 200);
       return;
     }
 
@@ -369,6 +513,7 @@ export const getPopularServices = async (req: Request, res: Response): Promise<v
     } else {
       services = await prisma.service.findMany({
         where: {
+          id: { in: [...reachableServiceIds] },
           isActive: true,
           isPopular: true,
           deletedAt: null,
@@ -454,19 +599,29 @@ export const getCatalogServiceReviews = async (req: Request, res: Response): Pro
  * Get Customer App Home Screen Layout (slides, section visibility, search hints)
  * Public - no authentication required.
  */
-export const getCatalogHomeLayout = async (_req: Request, res: Response): Promise<void> => {
+export const getCatalogHomeLayout = async (req: Request, res: Response): Promise<void> => {
   try {
     // Send explicit zero-delay headers so mobile clients and proxies NEVER serve stale cache
     res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
 
+    const latitude = parseCoord(req.query.latitude ?? req.query.lat);
+    const longitude = parseCoord(req.query.longitude ?? req.query.lng);
+    const reachableServiceIds = await resolveReachableServiceIds(latitude, longitude);
+
     const config = await prisma.appConfiguration.findUnique({
       where: { key: 'HOME_LAYOUT' },
     });
 
     const data = normalizeHomeLayoutValue(config?.value);
-    const serviceSections = await attachHomeSectionServices(data.serviceSections || []);
+    const rawSections = (data.serviceSections || []).map((section: any) => ({
+      ...section,
+      serviceIds: Array.isArray(section.serviceIds)
+        ? section.serviceIds.filter((id: string) => reachableServiceIds.has(id))
+        : [],
+    }));
+    const serviceSections = await attachHomeSectionServices(rawSections);
     const updatedAt = config?.updatedAt ? config.updatedAt.getTime() : Date.now();
     const payload = { ...data, serviceSections, updatedAt };
 
