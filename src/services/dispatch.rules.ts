@@ -346,12 +346,22 @@ export function canSeeExactLocation(viewer: LocationViewerRole, status: BookingS
 // Call authorization
 // ---------------------------------------------------------------------------
 
-export type CallParticipantRole = 'CUSTOMER' | 'EXPERT';
+export type CallParticipantRole = 'CUSTOMER' | 'EXPERT' | 'DESK_MANAGER';
+
+/** Desk / field-created bookings — professional in-app calls go to Sales Manager (not the customer). */
+export const DESK_CALL_SOURCES: string[] = ['SALES_MANAGER', 'PHONE_HUB', 'EXPERT_TEAM'];
+
+export function isDeskCallBookingSource(source: string | null | undefined): boolean {
+  return !!source && DESK_CALL_SOURCES.includes(source);
+}
 
 export interface CallAccessInput {
   status: BookingStatus;
   customerUserId: string | null | undefined;
   expertUserId: string | null | undefined;
+  /** Sales Manager / desk assigner userId for desk-created bookings. */
+  deskManagerUserId?: string | null | undefined;
+  isDeskManaged?: boolean;
   userId: string;
 }
 
@@ -360,11 +370,44 @@ export type CallAccessDecision =
   | { allowed: false; code: 'FORBIDDEN' | 'CALL_NOT_AVAILABLE'; message: string; httpStatus: number };
 
 /**
- * Only the booking-owning customer and the CURRENTLY assigned expert may call each other, and only
- * while the booking is in an eligible state. Providers, other experts and super admins are refused.
+ * Customer-app bookings: customer ↔ assigned expert.
+ * Desk bookings (Sales Manager / Provider / Hub OM created): expert ↔ Sales Manager only.
  */
 export function evaluateCallAccess(input: CallAccessInput): CallAccessDecision {
-  const { status, customerUserId, expertUserId, userId } = input;
+  const { status, customerUserId, expertUserId, deskManagerUserId, isDeskManaged, userId } = input;
+
+  if (!CALLABLE_STATUSES.includes(status)) {
+    return {
+      allowed: false,
+      code: 'CALL_NOT_AVAILABLE',
+      message: `Calling is not available while the booking is ${status}`,
+      httpStatus: 409,
+    };
+  }
+
+  if (isDeskManaged) {
+    if (!expertUserId || !deskManagerUserId) {
+      return {
+        allowed: false,
+        code: 'CALL_NOT_AVAILABLE',
+        message: 'Sales Manager is not available for in-app calling on this desk booking yet',
+        httpStatus: 409,
+      };
+    }
+    const isExpert = expertUserId === userId;
+    const isDeskManager = deskManagerUserId === userId;
+    if (!isExpert && !isDeskManager) {
+      return {
+        allowed: false,
+        code: 'FORBIDDEN',
+        message: 'Only the assigned professional and the Sales Manager can call each other on this desk booking',
+        httpStatus: 403,
+      };
+    }
+    return isExpert
+      ? { allowed: true, participantRole: 'EXPERT', peerUserId: deskManagerUserId }
+      : { allowed: true, participantRole: 'DESK_MANAGER', peerUserId: expertUserId };
+  }
 
   const isCustomer = !!customerUserId && customerUserId === userId;
   const isExpert = !!expertUserId && expertUserId === userId;
@@ -387,15 +430,6 @@ export function evaluateCallAccess(input: CallAccessInput): CallAccessDecision {
     };
   }
 
-  if (!CALLABLE_STATUSES.includes(status)) {
-    return {
-      allowed: false,
-      code: 'CALL_NOT_AVAILABLE',
-      message: `Calling is not available while the booking is ${status}`,
-      httpStatus: 409,
-    };
-  }
-
   return isCustomer
     ? { allowed: true, participantRole: 'CUSTOMER', peerUserId: expertUserId }
     : { allowed: true, participantRole: 'EXPERT', peerUserId: customerUserId };
@@ -403,7 +437,9 @@ export function evaluateCallAccess(input: CallAccessInput): CallAccessDecision {
 
 /** Fixed per-role Agora UIDs: a channel has exactly two participants, so no hashing / collisions. */
 export function agoraUidForRole(role: CallParticipantRole): number {
-  return role === 'CUSTOMER' ? 1001 : 2002;
+  if (role === 'CUSTOMER') return 1001;
+  if (role === 'DESK_MANAGER') return 3003;
+  return 2002;
 }
 
 /** Booking-scoped channel name: <= 64 chars, ASCII alphanumerics + underscore only. */

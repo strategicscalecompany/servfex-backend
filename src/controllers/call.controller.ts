@@ -10,9 +10,157 @@ import {
   agoraUidForRole,
   channelNameForBooking,
   evaluateCallAccess,
+  isDeskCallBookingSource,
 } from '../services/dispatch.rules';
 import { notifyUsers } from '../services/notify.service';
 import { recordCallOutcome } from '../services/escalation.service';
+
+/**
+ * Desk bookings: professional in-app call always rings the Sales Manager for the hub.
+ * Preference:
+ * 1) Employee Sales Manager (expertKind=SALES_MANAGER) on this hub
+ * 2) Booking creator (desk actor who created the order)
+ * 3) ManagerProfile BUSINESS_DEVELOPMENT / OPERATIONS
+ * 4) Vendor owner
+ */
+async function resolveDeskManagerUserId(booking: {
+  id: string;
+  vendorId: string | null;
+  bookingSource: string;
+}): Promise<{ userId: string; name: string; photoUrl: string | null } | null> {
+  const vendorId = booking.vendorId;
+  if (!vendorId) return null;
+
+  // Prefer the exact desk creator when they are a Sales Manager on this booking.
+  const created = await prisma.bookingStatusHistory.findFirst({
+    where: {
+      bookingId: booking.id,
+      NOT: { changedBy: 'SYSTEM' },
+    },
+    orderBy: { createdAt: 'asc' },
+    select: { changedBy: true },
+  });
+  if (created?.changedBy) {
+    const creator = await prisma.user.findFirst({
+      where: { id: created.changedBy, deletedAt: null, status: 'ACTIVE' },
+      select: {
+        id: true,
+        name: true,
+        profilePhotoUrl: true,
+        employeeProfile: { select: { expertKind: true, vendorId: true } },
+      },
+    });
+    if (creator?.employeeProfile?.expertKind === 'SALES_MANAGER') {
+      return {
+        userId: creator.id,
+        name: creator.name || 'Sales Manager',
+        photoUrl: creator.profilePhotoUrl || null,
+      };
+    }
+  }
+
+  // Always prefer a hub Sales Manager for desk in-app calls (even if provider created the order).
+  const salesExpert = await prisma.employeeProfile.findFirst({
+    where: {
+      vendorId,
+      expertKind: 'SALES_MANAGER',
+      user: { status: 'ACTIVE', deletedAt: null },
+    },
+    orderBy: { createdAt: 'asc' },
+    select: {
+      userId: true,
+      user: { select: { name: true, profilePhotoUrl: true } },
+    },
+  });
+  if (salesExpert) {
+    return {
+      userId: salesExpert.userId,
+      name: salesExpert.user.name || 'Sales Manager',
+      photoUrl: salesExpert.user.profilePhotoUrl || null,
+    };
+  }
+
+  if (created?.changedBy) {
+    const creator = await prisma.user.findFirst({
+      where: { id: created.changedBy, deletedAt: null, status: 'ACTIVE' },
+      select: {
+        id: true,
+        name: true,
+        profilePhotoUrl: true,
+        role: true,
+      },
+    });
+    if (
+      creator &&
+      (creator.role === 'OPERATIONS_MANAGER' ||
+        creator.role === 'VENDOR' ||
+        creator.role === 'EMPLOYEE')
+    ) {
+      return {
+        userId: creator.id,
+        name: creator.name || 'Sales Manager',
+        photoUrl: creator.profilePhotoUrl || null,
+      };
+    }
+  }
+
+  const bdManager = await prisma.managerProfile.findFirst({
+    where: {
+      vendorId,
+      kind: 'BUSINESS_DEVELOPMENT',
+      user: { status: 'ACTIVE', deletedAt: null },
+    },
+    orderBy: { createdAt: 'asc' },
+    select: {
+      userId: true,
+      user: { select: { name: true, profilePhotoUrl: true } },
+    },
+  });
+  if (bdManager) {
+    return {
+      userId: bdManager.userId,
+      name: bdManager.user.name || 'Sales Manager',
+      photoUrl: bdManager.user.profilePhotoUrl || null,
+    };
+  }
+
+  const opsManager = await prisma.managerProfile.findFirst({
+    where: {
+      vendorId,
+      kind: 'OPERATIONS',
+      user: { status: 'ACTIVE', deletedAt: null },
+    },
+    orderBy: { createdAt: 'asc' },
+    select: {
+      userId: true,
+      user: { select: { name: true, profilePhotoUrl: true } },
+    },
+  });
+  if (opsManager) {
+    return {
+      userId: opsManager.userId,
+      name: opsManager.user.name || 'Hub Manager',
+      photoUrl: opsManager.user.profilePhotoUrl || null,
+    };
+  }
+
+  const vendor = await prisma.vendorProfile.findUnique({
+    where: { id: vendorId },
+    select: {
+      userId: true,
+      user: { select: { name: true, profilePhotoUrl: true, status: true, deletedAt: true } },
+    },
+  });
+  if (vendor?.user && vendor.user.status === 'ACTIVE' && !vendor.user.deletedAt) {
+    return {
+      userId: vendor.userId,
+      name: vendor.user.name || 'Provider',
+      photoUrl: vendor.user.profilePhotoUrl || null,
+    };
+  }
+
+  return null;
+}
 
 export const callTokenSchema = z.object({
   bookingId: z.string().min(1, 'Booking ID is required'),
@@ -82,11 +230,15 @@ export const generateCallToken = async (req: Request, res: Response): Promise<vo
 
     const customerUserId = booking.customer?.userId;
     const expertUserId = booking.employee?.userId;
+    const deskManaged = isDeskCallBookingSource(booking.bookingSource);
+    const deskManager = deskManaged ? await resolveDeskManagerUserId(booking) : null;
 
     const decision = evaluateCallAccess({
       status: booking.status,
       customerUserId,
       expertUserId,
+      deskManagerUserId: deskManager?.userId,
+      isDeskManaged: deskManaged,
       userId,
     });
 
@@ -99,18 +251,37 @@ export const generateCallToken = async (req: Request, res: Response): Promise<vo
     const agoraUid = agoraUidForRole(participantRole);
     const channelName = channelNameForBooking(booking.id);
 
-    const isCustomer = participantRole === 'CUSTOMER';
-    const peerName = isCustomer
-      ? booking.employee?.user?.name || 'Assigned Technician'
-      : booking.customer?.user?.name || 'Customer';
+    let peerName: string;
+    let peerRole: string;
+    let peerPhotoUrl: string | null;
+    let myName: string;
+
+    if (deskManaged) {
+      if (participantRole === 'EXPERT') {
+        peerName = deskManager?.name || 'Sales Manager';
+        peerRole = 'BUSINESS_DEVELOPMENT';
+        peerPhotoUrl = deskManager?.photoUrl || null;
+        myName = booking.employee?.user?.name || 'Assigned Expert';
+      } else {
+        peerName = booking.employee?.user?.name || 'Assigned Technician';
+        peerRole = 'EMPLOYEE';
+        peerPhotoUrl = booking.employee?.user?.profilePhotoUrl || null;
+        myName = deskManager?.name || 'Sales Manager';
+      }
+    } else {
+      const isCustomer = participantRole === 'CUSTOMER';
+      peerName = isCustomer
+        ? booking.employee?.user?.name || 'Assigned Technician'
+        : booking.customer?.user?.name || 'Customer';
+      peerRole = isCustomer ? 'EMPLOYEE' : 'CUSTOMER';
+      peerPhotoUrl = isCustomer
+        ? booking.employee?.user?.profilePhotoUrl || null
+        : booking.customer?.user?.profilePhotoUrl || null;
+      myName = isCustomer
+        ? booking.customer?.user?.name || 'Customer'
+        : booking.employee?.user?.name || 'Assigned Expert';
+    }
     const peerPhone = '';
-    const peerRole = isCustomer ? 'EMPLOYEE' : 'CUSTOMER';
-    const peerPhotoUrl = isCustomer
-      ? booking.employee?.user?.profilePhotoUrl || null
-      : booking.customer?.user?.profilePhotoUrl || null;
-    const myName = isCustomer
-      ? booking.customer?.user?.name || 'Customer'
-      : booking.employee?.user?.name || 'Assigned Expert';
 
     const tokenTtl = env.AGORA_TOKEN_TTL_SECONDS || 1800;
     const currentTimestamp = Math.floor(Date.now() / 1000);
