@@ -3,7 +3,6 @@ import { z } from 'zod';
 import { prisma } from '../config/prisma';
 import { sendSuccess, sendError } from '../utils/response';
 import { emitBookingRefresh, emitBookingEvent, emitUserEvent } from '../utils/realtime';
-import { invalidateCatalogCache } from './catalog.controller';
 import { Prisma, BookingStatus, DocumentType } from '@prisma/client';
 import { hashPassword } from '../utils/password';
 import { generateAccessToken, generateRefreshToken } from '../utils/token';
@@ -848,76 +847,42 @@ function assignedHubsForActor(actor: Awaited<ReturnType<typeof resolvePortalActo
   return Array.from(hubs.values());
 }
 
-function toServiceSlug(name: string): string {
-  const base = name
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 48) || 'service';
-  return `${base}-${Date.now().toString(36)}`;
-}
-
-async function resolveOrPublishDeskService(serviceId: string | undefined, serviceName: string | undefined, vendorId: string) {
-  const trimmedName = (serviceName || '').trim();
-  let service = serviceId
-    ? await prisma.service.findFirst({ where: { id: serviceId, isActive: true, deletedAt: null } })
-    : null;
-
-  if (!service && trimmedName) {
-    service = await prisma.service.findFirst({
+/** Resolve a service only if Super Admin already assigned it to this hub/warehouse. */
+async function resolveAssignedHubService(
+  serviceId: string | undefined,
+  serviceName: string | undefined,
+  vendorId: string
+) {
+  if (serviceId) {
+    const assigned = await prisma.vendorService.findFirst({
       where: {
+        vendorId,
+        serviceId,
+        isActive: true,
+        service: { isActive: true, deletedAt: null },
+      },
+      include: { service: true },
+    });
+    if (assigned?.service) return assigned.service;
+  }
+
+  const trimmedName = (serviceName || '').trim();
+  if (!trimmedName) return null;
+
+  const assignedByName = await prisma.vendorService.findFirst({
+    where: {
+      vendorId,
+      isActive: true,
+      service: {
         isActive: true,
         deletedAt: null,
         name: { equals: trimmedName, mode: 'insensitive' },
       },
-    });
-  }
-
-  if (!service && trimmedName) {
-    let category = await prisma.serviceCategory.findFirst({
-      where: { isActive: true, slug: 'desk-bookings' },
-    });
-    if (!category) {
-      category = await prisma.serviceCategory.findFirst({
-        where: { isActive: true, deletedAt: null },
-        orderBy: { displayOrder: 'asc' },
-      });
-    }
-    if (!category) {
-      category = await prisma.serviceCategory.create({
-        data: {
-          name: 'Desk Bookings',
-          slug: 'desk-bookings',
-          description: 'Services published from hub desk and Sales Manager orders',
-          isActive: true,
-        },
-      });
-    }
-
-    service = await prisma.service.create({
-      data: {
-        categoryId: category.id,
-        name: trimmedName,
-        slug: toServiceSlug(trimmedName),
-        description: `${trimmedName} published from a ServFex desk order`,
-        startingPrice: '0.00',
-        isActive: true,
-      },
-    });
-    invalidateCatalogCache();
-  }
-
-  if (!service) {
-    return null;
-  }
-
-  await prisma.vendorService.upsert({
-    where: { vendorId_serviceId: { vendorId, serviceId: service.id } },
-    update: { isActive: true },
-    create: { vendorId, serviceId: service.id, isActive: true },
+    },
+    include: { service: true },
   });
 
-  return service;
+  return assignedByName?.service || null;
 }
 
 function cityFromAddress(addressLine1: string, city?: string): string {
@@ -1033,23 +998,69 @@ export const getDeskContext = async (req: Request, res: Response): Promise<void>
 
 export const searchDeskServices = async (req: Request, res: Response): Promise<void> => {
   try {
+    const actor = await resolvePortalActor(req.user!.userId);
+    if (!actor.user || (!actor.isManager && !actor.isVendor && !actor.user.employeeProfile)) {
+      sendError(res, 'FORBIDDEN', 'Only a hub manager, provider, or expert can search desk services', 403);
+      return;
+    }
+
     const term = String(req.query.q || '').trim();
     if (term.length < 1) {
       sendSuccess(res, { services: [] });
       return;
     }
 
-    const services = await prisma.service.findMany({
+    const hubs = assignedHubsForActor(actor);
+    const requestedVendorId = String(req.query.vendorId || '').trim();
+    let hubIds = hubs.map((hub) => hub.id);
+
+    if (requestedVendorId) {
+      if (!hubs.some((hub) => hub.id === requestedVendorId)) {
+        sendError(res, 'FORBIDDEN', 'You can only search services for a hub you are assigned to', 403);
+        return;
+      }
+      hubIds = [requestedVendorId];
+    } else if (actor.vendorId) {
+      hubIds = [actor.vendorId];
+    }
+
+    if (hubIds.length === 0) {
+      sendSuccess(res, { services: [] });
+      return;
+    }
+
+    // Only services admin-assigned to the actor's hub/warehouse (VendorService).
+    const assignments = await prisma.vendorService.findMany({
       where: {
+        vendorId: { in: hubIds },
         isActive: true,
-        deletedAt: null,
-        name: { contains: term, mode: 'insensitive' },
+        service: {
+          isActive: true,
+          deletedAt: null,
+          name: { contains: term, mode: 'insensitive' },
+        },
       },
-      select: { id: true, name: true, startingPrice: true },
-      orderBy: { name: 'asc' },
-      take: 20,
+      include: {
+        service: { select: { id: true, name: true, startingPrice: true } },
+      },
+      take: 40,
     });
 
+    const seen = new Set<string>();
+    const services: Array<{ id: string; name: string; startingPrice: string | null }> = [];
+    for (const row of assignments) {
+      const service = row.service;
+      if (!service || seen.has(service.id)) continue;
+      seen.add(service.id);
+      services.push({
+        id: service.id,
+        name: service.name,
+        startingPrice: service.startingPrice,
+      });
+      if (services.length >= 20) break;
+    }
+
+    services.sort((a, b) => a.name.localeCompare(b.name));
     sendSuccess(res, { services });
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
@@ -2474,9 +2485,14 @@ export const createHubBooking = async (req: Request, res: Response): Promise<voi
       return;
     }
 
-    const service = await resolveOrPublishDeskService(serviceId || undefined, serviceName, targetVendorId);
+    const service = await resolveAssignedHubService(serviceId || undefined, serviceName, targetVendorId);
     if (!service) {
-      sendError(res, 'BAD_REQUEST', 'Select a matching service or type a new service name to publish', 400);
+      sendError(
+        res,
+        'SERVICE_NOT_ASSIGNED',
+        'Select a service that Super Admin has assigned to this hub/warehouse',
+        400
+      );
       return;
     }
 
