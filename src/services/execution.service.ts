@@ -626,7 +626,7 @@ export async function getHubAttendanceStatus(userId: string) {
       },
     },
   });
-  if (!profile) throw new DispatchError('FORBIDDEN', 'Only Working Professionals can use hub attendance', 403);
+  if (!profile) throw new DispatchError('FORBIDDEN', 'Only Working Professionals and Sales Managers can use hub attendance', 403);
   const workRadiusMeters = profile.workRadiusMeters > 0 ? profile.workRadiusMeters : DEFAULT_WORK_RADIUS_METERS;
   const checkedIn = Boolean(profile.hubCheckedInAt);
   let workedHours = 0;
@@ -670,7 +670,7 @@ export async function hubCheckIn(userId: string, latitude: number, longitude: nu
       vendor: { select: { latitude: true, longitude: true, companyName: true } },
     },
   });
-  if (!profile) throw new DispatchError('FORBIDDEN', 'Only Working Professionals can check in', 403);
+  if (!profile) throw new DispatchError('FORBIDDEN', 'Only Working Professionals and Sales Managers can check in', 403);
   if (profile.hubCheckedInAt) {
     return getHubAttendanceStatus(userId);
   }
@@ -718,7 +718,7 @@ export async function hubCheckOut(userId: string, latitude: number, longitude: n
       vendor: { select: { latitude: true, longitude: true, companyName: true } },
     },
   });
-  if (!profile) throw new DispatchError('FORBIDDEN', 'Only Working Professionals can check out', 403);
+  if (!profile) throw new DispatchError('FORBIDDEN', 'Only Working Professionals and Sales Managers can check out', 403);
   if (!profile.hubCheckedInAt) {
     throw new DispatchError('NOT_CHECKED_IN', 'You are not checked in at the hub', 409);
   }
