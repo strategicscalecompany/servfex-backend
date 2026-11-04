@@ -170,6 +170,23 @@ export const getCatalogCategories = async (req: Request, res: Response): Promise
 
     const reachableList = [...reachableServiceIds];
 
+    const serviceTileSelect = {
+      id: true,
+      name: true,
+      slug: true,
+      startingPrice: true,
+      priceUnit: true,
+      durationText: true,
+      rating: true,
+      reviewCount: true,
+      iconUrl: true,
+      imageUrl: true,
+      bannerImages: true,
+      iconName: true,
+      categoryId: true,
+      subCategoryId: true,
+    } as const;
+
     const categories = await prisma.serviceCategory.findMany({
       where: {
         isActive: true,
@@ -203,20 +220,7 @@ export const getCatalogCategories = async (req: Request, res: Response): Promise
                 ],
               },
               orderBy: { name: 'asc' },
-              select: {
-                id: true,
-                name: true,
-                slug: true,
-                startingPrice: true,
-                priceUnit: true,
-                durationText: true,
-                rating: true,
-                reviewCount: true,
-                iconUrl: true,
-                imageUrl: true,
-                bannerImages: true,
-                iconName: true,
-              },
+              select: serviceTileSelect,
             },
           },
         },
@@ -234,18 +238,57 @@ export const getCatalogCategories = async (req: Request, res: Response): Promise
       },
     });
 
+    // Services with no (active) subcategory never appeared as category tiles in the app —
+    // they were counted in _count but omitted from subCategories. Surface each as its own tile.
+    const nestedServiceIds = new Set(
+      categories.flatMap((cat) =>
+        (cat.subCategories || []).flatMap((sub) => (sub.services || []).map((s) => s.id))
+      )
+    );
+    const orphanServices = await prisma.service.findMany({
+      where: {
+        id: { in: reachableList.filter((id) => !nestedServiceIds.has(id)) },
+        isActive: true,
+        deletedAt: null,
+        categoryId: { in: categories.map((c) => c.id) },
+      },
+      orderBy: { name: 'asc' },
+      select: serviceTileSelect,
+    });
+    const orphansByCategory = new Map<string, typeof orphanServices>();
+    for (const svc of orphanServices) {
+      const list = orphansByCategory.get(svc.categoryId) || [];
+      list.push(svc);
+      orphansByCategory.set(svc.categoryId, list);
+    }
+
     const sanitizedCategories = categories
       .map((cat) => {
         const subCategories = (cat.subCategories || [])
           .map((sub) => ({ ...sub, services: sub.services || [] }))
           .filter((sub) => sub.services.length > 0);
+
+        const orphanTiles = (orphansByCategory.get(cat.id) || []).map((svc) => ({
+          id: `svc-tile:${svc.id}`,
+          categoryId: cat.id,
+          name: svc.name,
+          iconUrl: svc.iconUrl || svc.imageUrl || null,
+          displayOrder: 9999,
+          isActive: true,
+          createdAt: new Date(0),
+          updatedAt: new Date(0),
+          services: [svc],
+          isSyntheticServiceTile: true,
+        }));
+
+        const mergedSubs = [...subCategories, ...orphanTiles];
         const serviceCount =
           typeof cat._count?.services === 'number'
             ? cat._count.services
-            : subCategories.reduce((sum, sub) => sum + sub.services.length, 0);
+            : mergedSubs.reduce((sum, sub) => sum + (sub.services?.length || 0), 0);
         return {
           ...cat,
-          subCategories,
+          subCategories: mergedSubs,
           _count: { ...(cat._count || {}), services: serviceCount },
           icon: cat.icon && cat.icon.startsWith('data:') && cat.icon.length > 2000 ? (cat.iconUrl || '') : cat.icon,
           iconUrl: cat.iconUrl && cat.iconUrl.startsWith('data:') && cat.iconUrl.length > 2000 ? null : cat.iconUrl,
