@@ -18,6 +18,13 @@ export const invalidateCatalogCache = (): void => {
   catalogMemoryCache.clear();
 };
 
+const notDeletedClause = {
+  OR: [
+    { deletedAt: null },
+    { deletedAt: { isSet: false } },
+  ],
+};
+
 const parseCoord = (raw: unknown): number | null => {
   if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
   if (typeof raw === 'string' && raw.trim().length > 0) {
@@ -118,7 +125,7 @@ const loadCatalogServicesByIds = async (ids: string[]) => {
     where: {
       id: { in: ids },
       isActive: true,
-      deletedAt: null,
+      ...notDeletedClause,
     },
     include: CATALOG_SERVICE_INCLUDE,
   });
@@ -198,7 +205,7 @@ export const getCatalogCategories = async (req: Request, res: Response): Promise
           some: {
             id: { in: reachableList },
             isActive: true,
-            deletedAt: null,
+            ...notDeletedClause,
           },
         },
       },
@@ -230,7 +237,7 @@ export const getCatalogCategories = async (req: Request, res: Response): Promise
               where: {
                 id: { in: reachableList },
                 isActive: true,
-                deletedAt: null,
+                ...notDeletedClause,
               },
             },
           },
@@ -249,7 +256,7 @@ export const getCatalogCategories = async (req: Request, res: Response): Promise
       where: {
         id: { in: reachableList.filter((id) => !nestedServiceIds.has(id)) },
         isActive: true,
-        deletedAt: null,
+        ...notDeletedClause,
         categoryId: { in: categories.map((c) => c.id) },
       },
       orderBy: { name: 'asc' },
@@ -352,7 +359,7 @@ export const getCatalogServices = async (req: Request, res: Response): Promise<v
 
     const where: any = {
       isActive: true,
-      deletedAt: null,
+      ...notDeletedClause,
       id: { in: filteredRequestedIds.length > 0 ? filteredRequestedIds : reachableList },
     };
 
@@ -435,7 +442,7 @@ export const getCatalogServiceById = async (req: Request, res: Response): Promis
       where: {
         id,
         isActive: true,
-        deletedAt: null,
+        ...notDeletedClause,
       },
       include: {
         category: true,
@@ -542,7 +549,7 @@ export const getPopularServices = async (req: Request, res: Response): Promise<v
         where: {
           id: { in: selectedIds },
           isActive: true,
-          deletedAt: null,
+          ...notDeletedClause,
         },
         include,
       });
@@ -559,7 +566,7 @@ export const getPopularServices = async (req: Request, res: Response): Promise<v
           id: { in: [...reachableServiceIds] },
           isActive: true,
           isPopular: true,
-          deletedAt: null,
+          ...notDeletedClause,
         },
         take: limit,
         orderBy: { rating: 'desc' },
