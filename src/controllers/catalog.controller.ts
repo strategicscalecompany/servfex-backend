@@ -82,7 +82,8 @@ const resolveReachableServiceIds = async (
 
   const hasCustomerPoint = isValidCoordinate(latitude, longitude);
   if (!hasCustomerPoint) {
-    return { serviceIds: allAssigned, inServiceArea: true };
+    // No customer point yet — allow browse of assigned catalog, but do not treat as in-area booking.
+    return { serviceIds: allAssigned, inServiceArea: false };
   }
 
   const inRadiusIds = new Set<string>();
