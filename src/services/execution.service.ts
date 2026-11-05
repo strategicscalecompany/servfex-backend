@@ -14,6 +14,43 @@ import {
 
 const DEFAULT_WORK_RADIUS_METERS = 200;
 const MIN_SHIFT_HOURS = 8;
+/** Shift length after which the WP must return to the hub to check out. */
+export const SHIFT_HOURS = 8;
+/** Extra hours after shift end before the account is flagged Late Worker. */
+export const GRACE_HOURS = 2;
+
+export function computeShiftTiming(hubCheckedInAt: Date | string | null | undefined, now: Date = new Date()) {
+  if (!hubCheckedInAt) {
+    return {
+      workedHours: 0,
+      shiftEndsAt: null as Date | null,
+      graceEndsAt: null as Date | null,
+      isShiftOverdue: false,
+      isInGrace: false,
+      needsReturnToHub: false,
+      canCheckOut: false,
+    };
+  }
+  const checkInMs = new Date(hubCheckedInAt).getTime();
+  const workedHours = (now.getTime() - checkInMs) / (1000 * 60 * 60);
+  const shiftEndsAt = new Date(checkInMs + SHIFT_HOURS * 60 * 60 * 1000);
+  const graceEndsAt = new Date(checkInMs + (SHIFT_HOURS + GRACE_HOURS) * 60 * 60 * 1000);
+  const isShiftOverdue = workedHours >= SHIFT_HOURS;
+  const isInGrace = isShiftOverdue && workedHours < SHIFT_HOURS + GRACE_HOURS;
+  return {
+    workedHours: Math.round(workedHours * 10) / 10,
+    shiftEndsAt,
+    graceEndsAt,
+    isShiftOverdue,
+    isInGrace,
+    needsReturnToHub: isShiftOverdue,
+    canCheckOut: workedHours >= MIN_SHIFT_HOURS,
+  };
+}
+
+export function isLateWorkerFlagged(lateWorkerFlaggedAt: Date | string | null | undefined): boolean {
+  return Boolean(lateWorkerFlaggedAt);
+}
 import {
   generateCompletionOtp,
   generateStartOtp,
@@ -303,16 +340,88 @@ export async function verifyStartOtpForExpert(userId: string, bookingId: string,
     );
   }
 
+  // PIN verified — stay ARRIVED until at least 4 before photos are uploaded, then IN_PROGRESS.
+  const updated = await prisma.booking.update({
+    where: { id: bookingId },
+    data: {
+      qrVerifiedAt: new Date(),
+      qrChallengeToken: null,
+      startOtpAttempts: 0,
+      startOtpLockedUntil: null,
+      statusHistory: {
+        create: {
+          oldStatus: booking.status,
+          newStatus: booking.status,
+          changedBy: userId,
+          changedByRole: 'EMPLOYEE',
+          reason: 'Customer start OTP verified on site. Upload 4 before photos to begin work.',
+        },
+      },
+    },
+  });
+
+  await notifyUsers(
+    [booking.customer.userId],
+    `Professional on site #${booking.bookingNumber}`,
+    'Your service professional verified the start PIN and is capturing before photos. Work begins shortly.',
+    { bookingId, type: 'booking:pin_verified' }
+  );
+  void emitBookingRefresh(bookingId, { reason: 'START_PIN_VERIFIED' });
+  return updated;
+}
+
+/**
+ * After start PIN (or desk arrival) + ≥4 before photos, officially begin work (IN_PROGRESS)
+ * and issue the customer completion PIN.
+ */
+export async function beginWorkAfterBeforePhotos(userId: string, bookingId: string) {
+  const { hasRequiredBeforePhotos, MIN_BEFORE_PHOTOS, countValidBeforePhotos } = await import(
+    '../config/testing-workflow'
+  );
+
+  const booking = await prisma.booking.findUnique({
+    where: { id: bookingId },
+    include: { employee: { select: { userId: true } }, customer: { select: { userId: true } } },
+  });
+  if (!booking) throw new DispatchError('NOT_FOUND', 'Order not found', 404);
+  if (booking.employee?.userId !== userId) {
+    throw new DispatchError('FORBIDDEN', 'Only the assigned professional can start this job', 403);
+  }
+  if (booking.status === 'IN_PROGRESS') {
+    return booking;
+  }
+  if (booking.status !== 'ARRIVED') {
+    throw new DispatchError(
+      'INVALID_TRANSITION',
+      `Cannot begin work while booking is ${booking.status}. Mark arrived and verify the start PIN first.`,
+      409
+    );
+  }
+
+  const deskManaged =
+    booking.bookingSource === 'SALES_MANAGER' || booking.bookingSource === 'PHONE_HUB';
+  if (!booking.qrVerifiedAt && !deskManaged) {
+    throw new DispatchError(
+      'BAD_REQUEST',
+      'Verify the customer start PIN before uploading before photos and starting work',
+      400
+    );
+  }
+  if (!hasRequiredBeforePhotos(booking.beforePhotoUrls)) {
+    throw new DispatchError(
+      'PHOTOS_REQUIRED',
+      `Upload at least ${MIN_BEFORE_PHOTOS} before photographs to show site condition. Currently ${countValidBeforePhotos(booking.beforePhotoUrls)} valid photograph(s) are stored.`,
+      400
+    );
+  }
+
   const completionToken = generateCompletionOtp();
   const updated = await prisma.booking.update({
     where: { id: bookingId },
     data: {
       status: 'IN_PROGRESS',
-      qrVerifiedAt: new Date(),
+      qrVerifiedAt: booking.qrVerifiedAt || new Date(),
       qrChallengeToken: null,
-      startOtpAttempts: 0,
-      startOtpLockedUntil: null,
-      // Issue completion PIN immediately so customer can show it when work ends.
       completionOtpToken: completionToken,
       completionOtpExpiresAt: addSeconds(new Date(), env.START_OTP_EXPIRY_MINUTES * 60),
       completionOtpVerifiedAt: null,
@@ -323,7 +432,7 @@ export async function verifyStartOtpForExpert(userId: string, bookingId: string,
           newStatus: 'IN_PROGRESS',
           changedBy: userId,
           changedByRole: 'EMPLOYEE',
-          reason: 'Customer start OTP verified on site. Work officially commenced.',
+          reason: 'Before photographs uploaded. Work officially commenced.',
         },
       },
     },
@@ -332,7 +441,7 @@ export async function verifyStartOtpForExpert(userId: string, bookingId: string,
   await notifyUsers(
     [booking.customer.userId],
     `Service started #${booking.bookingNumber}`,
-    'Your service professional has verified the start PIN and started the work. A completion PIN is ready when the job ends.',
+    'Your service professional captured before photos and started the work. A completion PIN is ready when the job ends.',
     { bookingId, type: 'booking:started' }
   );
   void emitBookingRefresh(bookingId, { reason: 'SERVICE_STARTED' });
@@ -612,6 +721,8 @@ export async function getHubAttendanceStatus(userId: string) {
       hubCheckedOutAt: true,
       lastHubCheckInAt: true,
       lastHubCheckOutAt: true,
+      shiftOverdueNotifiedAt: true,
+      lateWorkerFlaggedAt: true,
       isAvailable: true,
       acceptingRequests: true,
       vendor: {
@@ -629,10 +740,8 @@ export async function getHubAttendanceStatus(userId: string) {
   if (!profile) throw new DispatchError('FORBIDDEN', 'Only Working Professionals and Sales Managers can use hub attendance', 403);
   const workRadiusMeters = profile.workRadiusMeters > 0 ? profile.workRadiusMeters : DEFAULT_WORK_RADIUS_METERS;
   const checkedIn = Boolean(profile.hubCheckedInAt);
-  let workedHours = 0;
-  if (profile.hubCheckedInAt) {
-    workedHours = (Date.now() - new Date(profile.hubCheckedInAt).getTime()) / (1000 * 60 * 60);
-  }
+  const timing = computeShiftTiming(profile.hubCheckedInAt);
+  const isLateWorker = isLateWorkerFlagged(profile.lateWorkerFlaggedAt);
   return {
     checkedIn,
     canGoOnline: checkedIn,
@@ -649,9 +758,17 @@ export async function getHubAttendanceStatus(userId: string) {
     hubCheckedOutAt: profile.hubCheckedOutAt,
     lastHubCheckInAt: profile.lastHubCheckInAt,
     lastHubCheckOutAt: profile.lastHubCheckOutAt,
-    workedHours: Math.round(workedHours * 10) / 10,
+    workedHours: timing.workedHours,
     minShiftHours: MIN_SHIFT_HOURS,
-    canCheckOut: checkedIn && workedHours >= MIN_SHIFT_HOURS,
+    shiftHours: SHIFT_HOURS,
+    graceHours: GRACE_HOURS,
+    shiftEndsAt: timing.shiftEndsAt,
+    graceEndsAt: timing.graceEndsAt,
+    isShiftOverdue: checkedIn && timing.isShiftOverdue,
+    isInGrace: checkedIn && timing.isInGrace,
+    needsReturnToHub: checkedIn && timing.needsReturnToHub,
+    isLateWorker: checkedIn && isLateWorker,
+    canCheckOut: checkedIn && timing.canCheckOut,
     isAvailable: profile.isAvailable,
     acceptingRequests: profile.acceptingRequests,
   };
@@ -695,6 +812,8 @@ export async function hubCheckIn(userId: string, latitude: number, longitude: nu
       hubCheckedInAt: now,
       hubCheckedOutAt: null,
       lastHubCheckInAt: now,
+      shiftOverdueNotifiedAt: null,
+      lateWorkerFlaggedAt: null,
       lastLatitude: latitude,
       lastLongitude: longitude,
       lastLocationAt: now,
@@ -751,6 +870,8 @@ export async function hubCheckOut(userId: string, latitude: number, longitude: n
       hubCheckedInAt: null,
       hubCheckedOutAt: now,
       lastHubCheckOutAt: now,
+      shiftOverdueNotifiedAt: null,
+      lateWorkerFlaggedAt: null,
       lastLatitude: latitude,
       lastLongitude: longitude,
       lastLocationAt: now,
@@ -759,4 +880,36 @@ export async function hubCheckOut(userId: string, latitude: number, longitude: n
     },
   });
   return getHubAttendanceStatus(userId);
+}
+
+/** Periodic GPS ping while the professional is hub-checked-in (vendor live map). */
+export async function pingHubLocation(userId: string, latitude: number, longitude: number) {
+  if (!isValidCoordinate(latitude, longitude)) {
+    throw new DispatchError('BAD_REQUEST', 'Valid GPS coordinates are required', 400);
+  }
+  const profile = await prisma.employeeProfile.findUnique({
+    where: { userId },
+    select: { id: true, hubCheckedInAt: true },
+  });
+  if (!profile) {
+    throw new DispatchError('FORBIDDEN', 'Only Working Professionals and Sales Managers can ping hub location', 403);
+  }
+  if (!profile.hubCheckedInAt) {
+    throw new DispatchError('NOT_CHECKED_IN', 'You must be checked in at the hub to share location', 409);
+  }
+  const now = new Date();
+  await prisma.employeeProfile.update({
+    where: { id: profile.id },
+    data: {
+      lastLatitude: latitude,
+      lastLongitude: longitude,
+      lastLocationAt: now,
+    },
+  });
+  return {
+    ok: true,
+    lastLatitude: latitude,
+    lastLongitude: longitude,
+    lastLocationAt: now,
+  };
 }

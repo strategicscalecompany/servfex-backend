@@ -9,9 +9,14 @@ import { env } from './env';
  * EXPERT_TESTING_WORKFLOW_ENABLED only isolates Sales Manager auto-dispatch.
  * Set it to false to restore original auto-dispatch for those bookings too.
  */
+/** Minimum site-condition photos before work may begin (after start PIN). */
+export const MIN_BEFORE_PHOTOS = 4;
+/** Minimum after-work photographs before the job may be completed. */
 export const MIN_COMPLETION_PHOTOS = 4;
 
 export const COMPLETABLE_JOB_STATUSES = ['IN_PROGRESS'] as const;
+/** Statuses where before (pre-work) photographs may be uploaded. */
+export const BEFORE_PHOTO_ELIGIBLE_STATUSES = ['ARRIVED'] as const;
 
 export function isTestingWorkflowEnabled(): boolean {
   return env.EXPERT_TESTING_WORKFLOW_ENABLED === true;
@@ -20,6 +25,7 @@ export function isTestingWorkflowEnabled(): boolean {
 export function getTestingWorkflowSnapshot() {
   return {
     enabled: isTestingWorkflowEnabled(),
+    minBeforePhotos: MIN_BEFORE_PHOTOS,
     minCompletionPhotos: MIN_COMPLETION_PHOTOS,
     isolatedConnections: isTestingWorkflowEnabled()
       ? [
@@ -63,4 +69,10 @@ export function countValidCompletionPhotos(values: unknown): number {
 
 export function hasRequiredCompletionPhotos(values: unknown, min = MIN_COMPLETION_PHOTOS): boolean {
   return countValidCompletionPhotos(values) >= min;
+}
+
+export const countValidBeforePhotos = countValidCompletionPhotos;
+
+export function hasRequiredBeforePhotos(values: unknown, min = MIN_BEFORE_PHOTOS): boolean {
+  return countValidBeforePhotos(values) >= min;
 }

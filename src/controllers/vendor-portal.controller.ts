@@ -21,18 +21,26 @@ import {
   LocationViewerRole,
 } from '../services/dispatch.rules';
 import { generateStartOtp, stripStartOtp } from '../utils/start-otp';
-import { setLocationSharing, verifyStartOtpForExpert } from '../services/execution.service';
+import {
+  beginWorkAfterBeforePhotos,
+  setLocationSharing,
+  verifyStartOtpForExpert,
+} from '../services/execution.service';
 import { isValidUpiId, normalizeUpiId } from '../utils/upi';
 import { toMoney, toMoneyOrNull } from '../utils/money';
 import { sendPushToUserIds } from '../services/push.service';
 import { env } from '../config/env';
 import { estimatePayloadBytes, MAX_DOCUMENT_BYTES, resolveHostedUrl } from '../utils/cloudinary';
 import {
+  BEFORE_PHOTO_ELIGIBLE_STATUSES,
   COMPLETABLE_JOB_STATUSES,
+  countValidBeforePhotos,
   countValidCompletionPhotos,
   getTestingWorkflowSnapshot,
+  hasRequiredBeforePhotos,
   hasRequiredCompletionPhotos,
   isTestingWorkflowEnabled,
+  MIN_BEFORE_PHOTOS,
   MIN_COMPLETION_PHOTOS,
   uniqueHostedImageUrls,
 } from '../config/testing-workflow';
@@ -179,6 +187,8 @@ export const uploadCompletionPhotosSchema = z.object({
   image: z.string().min(8).optional(),
   images: z.array(z.string().min(8)).max(12).optional(),
 });
+
+export const uploadBeforePhotosSchema = uploadCompletionPhotosSchema;
 
 export const recordCashSchema = z.object({
   amount: z.number().positive().optional(),
@@ -992,6 +1002,10 @@ export const getDeskContext = async (req: Request, res: Response): Promise<void>
           // Assignable only when checked in at hub AND online
           isOnline: checkedIn && isAvailable && acceptingRequests,
           checkedIn,
+          isLateWorker: checkedIn && Boolean(emp.lateWorkerFlaggedAt),
+          lastLatitude: emp.lastLatitude ?? null,
+          lastLongitude: emp.lastLongitude ?? null,
+          lastLocationAt: emp.lastLocationAt ?? null,
         };
       });
     }
@@ -1332,7 +1346,14 @@ export const updateOrderStatus = async (req: Request, res: Response): Promise<vo
       if (status === 'IN_PROGRESS') {
         const bookingForStart = await prisma.booking.findFirst({
           where: { id, employeeId: user.employeeProfile.id },
-          select: { id: true, status: true, bookingSource: true, bookingNumber: true },
+          select: {
+            id: true,
+            status: true,
+            bookingSource: true,
+            bookingNumber: true,
+            beforePhotoUrls: true,
+            qrVerifiedAt: true,
+          },
         });
         if (!bookingForStart) {
           sendError(res, 'NOT_FOUND', 'Order not found or unauthorized', 404);
@@ -1341,38 +1362,46 @@ export const updateOrderStatus = async (req: Request, res: Response): Promise<vo
         const deskManaged =
           bookingForStart.bookingSource === 'SALES_MANAGER' || bookingForStart.bookingSource === 'PHONE_HUB';
         if (!deskManaged) {
-          sendError(res, 'INVALID_TRANSITION', 'Use the start OTP endpoint to begin work', 400);
-          return;
-        }
-        if (!['ARRIVED', 'ON_THE_WAY', 'ACCEPTED'].includes(bookingForStart.status)) {
           sendError(
             res,
             'INVALID_TRANSITION',
-            `Cannot start work from ${bookingForStart.status}. Mark arrived first.`,
+            'Verify the start OTP, then upload 4 before photographs to begin work',
+            400
+          );
+          return;
+        }
+        if (bookingForStart.status !== 'ARRIVED') {
+          sendError(
+            res,
+            'INVALID_TRANSITION',
+            `Cannot start work from ${bookingForStart.status}. Mark arrived first, then upload 4 before photographs.`,
             409
           );
           return;
         }
-        const started = await prisma.booking.update({
+        if (!hasRequiredBeforePhotos(bookingForStart.beforePhotoUrls)) {
+          sendError(
+            res,
+            'PHOTOS_REQUIRED',
+            `Upload at least ${MIN_BEFORE_PHOTOS} before photographs showing site condition before starting work. Currently ${countValidBeforePhotos(bookingForStart.beforePhotoUrls)} valid photograph(s) are stored.`,
+            400
+          );
+          return;
+        }
+        try {
+          await beginWorkAfterBeforePhotos(userId, id);
+        } catch (err: any) {
+          if (err instanceof DispatchError) {
+            sendError(res, err.code, err.message, err.httpStatus);
+            return;
+          }
+          throw err;
+        }
+        const started = await prisma.booking.findUnique({
           where: { id },
-          data: {
-            status: 'IN_PROGRESS',
-            qrVerifiedAt: new Date(),
-            qrChallengeToken: null,
-            statusHistory: {
-              create: {
-                oldStatus: bookingForStart.status,
-                newStatus: 'IN_PROGRESS',
-                changedBy: userId,
-                changedByRole: 'EMPLOYEE',
-                reason: 'Desk-assigned job started without customer OTP (Sales Manager / Hub Operation Manager booking)',
-              },
-            },
-          },
           include: ORDER_LIST_INCLUDE,
         });
-        void emitBookingRefresh(id, { reason: 'SERVICE_STARTED' });
-        sendSuccess(res, { order: started }, 200);
+        sendSuccess(res, { order: started ? stripStartOtp(started) : started }, 200);
         return;
       }
       if (status === 'ACCEPTED') {
@@ -1512,7 +1541,18 @@ export const verifyOrderOtp = async (req: Request, res: Response): Promise<void>
       where: { id },
       include: ORDER_LIST_INCLUDE,
     });
-    sendSuccess(res, { order: updated ? stripStartOtp(updated) : updated, message: 'OTP verified successfully. Service is now IN PROGRESS.' }, 200);
+    sendSuccess(
+      res,
+      {
+        order: updated ? stripStartOtp(updated) : updated,
+        message: 'OTP verified. Upload at least 4 before photographs to start work.',
+        pinVerified: true,
+        requiresBeforePhotos: true,
+        requiredBeforePhotos: MIN_BEFORE_PHOTOS,
+        beforePhotoCount: countValidBeforePhotos(updated?.beforePhotoUrls),
+      },
+      200
+    );
   } catch (err: any) {
     if (err instanceof DispatchError) {
       sendError(res, err.code, err.message, err.httpStatus);
@@ -1524,6 +1564,127 @@ export const verifyOrderOtp = async (req: Request, res: Response): Promise<void>
 
 /** @deprecated alias — QR start verification was replaced with a 4-digit OTP. */
 export const verifyOrderQr = verifyOrderOtp;
+
+export const uploadOrderBeforePhotos = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = req.user!.userId;
+    const id = req.params.id as string;
+    const payloads: string[] = [];
+    if (typeof req.body?.image === 'string') payloads.push(req.body.image);
+    if (Array.isArray(req.body?.images)) payloads.push(...req.body.images.filter((v: unknown) => typeof v === 'string'));
+
+    if (payloads.length === 0) {
+      sendError(res, 'BAD_REQUEST', 'At least one before photograph is required', 400);
+      return;
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      include: { employeeProfile: true },
+    });
+    if (!user?.employeeProfile) {
+      sendError(res, 'FORBIDDEN', 'Only the assigned Service Professional can upload before photographs', 403);
+      return;
+    }
+    if (isTestingWorkflowEnabled() && user.employeeProfile.expertKind === 'SALES_MANAGER') {
+      sendError(res, 'FORBIDDEN', 'Sales Managers cannot upload service before photographs', 403);
+      return;
+    }
+
+    const booking = await prisma.booking.findFirst({
+      where: { id, employeeId: user.employeeProfile.id },
+    });
+    if (!booking) {
+      sendError(res, 'NOT_FOUND', 'Order not found or not assigned to you', 404);
+      return;
+    }
+    if (!(BEFORE_PHOTO_ELIGIBLE_STATUSES as readonly string[]).includes(booking.status)) {
+      sendError(
+        res,
+        'BAD_REQUEST',
+        `Cannot upload before photographs while the job is ${booking.status}. Mark arrived and verify the start PIN first.`,
+        400
+      );
+      return;
+    }
+
+    const deskManaged =
+      booking.bookingSource === 'SALES_MANAGER' || booking.bookingSource === 'PHONE_HUB';
+    if (!booking.qrVerifiedAt && !deskManaged) {
+      sendError(res, 'BAD_REQUEST', 'Verify the customer start PIN before uploading before photographs', 400);
+      return;
+    }
+
+    const hosted: string[] = [];
+    for (const payload of payloads) {
+      if (estimatePayloadBytes(payload) > MAX_DOCUMENT_BYTES) {
+        sendError(res, 'PAYLOAD_TOO_LARGE', 'Each photograph must be 500MB or smaller', 413);
+        return;
+      }
+      const url = await resolveHostedUrl(payload, 'servfex/before');
+      if (url) hosted.push(url);
+    }
+    if (hosted.length === 0) {
+      sendError(res, 'IMAGE_UPLOAD_FAILED', 'Photographs could not be hosted. Retry the upload.', 400);
+      return;
+    }
+
+    const merged = uniqueHostedImageUrls([...(booking.beforePhotoUrls || []), ...hosted]);
+    const updated = await prisma.booking.update({
+      where: { id },
+      data: { beforePhotoUrls: merged },
+      select: {
+        id: true,
+        status: true,
+        beforePhotoUrls: true,
+      },
+    });
+    await prisma.bookingPhoto.createMany({
+      data: hosted.map((url) => ({
+        bookingId: id,
+        employeeId: user.employeeProfile!.id,
+        url,
+        category: 'BEFORE' as const,
+      })),
+    });
+
+    let workStarted = false;
+    let orderStatus = updated.status;
+    if (hasRequiredBeforePhotos(updated.beforePhotoUrls) && updated.status === 'ARRIVED') {
+      try {
+        const started = await beginWorkAfterBeforePhotos(userId, id);
+        workStarted = true;
+        orderStatus = started.status;
+      } catch (err: any) {
+        if (!(err instanceof DispatchError && err.code === 'PHOTOS_REQUIRED')) {
+          throw err;
+        }
+      }
+    }
+
+    void emitBookingRefresh(id, { reason: workStarted ? 'SERVICE_STARTED' : 'BEFORE_PHOTOS_UPLOADED' });
+
+    sendSuccess(
+      res,
+      {
+        orderId: updated.id,
+        photoUrls: updated.beforePhotoUrls,
+        count: countValidBeforePhotos(updated.beforePhotoUrls),
+        required: MIN_BEFORE_PHOTOS,
+        readyToStart: hasRequiredBeforePhotos(updated.beforePhotoUrls),
+        workStarted,
+        status: orderStatus,
+      },
+      200
+    );
+  } catch (err: any) {
+    if (err instanceof DispatchError) {
+      sendError(res, err.code, err.message, err.httpStatus);
+      return;
+    }
+    sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
+  }
+};
 
 export const uploadOrderCompletionPhotos = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -1685,6 +1846,16 @@ export const completeOrder = async (req: Request, res: Response): Promise<void> 
       }
     }
 
+    if (!hasRequiredBeforePhotos(booking.beforePhotoUrls)) {
+      sendError(
+        res,
+        'BEFORE_PHOTOS_REQUIRED',
+        `This job is missing the required before photographs (${MIN_BEFORE_PHOTOS} minimum). Currently ${countValidBeforePhotos(booking.beforePhotoUrls)} valid photograph(s) are stored.`,
+        400
+      );
+      return;
+    }
+
     if (!hasRequiredCompletionPhotos(booking.completionPhotoUrls)) {
       sendError(
         res,
@@ -1716,6 +1887,12 @@ export const completeOrder = async (req: Request, res: Response): Promise<void> 
           current.bookingSource === 'SALES_MANAGER' || current.bookingSource === 'PHONE_HUB';
         if (!current.qrVerifiedAt && !currentDeskManaged) {
           throw Object.assign(new Error('Cannot complete order without verified start OTP'), { code: 'BAD_REQUEST' });
+        }
+        if (!hasRequiredBeforePhotos(current.beforePhotoUrls)) {
+          throw Object.assign(
+            new Error(`Upload at least ${MIN_BEFORE_PHOTOS} before photographs before finishing this job.`),
+            { code: 'BEFORE_PHOTOS_REQUIRED' }
+          );
         }
         if (!hasRequiredCompletionPhotos(current.completionPhotoUrls)) {
           throw Object.assign(
@@ -2104,6 +2281,10 @@ export const getVendorEmployees = async (req: Request, res: Response): Promise<v
           ...emp,
           checkedIn: Boolean(emp.hubCheckedInAt),
           assignable: Boolean(emp.hubCheckedInAt) && emp.isAvailable !== false && emp.acceptingRequests !== false,
+          isLateWorker: Boolean(emp.hubCheckedInAt) && Boolean(emp.lateWorkerFlaggedAt),
+          lastLatitude: emp.lastLatitude ?? null,
+          lastLongitude: emp.lastLongitude ?? null,
+          lastLocationAt: emp.lastLocationAt ?? null,
         })),
       },
       200

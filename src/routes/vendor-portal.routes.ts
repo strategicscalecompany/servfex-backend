@@ -21,6 +21,7 @@ import {
   getDeskContext,
   searchDeskServices,
   completeOrder,
+  uploadOrderBeforePhotos,
   uploadOrderCompletionPhotos,
   getVendorWorkflowConfig,
   recordCashCollection,
@@ -41,6 +42,7 @@ import {
   updateOrderStatusSchema,
   verifyOrderQrSchema,
   createHubBookingSchema,
+  uploadBeforePhotosSchema,
   uploadCompletionPhotosSchema,
   recordCashSchema,
   assignEmployeeOrderSchema,
@@ -66,6 +68,7 @@ import {
   pingOrderLocation,
   postHubCheckIn,
   postHubCheckOut,
+  postHubLocation,
   postOrderMessage,
   resolveEscalationSchema,
   resolveEscalationTicket,
@@ -123,6 +126,7 @@ router.post('/orders/:id/status', validate(updateOrderStatusSchema), updateOrder
 router.post('/orders/:id/verify-otp', validate(verifyOrderQrSchema), verifyOrderOtp);
 router.post('/orders/:id/verify-qr', validate(verifyOrderQrSchema), verifyOrderQr);
 router.post('/orders/:id/complete', completeOrder);
+router.post('/orders/:id/before-photos', validate(uploadBeforePhotosSchema), uploadOrderBeforePhotos);
 router.post('/orders/:id/completion-photos', validate(uploadCompletionPhotosSchema), uploadOrderCompletionPhotos);
 router.post('/orders/:id/call-token', generateCallToken);
 router.post('/orders/:id/record-cash', validate(recordCashSchema), recordCashCollection);
@@ -137,6 +141,7 @@ router.get('/me/professional', getMyProfessionalProfile);
 router.get('/me/hub-attendance', getMyHubAttendance);
 router.post('/me/hub-check-in', validate(locationPingSchema), postHubCheckIn);
 router.post('/me/hub-check-out', validate(locationPingSchema), postHubCheckOut);
+router.post('/me/hub-location', validate(locationPingSchema), postHubLocation);
 router.patch('/me/availability', validate(availabilitySchema), updateMyAvailability);
 router.patch('/me/upi', validate(upiSchema), updateMyUpi);
 router.get('/escalations', listEscalations);

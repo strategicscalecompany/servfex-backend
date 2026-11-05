@@ -288,6 +288,10 @@ model EmployeeProfile {
   hubCheckedOutAt DateTime?
   lastHubCheckInAt DateTime?
   lastHubCheckOutAt DateTime?
+  /// Set once when the 8h shift overdue notification is sent.
+  shiftOverdueNotifiedAt DateTime?
+  /// Set when the 2h grace ends without hub check-out; cleared on successful check-out.
+  lateWorkerFlaggedAt DateTime?
   lastAssignedAt DateTime?
   lastLatitude   Float?
   lastLongitude  Float?
@@ -608,8 +612,8 @@ model Booking {
   outOfRadiusDispatch    Boolean              @default(false)
   lastChatAt             DateTime?
 
-  // Hosted completion photograph URLs. Empty for historic bookings; required (min 4) only while the
-  // temporary expert testing workflow is enabled.
+  // Before photos (site condition prior to work) and completion photos (after work). Min 4 each.
+  beforePhotoUrls        String[]             @default([])
   completionPhotoUrls    String[]             @default([])
 
   createdAt          DateTime             @default(now())
