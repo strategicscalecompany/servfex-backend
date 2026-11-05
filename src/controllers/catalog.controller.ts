@@ -34,15 +34,30 @@ const parseCoord = (raw: unknown): number | null => {
   return null;
 };
 
+type CatalogReachability = {
+  serviceIds: Set<string>;
+  /** False when the customer has a GPS point but no hub covers it. */
+  inServiceArea: boolean;
+};
+
+const OUT_OF_AREA_MESSAGE =
+  'Services are not available in your location. Please contact the nearest hub operations manager.';
+
+const coveragePayload = (inServiceArea: boolean) => ({
+  inServiceArea,
+  message: inServiceArea ? null : OUT_OF_AREA_MESSAGE,
+});
+
 /**
  * Service IDs that at least one active partner offers.
- * When customer lat/lng are provided, only partners whose hub covers that point
- * (within VendorProfile.serviceRadiusKm) contribute their assigned services.
+ * Inside a hub radius: only that hub's assigned services.
+ * Outside every hub radius: still return all partner-assigned services for browse/request,
+ * with inServiceArea=false so the app can show Request + nearest HOM contact.
  */
 const resolveReachableServiceIds = async (
   latitude: number | null,
   longitude: number | null
-): Promise<Set<string>> => {
+): Promise<CatalogReachability> => {
   const assignments = await prisma.vendorService.findMany({
     where: {
       isActive: true,
@@ -60,16 +75,18 @@ const resolveReachableServiceIds = async (
     },
   });
 
-  const hasCustomerPoint = isValidCoordinate(latitude, longitude);
-  const ids = new Set<string>();
-
+  const allAssigned = new Set<string>();
   for (const row of assignments) {
-    if (!hasCustomerPoint) {
-      // No GPS yet: still hide pure catalog orphans — only assigned services.
-      ids.add(row.serviceId);
-      continue;
-    }
+    allAssigned.add(row.serviceId);
+  }
 
+  const hasCustomerPoint = isValidCoordinate(latitude, longitude);
+  if (!hasCustomerPoint) {
+    return { serviceIds: allAssigned, inServiceArea: true };
+  }
+
+  const inRadiusIds = new Set<string>();
+  for (const row of assignments) {
     const vLat = row.vendor.latitude;
     const vLng = row.vendor.longitude;
     if (!isValidCoordinate(vLat, vLng)) continue;
@@ -80,11 +97,109 @@ const resolveReachableServiceIds = async (
         : 15;
     const distanceKm = haversineKm(latitude as number, longitude as number, vLat as number, vLng as number);
     if (distanceKm <= radiusKm) {
-      ids.add(row.serviceId);
+      inRadiusIds.add(row.serviceId);
     }
   }
 
-  return ids;
+  if (inRadiusIds.size > 0) {
+    return { serviceIds: inRadiusIds, inServiceArea: true };
+  }
+
+  // Out of radius — browse full assigned catalog; booking via Request / call HOM.
+  return { serviceIds: allAssigned, inServiceArea: false };
+};
+
+const digitsOnlyPhone = (raw: string | null | undefined): string =>
+  (raw || '').replace(/\D/g, '');
+
+/**
+ * Nearest active fulfillment hub + its Hub Operation Manager phone for out-of-area requests.
+ */
+const resolveNearestHubOperationsContact = async (
+  latitude: number | null,
+  longitude: number | null
+): Promise<{
+  hubId: string;
+  hubName: string;
+  managerName: string;
+  phone: string;
+  distanceKm: number | null;
+} | null> => {
+  const hubs = await prisma.vendorProfile.findMany({
+    where: { isActive: true },
+    select: {
+      id: true,
+      companyName: true,
+      warehouseName: true,
+      warehousePhone: true,
+      latitude: true,
+      longitude: true,
+      user: { select: { phone: true, name: true, status: true, deletedAt: true } },
+      managers: {
+        where: { kind: 'OPERATIONS', user: { status: 'ACTIVE', deletedAt: null } },
+        orderBy: { createdAt: 'asc' },
+        take: 1,
+        select: {
+          user: { select: { name: true, phone: true } },
+        },
+      },
+    },
+  });
+
+  if (hubs.length === 0) return null;
+
+  const hasCustomerPoint = isValidCoordinate(latitude, longitude);
+  type Ranked = {
+    hub: (typeof hubs)[number];
+    distanceKm: number | null;
+  };
+
+  const ranked: Ranked[] = hubs.map((hub) => {
+    if (
+      hasCustomerPoint &&
+      isValidCoordinate(hub.latitude, hub.longitude)
+    ) {
+      return {
+        hub,
+        distanceKm: haversineKm(
+          latitude as number,
+          longitude as number,
+          hub.latitude as number,
+          hub.longitude as number
+        ),
+      };
+    }
+    return { hub, distanceKm: null };
+  });
+
+  ranked.sort((a, b) => {
+    if (a.distanceKm == null && b.distanceKm == null) return 0;
+    if (a.distanceKm == null) return 1;
+    if (b.distanceKm == null) return -1;
+    return a.distanceKm - b.distanceKm;
+  });
+
+  for (const row of ranked) {
+    const manager = row.hub.managers[0]?.user;
+    const managerPhone = digitsOnlyPhone(manager?.phone);
+    const warehousePhone = digitsOnlyPhone(row.hub.warehousePhone);
+    const ownerPhone =
+      row.hub.user?.status === 'ACTIVE' && !row.hub.user?.deletedAt
+        ? digitsOnlyPhone(row.hub.user.phone)
+        : '';
+    const phone = managerPhone || warehousePhone || ownerPhone;
+    if (!phone) continue;
+
+    return {
+      hubId: row.hub.id,
+      hubName: row.hub.warehouseName || row.hub.companyName,
+      managerName: manager?.name || row.hub.user?.name || 'Hub Operations',
+      phone,
+      distanceKm: row.distanceKm,
+    };
+  }
+
+  return null;
 };
 
 const CATALOG_SERVICE_INCLUDE = {
@@ -158,7 +273,8 @@ export const getCatalogCategories = async (req: Request, res: Response): Promise
       isValidCoordinate(latitude, longitude)
         ? `${(latitude as number).toFixed(3)}:${(longitude as number).toFixed(3)}`
         : 'noloc';
-    const cacheKey = `categories:assigned:${locKey}`;
+    const reachability = await resolveReachableServiceIds(latitude, longitude);
+    const cacheKey = `categories:assigned:${locKey}:${reachability.inServiceArea ? 'in' : 'oor'}`;
     const cached = catalogMemoryCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) {
       res.setHeader('Cache-Control', 'private, max-age=60, stale-while-revalidate=120');
@@ -166,16 +282,15 @@ export const getCatalogCategories = async (req: Request, res: Response): Promise
       return;
     }
 
-    const reachableServiceIds = await resolveReachableServiceIds(latitude, longitude);
-    if (reachableServiceIds.size === 0) {
-      const empty = { categories: [] as any[] };
+    if (reachability.serviceIds.size === 0) {
+      const empty = { categories: [] as any[], coverage: coveragePayload(reachability.inServiceArea) };
       catalogMemoryCache.set(cacheKey, { data: empty, expiresAt: Date.now() + CACHE_TTL_MS });
       res.setHeader('Cache-Control', 'private, max-age=60, stale-while-revalidate=120');
       sendSuccess(res, empty, 200);
       return;
     }
 
-    const reachableList = [...reachableServiceIds];
+    const reachableList = [...reachability.serviceIds];
 
     const serviceTileSelect = {
       id: true,
@@ -303,7 +418,10 @@ export const getCatalogCategories = async (req: Request, res: Response): Promise
       })
       .filter((cat) => (cat._count?.services || 0) > 0 || cat.subCategories.some((s) => s.services.length > 0));
 
-    const resultData = { categories: sanitizedCategories };
+    const resultData = {
+      categories: sanitizedCategories,
+      coverage: coveragePayload(reachability.inServiceArea),
+    };
     catalogMemoryCache.set(cacheKey, { data: resultData, expiresAt: Date.now() + CACHE_TTL_MS });
 
     res.setHeader('Cache-Control', 'private, max-age=60, stale-while-revalidate=120');
@@ -335,7 +453,8 @@ export const getCatalogServices = async (req: Request, res: Response): Promise<v
       isValidCoordinate(latitude, longitude)
         ? `${(latitude as number).toFixed(3)}:${(longitude as number).toFixed(3)}`
         : 'noloc';
-    const cacheKey = `services:assigned:${locKey}:${categoryId || ''}:${subCategoryId || ''}:${categorySlug || ''}:${search || ''}:${isPopular}:${requestedIds.join(',')}:${page}:${limit}`;
+    const reachability = await resolveReachableServiceIds(latitude, longitude);
+    const cacheKey = `services:assigned:${locKey}:${reachability.inServiceArea ? 'in' : 'oor'}:${categoryId || ''}:${subCategoryId || ''}:${categorySlug || ''}:${search || ''}:${isPopular}:${requestedIds.join(',')}:${page}:${limit}`;
     const cached = catalogMemoryCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) {
       res.setHeader('Cache-Control', 'private, max-age=60, stale-while-revalidate=120');
@@ -343,9 +462,8 @@ export const getCatalogServices = async (req: Request, res: Response): Promise<v
       return;
     }
 
-    const reachableServiceIds = await resolveReachableServiceIds(latitude, longitude);
-    if (reachableServiceIds.size === 0) {
-      const empty = { services: [] as any[] };
+    if (reachability.serviceIds.size === 0) {
+      const empty = { services: [] as any[], coverage: coveragePayload(reachability.inServiceArea) };
       const meta = { total: 0, page, limit, totalPages: 0 };
       catalogMemoryCache.set(cacheKey, { data: empty, meta, expiresAt: Date.now() + CACHE_TTL_MS });
       res.setHeader('Cache-Control', 'private, max-age=60, stale-while-revalidate=120');
@@ -353,9 +471,9 @@ export const getCatalogServices = async (req: Request, res: Response): Promise<v
       return;
     }
 
-    const reachableList = [...reachableServiceIds];
+    const reachableList = [...reachability.serviceIds];
     const filteredRequestedIds =
-      requestedIds.length > 0 ? requestedIds.filter((id) => reachableServiceIds.has(id)) : [];
+      requestedIds.length > 0 ? requestedIds.filter((id) => reachability.serviceIds.has(id)) : [];
 
     const where: any = {
       isActive: true,
@@ -405,7 +523,10 @@ export const getCatalogServices = async (req: Request, res: Response): Promise<v
             .map(sanitizeCatalogService)
         : services.map(sanitizeCatalogService);
 
-    const resultData = { services: sanitizedServices };
+    const resultData = {
+      services: sanitizedServices,
+      coverage: coveragePayload(reachability.inServiceArea),
+    };
     const meta = {
       total,
       page,
@@ -498,7 +619,7 @@ export const getPopularServices = async (req: Request, res: Response): Promise<v
       isValidCoordinate(latitude, longitude)
         ? `${(latitude as number).toFixed(3)}:${(longitude as number).toFixed(3)}`
         : 'noloc';
-    const reachableServiceIds = await resolveReachableServiceIds(latitude, longitude);
+    const reachability = await resolveReachableServiceIds(latitude, longitude);
 
     const layoutConfig = await prisma.appConfiguration.findUnique({
       where: { key: 'HOME_LAYOUT' },
@@ -513,10 +634,10 @@ export const getPopularServices = async (req: Request, res: Response): Promise<v
         : Array.isArray(layoutValue.popularServiceIds)
           ? layoutValue.popularServiceIds.filter((id: unknown) => typeof id === 'string' && id.length > 0)
           : []
-    ).filter((id: string) => reachableServiceIds.has(id));
+    ).filter((id: string) => reachability.serviceIds.has(id));
     const limit = selectedIds.length > 0 ? Math.min(Math.max(selectedIds.length, 1), 50) : requestedLimit;
 
-    const cacheKey = `services:popular:assigned:${locKey}:${limit}:${selectedIds.join(',')}`;
+    const cacheKey = `services:popular:assigned:${locKey}:${reachability.inServiceArea ? 'in' : 'oor'}:${limit}:${selectedIds.join(',')}`;
     const cached = catalogMemoryCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) {
       res.setHeader('Cache-Control', 'private, max-age=60, stale-while-revalidate=120');
@@ -524,8 +645,8 @@ export const getPopularServices = async (req: Request, res: Response): Promise<v
       return;
     }
 
-    if (reachableServiceIds.size === 0) {
-      const empty = { services: [] as any[] };
+    if (reachability.serviceIds.size === 0) {
+      const empty = { services: [] as any[], coverage: coveragePayload(reachability.inServiceArea) };
       catalogMemoryCache.set(cacheKey, { data: empty, expiresAt: Date.now() + CACHE_TTL_MS });
       res.setHeader('Cache-Control', 'private, max-age=60, stale-while-revalidate=120');
       sendSuccess(res, empty, 200);
@@ -563,7 +684,7 @@ export const getPopularServices = async (req: Request, res: Response): Promise<v
     } else {
       services = await prisma.service.findMany({
         where: {
-          id: { in: [...reachableServiceIds] },
+          id: { in: [...reachability.serviceIds] },
           isActive: true,
           isPopular: true,
           ...notDeletedClause,
@@ -588,7 +709,10 @@ export const getPopularServices = async (req: Request, res: Response): Promise<v
         : null,
     }));
 
-    const resultData = { services: sanitizedServices };
+    const resultData = {
+      services: sanitizedServices,
+      coverage: coveragePayload(reachability.inServiceArea),
+    };
     catalogMemoryCache.set(cacheKey, { data: resultData, expiresAt: Date.now() + CACHE_TTL_MS });
 
     res.setHeader('Cache-Control', 'private, max-age=60, stale-while-revalidate=120');
@@ -658,7 +782,10 @@ export const getCatalogHomeLayout = async (req: Request, res: Response): Promise
 
     const latitude = parseCoord(req.query.latitude ?? req.query.lat);
     const longitude = parseCoord(req.query.longitude ?? req.query.lng);
-    const reachableServiceIds = await resolveReachableServiceIds(latitude, longitude);
+    const reachability = await resolveReachableServiceIds(latitude, longitude);
+    const nearestContact = reachability.inServiceArea
+      ? null
+      : await resolveNearestHubOperationsContact(latitude, longitude);
 
     const config = await prisma.appConfiguration.findUnique({
       where: { key: 'HOME_LAYOUT' },
@@ -668,16 +795,45 @@ export const getCatalogHomeLayout = async (req: Request, res: Response): Promise
     const rawSections = (data.serviceSections || []).map((section: any) => ({
       ...section,
       serviceIds: Array.isArray(section.serviceIds)
-        ? section.serviceIds.filter((id: string) => reachableServiceIds.has(id))
+        ? section.serviceIds.filter((id: string) => reachability.serviceIds.has(id))
         : [],
     }));
     const serviceSections = await attachHomeSectionServices(rawSections);
     const updatedAt = config?.updatedAt ? config.updatedAt.getTime() : Date.now();
-    const payload = { ...data, serviceSections, updatedAt };
+    const payload = {
+      ...data,
+      serviceSections,
+      updatedAt,
+      coverage: coveragePayload(reachability.inServiceArea),
+      nearestHubContact: nearestContact,
+    };
 
     sendSuccess(res, payload, 200);
   } catch (err: any) {
     sendSuccess(res, DEFAULT_HOME_LAYOUT, 200);
+  }
+};
+
+/**
+ * Nearest hub operations manager contact for the customer's coordinates.
+ * Public — used when the customer is outside every hub service radius.
+ */
+export const getNearestHubContact = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const latitude = parseCoord(req.query.latitude ?? req.query.lat);
+    const longitude = parseCoord(req.query.longitude ?? req.query.lng);
+    const reachability = await resolveReachableServiceIds(latitude, longitude);
+    const contact = await resolveNearestHubOperationsContact(latitude, longitude);
+    sendSuccess(
+      res,
+      {
+        coverage: coveragePayload(reachability.inServiceArea),
+        contact,
+      },
+      200
+    );
+  } catch (err: any) {
+    sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
   }
 };
 

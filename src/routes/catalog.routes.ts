@@ -5,12 +5,14 @@ import {
   getCatalogServices,
   getCatalogServiceById,
   getCatalogServiceReviews,
+  getNearestHubContact,
 } from '../controllers/catalog.controller';
 
 const router = Router();
 
 // Public catalog endpoints (No authentication required)
 router.get('/home-layout', getCatalogHomeLayout);
+router.get('/nearest-hub-contact', getNearestHubContact);
 router.get('/categories', getCatalogCategories);
 router.get('/services', getCatalogServices);
 router.get('/services/:id', getCatalogServiceById);
