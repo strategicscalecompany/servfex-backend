@@ -36,78 +36,93 @@ const parseCoord = (raw: unknown): number | null => {
 
 type CatalogReachability = {
   serviceIds: Set<string>;
-  /** False when the customer has a GPS point but no hub covers it. */
+  /** False when no hub covers the customer point (or location is missing). */
   inServiceArea: boolean;
+  matchedHubId?: string | null;
+  matchedHubName?: string | null;
+  distanceKm?: number | null;
 };
 
 const OUT_OF_AREA_MESSAGE =
   'Services are not available in your location. Please contact the nearest hub operations manager.';
 
-const coveragePayload = (inServiceArea: boolean) => ({
-  inServiceArea,
-  message: inServiceArea ? null : OUT_OF_AREA_MESSAGE,
+const coveragePayload = (reachability: CatalogReachability) => ({
+  inServiceArea: reachability.inServiceArea,
+  message: reachability.inServiceArea ? null : OUT_OF_AREA_MESSAGE,
+  matchedHubId: reachability.matchedHubId ?? null,
+  matchedHubName: reachability.matchedHubName ?? null,
+  distanceKm: reachability.distanceKm ?? null,
 });
 
 /**
- * Service IDs that at least one active partner offers.
- * Inside a hub radius: only that hub's assigned services.
- * Outside every hub radius: still return all partner-assigned services for browse/request,
- * with inServiceArea=false so the app can show Request + nearest HOM contact.
+ * Inside a hub radius: ONLY services assigned to the nearest covering hub.
+ * Outside every hub (or no GPS): empty catalog + inServiceArea=false so the app
+ * shows the unavailable banner / Request / call-HOM — not the full platform list.
  */
 const resolveReachableServiceIds = async (
   latitude: number | null,
   longitude: number | null
 ): Promise<CatalogReachability> => {
-  const assignments = await prisma.vendorService.findMany({
-    where: {
-      isActive: true,
-      vendor: { isActive: true },
-    },
+  const hasCustomerPoint = isValidCoordinate(latitude, longitude);
+  if (!hasCustomerPoint) {
+    return { serviceIds: new Set(), inServiceArea: false };
+  }
+
+  const hubs = await prisma.vendorProfile.findMany({
+    where: { isActive: true },
     select: {
-      serviceId: true,
-      vendor: {
-        select: {
-          latitude: true,
-          longitude: true,
-          serviceRadiusKm: true,
-        },
-      },
+      id: true,
+      companyName: true,
+      warehouseName: true,
+      latitude: true,
+      longitude: true,
+      serviceRadiusKm: true,
     },
   });
 
-  const allAssigned = new Set<string>();
-  for (const row of assignments) {
-    allAssigned.add(row.serviceId);
-  }
-
-  const hasCustomerPoint = isValidCoordinate(latitude, longitude);
-  if (!hasCustomerPoint) {
-    // No customer point yet — allow browse of assigned catalog, but do not treat as in-area booking.
-    return { serviceIds: allAssigned, inServiceArea: false };
-  }
-
-  const inRadiusIds = new Set<string>();
-  for (const row of assignments) {
-    const vLat = row.vendor.latitude;
-    const vLng = row.vendor.longitude;
-    if (!isValidCoordinate(vLat, vLng)) continue;
-
+  type Covering = { id: string; name: string; distanceKm: number };
+  const covering: Covering[] = [];
+  for (const hub of hubs) {
+    if (!isValidCoordinate(hub.latitude, hub.longitude)) continue;
     const radiusKm =
-      typeof row.vendor.serviceRadiusKm === 'number' && row.vendor.serviceRadiusKm > 0
-        ? row.vendor.serviceRadiusKm
-        : 15;
-    const distanceKm = haversineKm(latitude as number, longitude as number, vLat as number, vLng as number);
+      typeof hub.serviceRadiusKm === 'number' && hub.serviceRadiusKm > 0 ? hub.serviceRadiusKm : 15;
+    const distanceKm = haversineKm(
+      latitude as number,
+      longitude as number,
+      hub.latitude as number,
+      hub.longitude as number
+    );
     if (distanceKm <= radiusKm) {
-      inRadiusIds.add(row.serviceId);
+      covering.push({
+        id: hub.id,
+        name: hub.warehouseName || hub.companyName,
+        distanceKm,
+      });
     }
   }
 
-  if (inRadiusIds.size > 0) {
-    return { serviceIds: inRadiusIds, inServiceArea: true };
+  if (covering.length === 0) {
+    return { serviceIds: new Set(), inServiceArea: false };
   }
 
-  // Out of radius — browse full assigned catalog; booking via Request / call HOM.
-  return { serviceIds: allAssigned, inServiceArea: false };
+  covering.sort((a, b) => a.distanceKm - b.distanceKm);
+  const nearest = covering[0];
+
+  const assignments = await prisma.vendorService.findMany({
+    where: {
+      isActive: true,
+      vendorId: nearest.id,
+    },
+    select: { serviceId: true },
+  });
+
+  return {
+    serviceIds: new Set(assignments.map((row) => row.serviceId)),
+    inServiceArea: true,
+    matchedHubId: nearest.id,
+    matchedHubName: nearest.name,
+    distanceKm: nearest.distanceKm,
+  };
 };
 
 const digitsOnlyPhone = (raw: string | null | undefined): string =>
@@ -284,7 +299,7 @@ export const getCatalogCategories = async (req: Request, res: Response): Promise
     }
 
     if (reachability.serviceIds.size === 0) {
-      const empty = { categories: [] as any[], coverage: coveragePayload(reachability.inServiceArea) };
+      const empty = { categories: [] as any[], coverage: coveragePayload(reachability) };
       catalogMemoryCache.set(cacheKey, { data: empty, expiresAt: Date.now() + CACHE_TTL_MS });
       res.setHeader('Cache-Control', 'private, max-age=60, stale-while-revalidate=120');
       sendSuccess(res, empty, 200);
@@ -421,7 +436,7 @@ export const getCatalogCategories = async (req: Request, res: Response): Promise
 
     const resultData = {
       categories: sanitizedCategories,
-      coverage: coveragePayload(reachability.inServiceArea),
+      coverage: coveragePayload(reachability),
     };
     catalogMemoryCache.set(cacheKey, { data: resultData, expiresAt: Date.now() + CACHE_TTL_MS });
 
@@ -464,7 +479,7 @@ export const getCatalogServices = async (req: Request, res: Response): Promise<v
     }
 
     if (reachability.serviceIds.size === 0) {
-      const empty = { services: [] as any[], coverage: coveragePayload(reachability.inServiceArea) };
+      const empty = { services: [] as any[], coverage: coveragePayload(reachability) };
       const meta = { total: 0, page, limit, totalPages: 0 };
       catalogMemoryCache.set(cacheKey, { data: empty, meta, expiresAt: Date.now() + CACHE_TTL_MS });
       res.setHeader('Cache-Control', 'private, max-age=60, stale-while-revalidate=120');
@@ -526,7 +541,7 @@ export const getCatalogServices = async (req: Request, res: Response): Promise<v
 
     const resultData = {
       services: sanitizedServices,
-      coverage: coveragePayload(reachability.inServiceArea),
+      coverage: coveragePayload(reachability),
     };
     const meta = {
       total,
@@ -647,7 +662,7 @@ export const getPopularServices = async (req: Request, res: Response): Promise<v
     }
 
     if (reachability.serviceIds.size === 0) {
-      const empty = { services: [] as any[], coverage: coveragePayload(reachability.inServiceArea) };
+      const empty = { services: [] as any[], coverage: coveragePayload(reachability) };
       catalogMemoryCache.set(cacheKey, { data: empty, expiresAt: Date.now() + CACHE_TTL_MS });
       res.setHeader('Cache-Control', 'private, max-age=60, stale-while-revalidate=120');
       sendSuccess(res, empty, 200);
@@ -712,7 +727,7 @@ export const getPopularServices = async (req: Request, res: Response): Promise<v
 
     const resultData = {
       services: sanitizedServices,
-      coverage: coveragePayload(reachability.inServiceArea),
+      coverage: coveragePayload(reachability),
     };
     catalogMemoryCache.set(cacheKey, { data: resultData, expiresAt: Date.now() + CACHE_TTL_MS });
 
@@ -805,7 +820,7 @@ export const getCatalogHomeLayout = async (req: Request, res: Response): Promise
       ...data,
       serviceSections,
       updatedAt,
-      coverage: coveragePayload(reachability.inServiceArea),
+      coverage: coveragePayload(reachability),
       nearestHubContact: nearestContact,
     };
 
@@ -828,7 +843,7 @@ export const getNearestHubContact = async (req: Request, res: Response): Promise
     sendSuccess(
       res,
       {
-        coverage: coveragePayload(reachability.inServiceArea),
+        coverage: coveragePayload(reachability),
         contact,
       },
       200
