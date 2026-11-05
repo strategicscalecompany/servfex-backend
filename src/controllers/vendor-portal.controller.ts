@@ -1846,16 +1846,6 @@ export const completeOrder = async (req: Request, res: Response): Promise<void> 
       }
     }
 
-    if (!hasRequiredBeforePhotos(booking.beforePhotoUrls)) {
-      sendError(
-        res,
-        'BEFORE_PHOTOS_REQUIRED',
-        `This job is missing the required before photographs (${MIN_BEFORE_PHOTOS} minimum). Currently ${countValidBeforePhotos(booking.beforePhotoUrls)} valid photograph(s) are stored.`,
-        400
-      );
-      return;
-    }
-
     if (!hasRequiredCompletionPhotos(booking.completionPhotoUrls)) {
       sendError(
         res,
@@ -1887,12 +1877,6 @@ export const completeOrder = async (req: Request, res: Response): Promise<void> 
           current.bookingSource === 'SALES_MANAGER' || current.bookingSource === 'PHONE_HUB';
         if (!current.qrVerifiedAt && !currentDeskManaged) {
           throw Object.assign(new Error('Cannot complete order without verified start OTP'), { code: 'BAD_REQUEST' });
-        }
-        if (!hasRequiredBeforePhotos(current.beforePhotoUrls)) {
-          throw Object.assign(
-            new Error(`Upload at least ${MIN_BEFORE_PHOTOS} before photographs before finishing this job.`),
-            { code: 'BEFORE_PHOTOS_REQUIRED' }
-          );
         }
         if (!hasRequiredCompletionPhotos(current.completionPhotoUrls)) {
           throw Object.assign(
