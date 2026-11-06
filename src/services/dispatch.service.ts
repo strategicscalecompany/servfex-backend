@@ -349,7 +349,8 @@ export async function offerToExpertInTx(tx: Tx, p: OfferParams): Promise<void> {
   const claimed = await tx.booking.updateMany({
     where: {
       id: booking.id,
-      status: p.method === 'AUTO' ? 'PENDING' : { in: ['PENDING', 'ASSIGNED'] },
+      // Hub may auto-accept first (ACCEPTED); provider can still assign from there.
+      status: p.method === 'AUTO' ? 'PENDING' : { in: ['PENDING', 'ACCEPTED', 'ASSIGNED'] },
     },
     data: {
       employeeId: employee.id,
@@ -409,10 +410,14 @@ async function notifyOffer(tx: Tx, p: OfferParams): Promise<void> {
       targetUserId: employee.userId,
     },
   });
+  const slotLabel =
+    booking.scheduledDate && booking.scheduledTimeSlot
+      ? ` Slot: ${booking.scheduledDate} (${booking.scheduledTimeSlot}).`
+      : '';
   await tx.notification.create({
     data: {
       title: `Working Professional assigned #${booking.bookingNumber}`,
-      message: `${employee.userName} has been assigned to your ${booking.service.name} booking.${etaLabel} You can now see their details in the app.`,
+      message: `${employee.userName} is assigned to your ${booking.service.name} booking.${slotLabel}${etaLabel} We'll keep you updated when they visit.`,
       target: 'SPECIFIC_USER',
       targetUserId: booking.customer.userId,
     },
@@ -860,7 +865,7 @@ export async function assignExpertManually(input: ManualAssignInput) {
     if (!booking || booking.vendorId !== input.vendorId) {
       throw new DispatchError('NOT_FOUND', 'Order not found', 404);
     }
-    if (booking.status !== 'PENDING' && booking.status !== 'ASSIGNED') {
+    if (booking.status !== 'PENDING' && booking.status !== 'ACCEPTED' && booking.status !== 'ASSIGNED') {
       throw new DispatchError(
         'ASSIGNMENT_CONFLICT',
         `Booking is already ${booking.status} and can no longer be assigned`,

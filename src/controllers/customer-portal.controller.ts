@@ -725,6 +725,9 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
       ? { lat: address.latitude as number, lng: address.longitude as number }
       : null;
 
+    // In-radius hub bookings are auto-accepted by the hub; professional assignment stays ASSIGNED later.
+    const initialStatus = matchedVendor ? ('ACCEPTED' as const) : ('PENDING' as const);
+
     const newBooking = await prisma.$transaction(async (tx) => {
       const [booking] = await Promise.all([
         tx.booking.create({
@@ -737,7 +740,7 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
             addressId: address.id,
             scheduledDate,
             scheduledTimeSlot,
-            status: 'PENDING',
+            status: initialStatus,
             dispatchDueAt,
             dispatchAttempts: 0,
             assignmentStrategy,
@@ -758,11 +761,11 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
             notes: bookingNotes,
             statusHistory: {
               create: {
-                newStatus: 'PENDING',
+                newStatus: initialStatus,
                 changedBy: userId,
                 changedByRole: 'CUSTOMER',
                 reason: matchedVendor
-                  ? `Order routed to warehouse: ${matchedVendor.warehouseName || matchedVendor.companyName}`
+                  ? `Hub auto-accepted — routed to ${matchedVendor.warehouseName || matchedVendor.companyName}. Slot ${scheduledDate} (${scheduledTimeSlot}). Awaiting Working Professional assignment.`
                   : 'Customer is outside vendor service radiuses; nearest eligible professional search armed',
               },
             },
@@ -810,16 +813,19 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
       void notifyUsers(
         [matchedVendor.user.id],
         `New booking #${bookingNumber}`,
-        `New booking for ${service.name}. Assign a checked-in Working Professional.`,
+        `Hub auto-accepted ${service.name} for ${scheduledDate} (${scheduledTimeSlot}). Assign a checked-in Working Professional.`,
         { bookingId: newBooking.id, type: 'booking:new' }
       );
     }
 
-    // Customer confirmation — WP details are shared only after the Provider assigns a professional.
+    // Customer confirmation — slots shown; visit time shared after Provider assigns a professional.
+    const customerConfirmMsg = matchedVendor
+      ? `Your order for ${service.name} is confirmed for ${scheduledDate} (${scheduledTimeSlot}). We'll let you know when our professionals will visit.`
+      : `Your order for ${service.name} is confirmed. You will be assigned a Working Professional soon.`;
     prisma.notification.create({
       data: {
         title: `Order Confirmed #${bookingNumber}`,
-        message: `Your order for ${service.name} is confirmed. You will be assigned a Working Professional soon.`,
+        message: customerConfirmMsg,
         target: 'SPECIFIC_USER',
         targetUserId: userId,
       },
@@ -827,7 +833,7 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
     void notifyUsers(
       [userId],
       `Order Confirmed #${bookingNumber}`,
-      `Your order for ${service.name} is confirmed. You will be assigned a Working Professional soon.`,
+      customerConfirmMsg,
       { bookingId: newBooking.id, type: 'booking:confirmed' }
     );
 
@@ -1259,8 +1265,8 @@ export const getBookingStartOtp = async (req: Request, res: Response): Promise<v
         bookingNumber: booking.bookingNumber,
         serviceName: booking.service.name,
         pinType: 'COMPLETION',
+        // Omit startOtp — Android JSONObject.optString turns JSON null into "null".
         completionOtp: completionToken,
-        startOtp: null,
         token: completionToken,
         qrChallengeToken: completionToken,
         otp: completionToken,
@@ -1276,7 +1282,7 @@ export const getBookingStartOtp = async (req: Request, res: Response): Promise<v
       serviceName: booking.service.name,
       pinType: 'START',
       startOtp: token,
-      completionOtp: null,
+      // Omit completionOtp while start PIN is active.
       token,
       qrChallengeToken: token,
       otp: token,

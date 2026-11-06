@@ -1198,15 +1198,10 @@ export const getVendorOrders = async (req: Request, res: Response): Promise<void
           bookingSource: 'SALES_MANAGER',
         };
       } else {
-        // Original Service Professional flow: assigned jobs plus unassigned hub jobs to swipe-accept.
+        // Assigned jobs for this professional (hub auto-accepts; WP sees ASSIGNED after hub assigns).
         where.OR = [
           { employeeId: user.employeeProfile.id },
           { helperEmployeeId: user.employeeProfile.id },
-          {
-            vendorId: user.employeeProfile.vendorId,
-            employeeId: null,
-            status: { in: ['ASSIGNED', 'PENDING'] },
-          },
         ];
       }
     } else {
