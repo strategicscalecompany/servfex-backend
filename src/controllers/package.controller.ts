@@ -37,13 +37,13 @@ async function syncServiceStartingPriceFromPackages(
 
   const nextStarting = toMoney(minPrice);
   const oldStarting = toMoney(service.startingPrice);
-  if (nextStarting === oldStarting) return;
-
-  await tx.service.update({
-    where: { id: serviceId },
-    data: { startingPrice: nextStarting },
-  });
-  // Clear hub price snapshots so partners/managers follow the live catalog price.
+  if (nextStarting !== oldStarting) {
+    await tx.service.update({
+      where: { id: serviceId },
+      data: { startingPrice: nextStarting },
+    });
+  }
+  // Always drop hub snapshots on package price sync so managers see live catalog pricing.
   await tx.vendorService.updateMany({
     where: { serviceId },
     data: { customPrice: null },
