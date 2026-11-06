@@ -234,6 +234,172 @@ router.get('/geocode', async (req: Request, res: Response): Promise<void> => {
 });
 
 /**
+ * GET /api/v1/geo/autocomplete
+ * Typeahead place suggestions (Google Places Autocomplete), India-biased.
+ */
+router.get('/autocomplete', async (req: Request, res: Response): Promise<void> => {
+  const query = ((req.query.query as string) || (req.query.input as string) || '').trim();
+  if (query.length < 2) {
+    res.status(400).json({
+      success: false,
+      error: { code: 'INVALID_QUERY', message: 'Query must be at least 2 characters' },
+    });
+    return;
+  }
+
+  const cacheKey = `ac:${query.toLowerCase()}`;
+  const cached = getCachedGeo(cacheKey);
+  if (cached) {
+    res.setHeader('Cache-Control', 'public, max-age=120');
+    res.status(200).json({ success: true, data: cached });
+    return;
+  }
+
+  const apiKey = env.GOOGLE_MAPS_API_KEY;
+  if (!apiKey) {
+    res.status(503).json({
+      success: false,
+      error: { code: 'KEY_NOT_CONFIGURED', message: 'Google Maps API key is not configured' },
+    });
+    return;
+  }
+
+  try {
+    const url =
+      `https://maps.googleapis.com/maps/api/place/autocomplete/json` +
+      `?input=${encodeURIComponent(query)}` +
+      `&components=country:in` +
+      `&language=en` +
+      `&key=${apiKey}`;
+    const response = await fetch(url, {
+      signal: AbortSignal.timeout(GEO_FETCH_TIMEOUT_MS),
+    });
+    const data = await response.json();
+
+    if (data.status === 'OK' || data.status === 'ZERO_RESULTS') {
+      const predictions = Array.isArray(data.predictions) ? data.predictions : [];
+      const results = predictions.slice(0, 8).map((item: any) => {
+        const main = item?.structured_formatting?.main_text || '';
+        const secondary = item?.structured_formatting?.secondary_text || '';
+        const description = String(item?.description || '').trim();
+        return {
+          placeId: String(item?.place_id || ''),
+          title: String(main || description.split(',')[0] || description).trim(),
+          subtitle: String(secondary || description).trim(),
+          description,
+        };
+      }).filter((item: { placeId: string; description: string }) => item.placeId && item.description);
+
+      setCachedGeo(cacheKey, results, 10 * 60 * 1000);
+      res.setHeader('Cache-Control', 'public, max-age=120');
+      res.status(200).json({ success: true, data: results });
+      return;
+    }
+
+    logger.warn({ status: data.status, message: data.error_message }, 'Places autocomplete non-OK');
+    res.status(200).json({
+      success: true,
+      data: [],
+      status: data.status,
+      message: data.error_message,
+    });
+  } catch (err: any) {
+    if (err?.name === 'TimeoutError' || err?.name === 'AbortError') {
+      res.status(504).json({
+        success: false,
+        error: { code: 'UPSTREAM_TIMEOUT', message: 'Places autocomplete timed out' },
+      });
+      return;
+    }
+    logger.error({ err }, 'Google Places Autocomplete proxy error');
+    res.status(500).json({
+      success: false,
+      error: { code: 'AUTOCOMPLETE_ERROR', message: 'Places autocomplete failed' },
+    });
+  }
+});
+
+/**
+ * GET /api/v1/geo/place-details
+ * Resolve a Places place_id to lat/lng + formatted address.
+ */
+router.get('/place-details', async (req: Request, res: Response): Promise<void> => {
+  const placeId = String(req.query.placeId || req.query.place_id || '').trim();
+  if (!placeId) {
+    res.status(400).json({
+      success: false,
+      error: { code: 'INVALID_PLACE_ID', message: 'placeId is required' },
+    });
+    return;
+  }
+
+  const cacheKey = `pd:${placeId}`;
+  const cached = getCachedGeo(cacheKey);
+  if (cached) {
+    res.setHeader('Cache-Control', 'public, max-age=300');
+    res.status(200).json({ success: true, data: cached });
+    return;
+  }
+
+  const apiKey = env.GOOGLE_MAPS_API_KEY;
+  if (!apiKey) {
+    res.status(503).json({
+      success: false,
+      error: { code: 'KEY_NOT_CONFIGURED', message: 'Google Maps API key is not configured' },
+    });
+    return;
+  }
+
+  try {
+    const url =
+      `https://maps.googleapis.com/maps/api/place/details/json` +
+      `?place_id=${encodeURIComponent(placeId)}` +
+      `&fields=geometry,formatted_address,name` +
+      `&key=${apiKey}`;
+    const response = await fetch(url, {
+      signal: AbortSignal.timeout(GEO_FETCH_TIMEOUT_MS),
+    });
+    const data = await response.json();
+
+    if (data.status === 'OK' && data.result?.geometry?.location) {
+      const resultData = {
+        placeId,
+        name: data.result.name || '',
+        formattedAddress: data.result.formatted_address || data.result.name || '',
+        lat: data.result.geometry.location.lat,
+        lng: data.result.geometry.location.lng,
+      };
+      setCachedGeo(cacheKey, resultData);
+      res.setHeader('Cache-Control', 'public, max-age=300');
+      res.status(200).json({ success: true, data: resultData });
+      return;
+    }
+
+    res.status(404).json({
+      success: false,
+      error: {
+        code: 'PLACE_NOT_FOUND',
+        message: data.error_message || 'Could not resolve this place',
+      },
+      status: data.status,
+    });
+  } catch (err: any) {
+    if (err?.name === 'TimeoutError' || err?.name === 'AbortError') {
+      res.status(504).json({
+        success: false,
+        error: { code: 'UPSTREAM_TIMEOUT', message: 'Place details timed out' },
+      });
+      return;
+    }
+    logger.error({ err }, 'Google Places Details proxy error');
+    res.status(500).json({
+      success: false,
+      error: { code: 'PLACE_DETAILS_ERROR', message: 'Place details lookup failed' },
+    });
+  }
+});
+
+/**
  * GET /api/v1/geo/reverse
  * Reverse geocode lat,lng using Google Maps Geocoding API
  */
