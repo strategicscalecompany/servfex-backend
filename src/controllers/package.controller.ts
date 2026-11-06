@@ -6,6 +6,49 @@ import { logAuditEvent } from '../utils/audit';
 import { uploadToCloudinary } from '../utils/cloudinary';
 import { Prisma } from '@prisma/client';
 import { toMoney } from '../utils/money';
+import { invalidateCatalogCache } from './catalog.controller';
+
+/** Keep Service.startingPrice = cheapest active package so tiles + hub fallbacks stay current. */
+async function syncServiceStartingPriceFromPackages(
+  tx: Prisma.TransactionClient,
+  serviceId: string
+): Promise<void> {
+  const service = await tx.service.findUnique({
+    where: { id: serviceId },
+    select: { startingPrice: true },
+  });
+  if (!service) return;
+
+  const packages = await tx.servicePackage.findMany({
+    where: { serviceId, isActive: true },
+    select: { discountedPrice: true, price: true },
+    orderBy: { displayOrder: 'asc' },
+  });
+  if (packages.length === 0) return;
+
+  let minPrice = Number.POSITIVE_INFINITY;
+  for (const pkg of packages) {
+    const candidate = Number(pkg.discountedPrice || pkg.price || NaN);
+    if (Number.isFinite(candidate) && candidate >= 0 && candidate < minPrice) {
+      minPrice = candidate;
+    }
+  }
+  if (!Number.isFinite(minPrice)) return;
+
+  const nextStarting = toMoney(minPrice);
+  const oldStarting = toMoney(service.startingPrice);
+  if (nextStarting === oldStarting) return;
+
+  await tx.service.update({
+    where: { id: serviceId },
+    data: { startingPrice: nextStarting },
+  });
+  // Clear hub price snapshots so partners/managers follow the live catalog price.
+  await tx.vendorService.updateMany({
+    where: { serviceId },
+    data: { customPrice: null },
+  });
+}
 
 // ==========================================
 // VALIDATION SCHEMAS
@@ -319,9 +362,11 @@ export const createPackage = async (req: Request, res: Response, next: NextFunct
         tx,
       });
 
+      await syncServiceStartingPriceFromPackages(tx, serviceId);
       return created;
     });
 
+    invalidateCatalogCache();
     sendSuccess(res, pkg, 201);
   } catch (error) {
     next(error);
@@ -426,9 +471,11 @@ export const updatePackage = async (req: Request, res: Response, next: NextFunct
         tx,
       });
 
+      await syncServiceStartingPriceFromPackages(tx, existing.serviceId);
       return pkg;
     });
 
+    invalidateCatalogCache();
     sendSuccess(res, updated);
   } catch (error) {
     next(error);

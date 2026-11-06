@@ -332,6 +332,10 @@ export const updateService = async (req: Request, res: Response, next: NextFunct
     }
 
     const updated = await prisma.$transaction(async (tx) => {
+      const nextStartingPrice =
+        startingPrice !== undefined ? toMoney(startingPrice) : undefined;
+      const oldStartingPrice = toMoney(existing.startingPrice);
+
       const s = await tx.service.update({
         where: { id },
         data: {
@@ -340,7 +344,7 @@ export const updateService = async (req: Request, res: Response, next: NextFunct
           ...(name ? { name } : {}),
           ...(slug ? { slug: slug.toLowerCase() } : {}),
           ...(description ? { description } : {}),
-          ...(startingPrice !== undefined ? { startingPrice: toMoney(startingPrice) } : {}),
+          ...(nextStartingPrice !== undefined ? { startingPrice: nextStartingPrice } : {}),
           ...(priceUnit ? { priceUnit } : {}),
           ...(durationText ? { durationText } : {}),
           ...(iconUrl !== undefined ? { iconUrl: uploadedIconUrl } : {}),
@@ -355,6 +359,14 @@ export const updateService = async (req: Request, res: Response, next: NextFunct
           packages: true,
         },
       });
+
+      // Drop hub price snapshots so partners/managers follow the live catalog price.
+      if (nextStartingPrice !== undefined && nextStartingPrice !== oldStartingPrice) {
+        await tx.vendorService.updateMany({
+          where: { serviceId: id },
+          data: { customPrice: null },
+        });
+      }
 
       await logAuditEvent({
         superAdminId: req.user!.userId,
