@@ -10,6 +10,7 @@ import {
   getTrackingSnapshot,
   hubCheckIn,
   hubCheckOut,
+  pingHubLocation,
   pingProfessionalLocation,
   saveProfessionalUpi,
   setProfessionalAvailability,
@@ -210,6 +211,20 @@ export const postHubCheckOut = async (req: Request, res: Response): Promise<void
       Number(req.body.longitude)
     );
     sendSuccess(res, { attendance });
+  } catch (err: any) {
+    if (handleDispatchError(res, err)) return;
+    sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
+  }
+};
+
+export const postHubLocation = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const location = await pingHubLocation(
+      req.user!.userId,
+      Number(req.body.latitude),
+      Number(req.body.longitude)
+    );
+    sendSuccess(res, { location });
   } catch (err: any) {
     if (handleDispatchError(res, err)) return;
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
