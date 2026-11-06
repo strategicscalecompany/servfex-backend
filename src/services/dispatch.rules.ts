@@ -24,6 +24,7 @@ export const MAX_AUTO_ASSIGN_ATTEMPTS = 20;
 
 /** Statuses in which the assigned expert may see the customer's exact pinned location. */
 export const EXACT_LOCATION_STATUSES: BookingStatus[] = [
+  'ASSIGNED',
   'ACCEPTED',
   'ON_THE_WAY',
   'ARRIVED',
@@ -308,7 +309,9 @@ export function rankEligibleExperts(
 // Expert travel-status transitions
 // ---------------------------------------------------------------------------
 
+/** Start journey is allowed from ASSIGNED (no Accept step) or ACCEPTED. */
 const EXPERT_TRAVEL_TRANSITIONS: Partial<Record<BookingStatus, BookingStatus>> = {
+  ASSIGNED: 'ON_THE_WAY',
   ACCEPTED: 'ON_THE_WAY',
   ON_THE_WAY: 'ARRIVED',
 };

@@ -328,7 +328,6 @@ export interface OfferParams {
  */
 export async function offerToExpertInTx(tx: Tx, p: OfferParams): Promise<void> {
   const { booking, employee, now } = p;
-  const autoAccept = Boolean(p.autoAccept);
   const confirmedEta =
     typeof p.etaMinutes === 'number' && Number.isFinite(p.etaMinutes)
       ? Math.max(1, Math.min(Math.round(p.etaMinutes), 43_200))
@@ -345,7 +344,8 @@ export async function offerToExpertInTx(tx: Tx, p: OfferParams): Promise<void> {
     throw new DispatchError('EXPERT_BUSY', `${employee.userName} already has a job in this time slot`, 409);
   }
 
-  const nextStatus = autoAccept ? 'ACCEPTED' : 'ASSIGNED';
+  // Always land on ASSIGNED. Professional starts when ready (no Accept / no auto-accept).
+  const nextStatus = 'ASSIGNED' as const;
   const claimed = await tx.booking.updateMany({
     where: {
       id: booking.id,
@@ -356,16 +356,9 @@ export async function offerToExpertInTx(tx: Tx, p: OfferParams): Promise<void> {
       status: nextStatus,
       assignmentMethod: p.method,
       assignedAt: now,
-      ...(autoAccept
-        ? {
-            acceptedAt: now,
-            dispatchDueAt: null,
-            locationSharingEnabled: true,
-            ...(confirmedEta ? { etaMinutes: confirmedEta, etaConfirmedAt: now } : {}),
-          }
-        : {
-            dispatchDueAt: addSeconds(now, env.EXPERT_ACCEPT_WINDOW_SECONDS),
-          }),
+      dispatchDueAt: null,
+      locationSharingEnabled: true,
+      ...(confirmedEta ? { etaMinutes: confirmedEta, etaConfirmedAt: now } : {}),
       ...CLEAR_HELPER_FIELDS,
       ...(booking.vendorId ? { vendorId: booking.vendorId } : {}),
       ...(p.expertPayout ? { expertPayout: toMoney(p.expertPayout) } : {}),
@@ -386,11 +379,10 @@ export async function offerToExpertInTx(tx: Tx, p: OfferParams): Promise<void> {
       bookingId: booking.id,
       employeeId: employee.id,
       method: p.method,
-      status: autoAccept ? 'ACCEPTED' : 'OFFERED',
+      status: 'OFFERED',
       assignedBy: p.assignedBy,
       reason: p.reason,
       offeredAt: now,
-      ...(autoAccept ? { respondedAt: now } : {}),
     },
   });
   await tx.employeeProfile.update({ where: { id: employee.id }, data: { lastAssignedAt: now } });
@@ -412,9 +404,7 @@ async function notifyOffer(tx: Tx, p: OfferParams): Promise<void> {
   await tx.notification.create({
     data: {
       title: `New Job Assignment #${booking.bookingNumber}`,
-      message: p.autoAccept
-        ? `You have been assigned ${booking.service.name} from ${warehouse}.${etaLabel} Open the job and start when ready.`
-        : `You have been assigned ${booking.service.name} from ${warehouse}. Please accept or reject within ${Math.round(env.EXPERT_ACCEPT_WINDOW_SECONDS / 60)} minutes.`,
+      message: `You have been assigned ${booking.service.name} from ${warehouse}.${etaLabel} Open the job and start when you are ready.`,
       target: 'SPECIFIC_USER',
       targetUserId: employee.userId,
     },
@@ -852,8 +842,8 @@ export interface ManualAssignInput {
 
 /**
  * Provider picks a specific expert from ITS OWN warehouse. Loses cleanly (409 ASSIGNMENT_CONFLICT) when the
- * auto-assign worker or an expert acceptance got there first. Provider assign auto-accepts so the
- * professional can Start immediately (no separate Accept step).
+ * auto-assign worker got there first. Sets arrival ETA (hours/days) but leaves the job ASSIGNED —
+ * the professional starts when ready (no Accept step).
  */
 export async function assignExpertManually(input: ManualAssignInput) {
   const now = new Date();
@@ -916,7 +906,7 @@ export async function assignExpertManually(input: ManualAssignInput) {
       now,
       expertPayout: input.expertPayout ? new Prisma.Decimal(input.expertPayout.toFixed(2)) : null,
       dispatchNote: note ? `[Dispatch Note]: ${note}` : null,
-      autoAccept: true,
+      autoAccept: false,
       etaMinutes: confirmedEta,
     });
 
@@ -1308,7 +1298,7 @@ function distanceMetersPrecise(lat1: number, lon1: number, lat2: number, lon2: n
   return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-/** Strictly ACCEPTED -> ON_THE_WAY -> ARRIVED, only by the assigned expert. Repeats are idempotent. */
+/** ASSIGNED|ACCEPTED -> ON_THE_WAY -> ARRIVED, only by the assigned expert. Repeats are idempotent. */
 export async function advanceTravelStatus(
   userId: string,
   bookingId: string,
@@ -1390,10 +1380,29 @@ export async function advanceTravelStatus(
       }
     }
 
+    const startingFromAssigned = target === 'ON_THE_WAY' && booking.status === 'ASSIGNED';
     await tx.booking.update({
       where: { id: bookingId },
-      data: target === 'ON_THE_WAY' ? { status: target, onTheWayAt: now } : { status: target, arrivedAt: now },
+      data:
+        target === 'ON_THE_WAY'
+          ? {
+              status: target,
+              onTheWayAt: now,
+              ...(startingFromAssigned
+                ? {
+                    acceptedAt: now,
+                    locationSharingEnabled: true,
+                  }
+                : {}),
+            }
+          : { status: target, arrivedAt: now },
     });
+    if (startingFromAssigned) {
+      await tx.bookingAssignment.updateMany({
+        where: { bookingId, employeeId: expert.id, status: 'OFFERED' },
+        data: { status: 'ACCEPTED', respondedAt: now },
+      });
+    }
     await recordHistory(
       tx, bookingId, booking.status, target, userId, 'EMPLOYEE',
       target === 'ON_THE_WAY' ? `${expert.user.name} is on the way` : `${expert.user.name} has arrived`
