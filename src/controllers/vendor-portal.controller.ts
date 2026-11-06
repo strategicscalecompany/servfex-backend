@@ -200,6 +200,16 @@ export const assignEmployeeOrderSchema = z.object({
   payout: z.number().positive().optional(),
   note: z.string().optional(),
   instructions: z.string().optional(),
+  // Provider sets arrival promise at assign time (hours/days → minutes). Required when assigning a WP.
+  etaMinutes: z.preprocess(
+    (val) => (val === '' || val === null || val === undefined ? undefined : val),
+    z.coerce
+      .number({ invalid_type_error: 'ETA must be a number of minutes' })
+      .int()
+      .min(60, 'ETA must be at least 1 hour')
+      .max(43_200, 'ETA cannot exceed 30 days')
+      .optional()
+  ),
 });
 
 const expertKindSchema = z
@@ -2072,7 +2082,7 @@ export const assignEmployeeToOrder = async (req: Request, res: Response): Promis
   try {
     const userId = req.user!.userId;
     const id = req.params.id as string;
-    const { employeeId, expertPayout, payout, note, instructions } = req.body;
+    const { employeeId, expertPayout, payout, note, instructions, etaMinutes } = req.body;
 
     const actor = await resolvePortalActor(userId);
     const vendorId = actor.vendorId;
@@ -2138,6 +2148,19 @@ export const assignEmployeeToOrder = async (req: Request, res: Response): Promis
     const resolvedInstructions = (instructions || note || '').trim();
 
     if (employeeId) {
+      const resolvedEta =
+        typeof etaMinutes === 'number' && Number.isFinite(etaMinutes)
+          ? Math.max(60, Math.min(Math.round(etaMinutes), 43_200))
+          : null;
+      if (resolvedEta == null) {
+        sendError(
+          res,
+          'ETA_REQUIRED',
+          'Set how long until the professional should arrive (hours or days) before assigning',
+          400
+        );
+        return;
+      }
       const updated = await assignExpertManually({
         bookingId: id,
         vendorId: vendorProfile.id,
@@ -2145,6 +2168,7 @@ export const assignEmployeeToOrder = async (req: Request, res: Response): Promis
         employeeIdOrUserId: employeeId,
         expertPayout: resolvedPayout ? Number(resolvedPayout) : null,
         note: resolvedInstructions || null,
+        etaMinutes: resolvedEta,
       });
       sendSuccess(res, { order: updated }, 200);
       return;

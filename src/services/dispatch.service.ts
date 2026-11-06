@@ -315,6 +315,9 @@ export interface OfferParams {
   now: Date;
   expertPayout?: Prisma.Decimal | null;
   dispatchNote?: string | null;
+  /** Provider assign can skip the professional Accept step and land on ACCEPTED + Start. */
+  autoAccept?: boolean;
+  etaMinutes?: number | null;
 }
 
 /**
@@ -325,6 +328,11 @@ export interface OfferParams {
  */
 export async function offerToExpertInTx(tx: Tx, p: OfferParams): Promise<void> {
   const { booking, employee, now } = p;
+  const autoAccept = Boolean(p.autoAccept);
+  const confirmedEta =
+    typeof p.etaMinutes === 'number' && Number.isFinite(p.etaMinutes)
+      ? Math.max(1, Math.min(Math.round(p.etaMinutes), 43_200))
+      : null;
 
   await lockEmployee(tx, employee.id);
 
@@ -337,6 +345,7 @@ export async function offerToExpertInTx(tx: Tx, p: OfferParams): Promise<void> {
     throw new DispatchError('EXPERT_BUSY', `${employee.userName} already has a job in this time slot`, 409);
   }
 
+  const nextStatus = autoAccept ? 'ACCEPTED' : 'ASSIGNED';
   const claimed = await tx.booking.updateMany({
     where: {
       id: booking.id,
@@ -344,10 +353,19 @@ export async function offerToExpertInTx(tx: Tx, p: OfferParams): Promise<void> {
     },
     data: {
       employeeId: employee.id,
-      status: 'ASSIGNED',
+      status: nextStatus,
       assignmentMethod: p.method,
       assignedAt: now,
-      dispatchDueAt: addSeconds(now, env.EXPERT_ACCEPT_WINDOW_SECONDS),
+      ...(autoAccept
+        ? {
+            acceptedAt: now,
+            dispatchDueAt: null,
+            locationSharingEnabled: true,
+            ...(confirmedEta ? { etaMinutes: confirmedEta, etaConfirmedAt: now } : {}),
+          }
+        : {
+            dispatchDueAt: addSeconds(now, env.EXPERT_ACCEPT_WINDOW_SECONDS),
+          }),
       ...CLEAR_HELPER_FIELDS,
       ...(booking.vendorId ? { vendorId: booking.vendorId } : {}),
       ...(p.expertPayout ? { expertPayout: toMoney(p.expertPayout) } : {}),
@@ -368,14 +386,15 @@ export async function offerToExpertInTx(tx: Tx, p: OfferParams): Promise<void> {
       bookingId: booking.id,
       employeeId: employee.id,
       method: p.method,
-      status: 'OFFERED',
+      status: autoAccept ? 'ACCEPTED' : 'OFFERED',
       assignedBy: p.assignedBy,
       reason: p.reason,
       offeredAt: now,
+      ...(autoAccept ? { respondedAt: now } : {}),
     },
   });
   await tx.employeeProfile.update({ where: { id: employee.id }, data: { lastAssignedAt: now } });
-  await recordHistory(tx, booking.id, booking.status, 'ASSIGNED', p.assignedBy, p.changedByRole, p.reason);
+  await recordHistory(tx, booking.id, booking.status, nextStatus, p.assignedBy, p.changedByRole, p.reason);
 
   await notifyOffer(tx, p);
 }
@@ -383,11 +402,19 @@ export async function offerToExpertInTx(tx: Tx, p: OfferParams): Promise<void> {
 async function notifyOffer(tx: Tx, p: OfferParams): Promise<void> {
   const { booking, employee } = p;
   const warehouse = booking.vendor?.warehouseName || booking.vendor?.companyName || 'your warehouse';
+  const etaLabel =
+    typeof p.etaMinutes === 'number' && p.etaMinutes >= 60
+      ? p.etaMinutes >= 1440
+        ? ` Arrive in about ${Math.round(p.etaMinutes / 1440)} day(s).`
+        : ` Arrive in about ${Math.round(p.etaMinutes / 60)} hour(s).`
+      : '';
 
   await tx.notification.create({
     data: {
       title: `New Job Assignment #${booking.bookingNumber}`,
-      message: `You have been assigned ${booking.service.name} from ${warehouse}. Please accept or reject within ${Math.round(env.EXPERT_ACCEPT_WINDOW_SECONDS / 60)} minutes.`,
+      message: p.autoAccept
+        ? `You have been assigned ${booking.service.name} from ${warehouse}.${etaLabel} Open the job and start when ready.`
+        : `You have been assigned ${booking.service.name} from ${warehouse}. Please accept or reject within ${Math.round(env.EXPERT_ACCEPT_WINDOW_SECONDS / 60)} minutes.`,
       target: 'SPECIFIC_USER',
       targetUserId: employee.userId,
     },
@@ -395,7 +422,7 @@ async function notifyOffer(tx: Tx, p: OfferParams): Promise<void> {
   await tx.notification.create({
     data: {
       title: `Working Professional assigned #${booking.bookingNumber}`,
-      message: `${employee.userName} has been assigned to your ${booking.service.name} booking. You can now see their details in the app.`,
+      message: `${employee.userName} has been assigned to your ${booking.service.name} booking.${etaLabel} You can now see their details in the app.`,
       target: 'SPECIFIC_USER',
       targetUserId: booking.customer.userId,
     },
@@ -819,16 +846,23 @@ export interface ManualAssignInput {
   employeeIdOrUserId: string;
   expertPayout?: number | null;
   note?: string | null;
+  /** Arrival promise set by the provider (hours/days → minutes). Auto-accepts the expert. */
+  etaMinutes?: number | null;
 }
 
 /**
  * Provider picks a specific expert from ITS OWN warehouse. Loses cleanly (409 ASSIGNMENT_CONFLICT) when the
- * auto-assign worker or an expert acceptance got there first. Invalidates the pending fallback because the
- * booking leaves PENDING and `dispatchDueAt` moves to the expert-accept deadline.
+ * auto-assign worker or an expert acceptance got there first. Provider assign auto-accepts so the
+ * professional can Start immediately (no separate Accept step).
  */
 export async function assignExpertManually(input: ManualAssignInput) {
   const now = new Date();
   const effects: Effects = { refreshBookingId: input.bookingId, reason: 'EXPERT_ASSIGNED' };
+  // Provider UI must send ETA; desk/immediate assigns default to 2 hours.
+  const confirmedEta =
+    typeof input.etaMinutes === 'number' && Number.isFinite(input.etaMinutes)
+      ? Math.max(60, Math.min(Math.round(input.etaMinutes), 43_200))
+      : 120;
 
   const updated = await prisma.$transaction(async (tx) => {
     await lockBooking(tx, input.bookingId);
@@ -882,6 +916,8 @@ export async function assignExpertManually(input: ManualAssignInput) {
       now,
       expertPayout: input.expertPayout ? new Prisma.Decimal(input.expertPayout.toFixed(2)) : null,
       dispatchNote: note ? `[Dispatch Note]: ${note}` : null,
+      autoAccept: true,
+      etaMinutes: confirmedEta,
     });
 
     effects.offerToUserId = employee.userId;
@@ -935,13 +971,6 @@ export async function acceptAssignment(
 
   const result = await prisma.$transaction(async (tx) => {
     const expert = await loadExpertContext(tx, userId);
-    if (!isValidUpiId(normalizeUpiId(expert.upiId))) {
-      throw new DispatchError(
-        'UPI_REQUIRED',
-        'Add your UPI ID before accepting orders so you can receive online payments',
-        400
-      );
-    }
     await lockBooking(tx, bookingId);
     const booking = await readBookingForDispatch(tx, bookingId);
     if (!booking) throw new DispatchError('NOT_FOUND', 'Order not found', 404);
@@ -1306,6 +1335,15 @@ export async function advanceTravelStatus(
         'INVALID_TRANSITION',
         `Cannot move booking from ${booking.status} to ${target}`,
         409
+      );
+    }
+
+    // UPI is required before starting the journey (Accept step removed for professionals).
+    if (target === 'ON_THE_WAY' && !isValidUpiId(normalizeUpiId(expert.upiId))) {
+      throw new DispatchError(
+        'UPI_REQUIRED',
+        'Add your UPI ID before starting the journey so you can receive online payments',
+        400
       );
     }
 
