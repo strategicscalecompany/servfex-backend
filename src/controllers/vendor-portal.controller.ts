@@ -2321,12 +2321,19 @@ export const createVendorEmployee = async (req: Request, res: Response): Promise
     const { name, email, phone, specialization, password, expertKind } = req.body;
     const resolvedExpertKind = normalizeExpertKind(expertKind);
 
-    const vendorProfile = await prisma.vendorProfile.findUnique({
-      where: { userId },
-    });
+    const actor = await resolvePortalActor(userId);
+    if (!actor.vendorId || (!actor.isVendor && !actor.isManager)) {
+      sendError(res, 'FORBIDDEN', 'Only hub partner or operations manager can onboard professionals', 403);
+      return;
+    }
+
+    const vendorProfile =
+      actor.user?.vendorProfile ||
+      actor.user?.managerProfile?.vendor ||
+      (await prisma.vendorProfile.findUnique({ where: { id: actor.vendorId } }));
 
     if (!vendorProfile) {
-      sendError(res, 'NOT_FOUND', 'Vendor profile not found', 404);
+      sendError(res, 'NOT_FOUND', 'Hub profile not found', 404);
       return;
     }
 
@@ -2344,6 +2351,9 @@ export const createVendorEmployee = async (req: Request, res: Response): Promise
 
     const assignedPassword = password || `Expert@${Math.floor(1000 + Math.random() * 9000)}`;
     const passwordHash = await hashPassword(assignedPassword);
+    const hubCompanyName =
+      ('companyName' in vendorProfile && vendorProfile.companyName) || 'ServFex Hub';
+    const hubLocation = ('location' in vendorProfile && vendorProfile.location) || '';
 
     const employee = await prisma.$transaction(async (tx) => {
       const user = await tx.user.create({
@@ -2357,7 +2367,7 @@ export const createVendorEmployee = async (req: Request, res: Response): Promise
           isVerified: true,
           employeeProfile: {
             create: {
-              vendorId: vendorProfile.id,
+              vendorId: actor.vendorId!,
               specialization,
               expertKind: resolvedExpertKind,
               rating: 5.0,
@@ -2378,9 +2388,9 @@ export const createVendorEmployee = async (req: Request, res: Response): Promise
     sendExpertWelcomeEmail({
       toEmail: cleanEmail,
       name,
-      providerName: vendorProfile.companyName,
-      providerCompany: vendorProfile.companyName,
-      location: vendorProfile.location,
+      providerName: hubCompanyName,
+      providerCompany: hubCompanyName,
+      location: hubLocation,
       specialization,
       phone,
       password: assignedPassword,

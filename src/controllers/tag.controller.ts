@@ -154,6 +154,116 @@ export const adminDeactivateTag = async (req: Request, res: Response): Promise<v
   }
 };
 
+export const syncCategoryTagsSchema = z.object({
+  tagIds: z.array(z.string().uuid()).default([]),
+  create: z
+    .array(
+      z.object({
+        name: z.string().min(2).max(80),
+        description: z.string().max(500).optional(),
+      })
+    )
+    .optional()
+    .default([]),
+});
+
+/** Super Admin: set ADMIN_SPECIALIST tags linked to one category (from category modal). */
+export const adminSyncCategoryTags = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const categoryId = req.params.id as string;
+    const { tagIds, create } = req.body as z.infer<typeof syncCategoryTagsSchema>;
+
+    const category = await prisma.serviceCategory.findFirst({
+      where: { id: categoryId, deletedAt: null },
+      select: { id: true },
+    });
+    if (!category) {
+      sendError(res, 'NOT_FOUND', 'Category not found', 404);
+      return;
+    }
+
+    if (tagIds.length > 0) {
+      const existing = await prisma.serviceTag.findMany({
+        where: {
+          id: { in: tagIds },
+          kind: TagKind.ADMIN_SPECIALIST,
+          vendorId: null,
+        },
+        select: { id: true },
+      });
+      if (existing.length !== tagIds.length) {
+        sendError(res, 'BAD_REQUEST', 'One or more specialist tags are invalid', 400);
+        return;
+      }
+    }
+
+    const createdTagIds: string[] = [];
+    for (const item of create || []) {
+      const name = item.name.trim();
+      const slug = slugify(name);
+      const conflict = await prisma.serviceTag.findFirst({
+        where: { slug, kind: TagKind.ADMIN_SPECIALIST, vendorId: null },
+      });
+      if (conflict) {
+        // Reuse existing specialist tag and ensure this category is linked.
+        createdTagIds.push(conflict.id);
+        continue;
+      }
+      const tag = await prisma.serviceTag.create({
+        data: {
+          name,
+          slug,
+          kind: TagKind.ADMIN_SPECIALIST,
+          vendorId: null,
+          description: item.description || null,
+          createdBy: req.user!.userId,
+          categories: { create: [{ categoryId }] },
+        },
+      });
+      createdTagIds.push(tag.id);
+    }
+
+    const desired = Array.from(new Set([...tagIds, ...createdTagIds]));
+
+    const currentLinks = await prisma.tagCategory.findMany({
+      where: {
+        categoryId,
+        tag: { kind: TagKind.ADMIN_SPECIALIST },
+      },
+      select: { id: true, tagId: true },
+    });
+    const currentTagIds = new Set(currentLinks.map((l) => l.tagId));
+    const toRemove = currentLinks.filter((l) => !desired.includes(l.tagId)).map((l) => l.id);
+    const toAdd = desired.filter((id) => !currentTagIds.has(id));
+
+    await prisma.$transaction([
+      ...(toRemove.length
+        ? [prisma.tagCategory.deleteMany({ where: { id: { in: toRemove } } })]
+        : []),
+      ...(toAdd.length
+        ? [
+            prisma.tagCategory.createMany({
+              data: toAdd.map((tagId) => ({ tagId, categoryId })),
+            }),
+          ]
+        : []),
+    ]);
+
+    const tags = await prisma.serviceTag.findMany({
+      where: {
+        kind: TagKind.ADMIN_SPECIALIST,
+        categories: { some: { categoryId } },
+      },
+      include: { categories: { include: { category: { select: { id: true, name: true } } } } },
+      orderBy: { name: 'asc' },
+    });
+    sendSuccess(res, tags.map(serializeTag));
+  } catch (err) {
+    console.error(err);
+    sendError(res, 'INTERNAL_ERROR', 'Failed to sync category tags', 500);
+  }
+};
+
 // ---- Vendor / HOM helpers expect vendorId resolved by caller ----
 
 export async function listTagsForHub(vendorId: string) {

@@ -231,8 +231,10 @@ import {
   adminCreateTag,
   adminUpdateTagCategories,
   adminDeactivateTag,
+  adminSyncCategoryTags,
   createAdminTagSchema,
   updateTagCategoriesSchema,
+  syncCategoryTagsSchema,
 } from '../controllers/tag.controller';
 
 router.get('/tags', adminListTags);
@@ -247,6 +249,7 @@ router.get('/categories', getCategories);
 router.post('/categories', validate(createCategorySchema), createCategory);
 router.patch('/categories/reorder', validate(reorderCategoriesSchema), reorderCategories);
 router.patch('/categories/:id', validate(updateCategorySchema), updateCategory);
+router.put('/categories/:id/tags', validate(syncCategoryTagsSchema), adminSyncCategoryTags);
 router.delete('/categories/:id', softDeleteCategory);
 
 // ==========================================
