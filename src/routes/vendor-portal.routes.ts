@@ -29,6 +29,7 @@ import {
   assignEmployeeToOrder,
   createVendorInquiry,
   getVendorEmployees,
+  getEmployeeDayBoard,
   createVendorEmployee,
   updateVendorEmployee,
   deleteVendorEmployee,
@@ -67,6 +68,8 @@ import {
   listEscalations,
   locationPingSchema,
   pingOrderLocation,
+  postHomForceCheckIn,
+  postHomForceCheckOut,
   postHubCheckIn,
   postHubCheckOut,
   postHubLocation,
@@ -154,6 +157,9 @@ router.get('/employees', getVendorEmployees);
 router.post('/employees', validate(createEmployeeSchema), createVendorEmployee);
 router.patch('/employees/:id', validate(updateEmployeeSchema), updateVendorEmployee);
 router.delete('/employees/:id', deleteVendorEmployee);
+router.get('/employees/:id/day-board', getEmployeeDayBoard);
+router.post('/employees/:id/force-check-in', postHomForceCheckIn);
+router.post('/employees/:id/force-check-out', postHomForceCheckOut);
 
 // Sales Manager visits (temporary testing workflow)
 router.get('/visits', listSalesVisits);

@@ -23,6 +23,7 @@ import {
 import { generateStartOtp, stripStartOtp } from '../utils/start-otp';
 import {
   beginWorkAfterBeforePhotos,
+  computeShiftTiming,
   setLocationSharing,
   verifyStartOtpForExpert,
 } from '../services/execution.service';
@@ -1091,31 +1092,56 @@ export const getManagerDashboard = async (req: Request, res: Response): Promise<
     const since = new Date();
     since.setDate(since.getDate() - 30);
 
-    const [employeeCount, servicesCount, bookings, openBookingsCount, escalations] = await Promise.all([
-      prisma.employeeProfile.count({
-        where: { vendorId: { in: hubIds }, user: { deletedAt: null } },
-      }),
-      prisma.vendorService.count({
-        where: { vendorId: { in: hubIds }, isActive: true, service: { isActive: true, deletedAt: null } },
-      }),
-      prisma.booking.findMany({
-        where: { vendorId: { in: hubIds }, createdAt: { gte: since } },
-        select: { status: true, totalAmount: true, paymentStatus: true },
-      }),
-      prisma.booking.count({
-        where: {
-          vendorId: { in: hubIds },
-          status: { notIn: ['COMPLETED', 'CANCELLED'] },
-        },
-      }),
-      prisma.escalationTicket.findMany({
-        where: {
-          createdAt: { gte: since },
-          booking: { vendorId: { in: hubIds } },
-        },
-        select: { status: true },
-      }),
-    ]);
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+
+    const [employeeCount, servicesCount, bookings, openBookingsCount, escalations, crewToday] =
+      await Promise.all([
+        prisma.employeeProfile.count({
+          where: { vendorId: { in: hubIds }, user: { deletedAt: null } },
+        }),
+        prisma.vendorService.count({
+          where: { vendorId: { in: hubIds }, isActive: true, service: { isActive: true, deletedAt: null } },
+        }),
+        prisma.booking.findMany({
+          where: { vendorId: { in: hubIds }, createdAt: { gte: since } },
+          select: { status: true, totalAmount: true, paymentStatus: true },
+        }),
+        prisma.booking.count({
+          where: {
+            vendorId: { in: hubIds },
+            status: { notIn: ['COMPLETED', 'CANCELLED'] },
+          },
+        }),
+        prisma.escalationTicket.findMany({
+          where: {
+            createdAt: { gte: since },
+            booking: { vendorId: { in: hubIds } },
+          },
+          select: { status: true },
+        }),
+        prisma.employeeProfile.findMany({
+          where: {
+            vendorId: { in: hubIds },
+            user: { deletedAt: null },
+            OR: [
+              { hubCheckedInAt: { not: null } },
+              { lastHubCheckInAt: { gte: startOfToday } },
+              { lastHubCheckOutAt: { gte: startOfToday } },
+            ],
+          },
+          select: {
+            id: true,
+            hubCheckedInAt: true,
+            hubCheckedOutAt: true,
+            lastHubCheckInAt: true,
+            lastHubCheckOutAt: true,
+            completedJobs: true,
+            user: { select: { name: true, phone: true } },
+          },
+          orderBy: { hubCheckedInAt: 'desc' },
+        }),
+      ]);
 
     const thirtyDaysJobs = bookings.length;
     const completedOrPaid = bookings.filter(
@@ -1131,6 +1157,63 @@ export const getManagerDashboard = async (req: Request, res: Response): Promise<
       complaintsCount === 0
         ? 100
         : Number(asDecimal(resolved).div(complaintsCount).times(100).toFixed(1));
+
+    const crewIds = crewToday.map((c) => c.id);
+    const completedTodayByEmployee = new Map<string, number>();
+    if (crewIds.length > 0) {
+      const todayKey = startOfToday.toISOString().slice(0, 10);
+      const completedToday = await prisma.booking.findMany({
+        where: {
+          vendorId: { in: hubIds },
+          status: 'COMPLETED',
+          scheduledDate: todayKey,
+          OR: [{ employeeId: { in: crewIds } }, { helperEmployeeId: { in: crewIds } }],
+        },
+        select: { employeeId: true, helperEmployeeId: true },
+      });
+      for (const b of completedToday) {
+        if (b.employeeId && crewIds.includes(b.employeeId)) {
+          completedTodayByEmployee.set(
+            b.employeeId,
+            (completedTodayByEmployee.get(b.employeeId) || 0) + 1
+          );
+        }
+        if (
+          b.helperEmployeeId &&
+          crewIds.includes(b.helperEmployeeId) &&
+          b.helperEmployeeId !== b.employeeId
+        ) {
+          completedTodayByEmployee.set(
+            b.helperEmployeeId,
+            (completedTodayByEmployee.get(b.helperEmployeeId) || 0) + 1
+          );
+        }
+      }
+    }
+
+    const activeToday = crewToday.map((emp) => {
+      const checkedIn = Boolean(emp.hubCheckedInAt);
+      const timing = computeShiftTiming(emp.hubCheckedInAt || emp.lastHubCheckInAt);
+      let workedHours = timing.workedHours;
+      if (!checkedIn && emp.lastHubCheckInAt && emp.lastHubCheckOutAt) {
+        const inMs = new Date(emp.lastHubCheckInAt).getTime();
+        const outMs = new Date(emp.lastHubCheckOutAt).getTime();
+        if (outMs > inMs && new Date(emp.lastHubCheckInAt) >= startOfToday) {
+          workedHours = Math.round(((outMs - inMs) / (1000 * 60 * 60)) * 10) / 10;
+        }
+      }
+      return {
+        employeeId: emp.id,
+        name: emp.user.name,
+        phone: emp.user.phone || '',
+        checkedIn,
+        checkedOut: !checkedIn && Boolean(emp.lastHubCheckOutAt && emp.lastHubCheckOutAt >= startOfToday),
+        workedHours,
+        completedOrdersToday: completedTodayByEmployee.get(emp.id) || 0,
+        hubCheckedInAt: emp.hubCheckedInAt,
+        lastHubCheckOutAt: emp.lastHubCheckOutAt,
+      };
+    });
 
     sendSuccess(res, {
       role: 'OPERATIONS_MANAGER',
@@ -1153,6 +1236,8 @@ export const getManagerDashboard = async (req: Request, res: Response): Promise<
         complaintsCount,
         unresolvedComplaints,
         slaRate,
+        activeTodayCount: activeToday.filter((a) => a.checkedIn).length,
+        activeToday,
       },
     });
   } catch (err: any) {
@@ -2496,22 +2581,150 @@ export const getVendorEmployees = async (req: Request, res: Response): Promise<v
         portalLabel: 'Hub Operation Manager',
       }));
 
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+
     sendSuccess(
       res,
       {
-        employees: employees.map((emp) => ({
-          ...emp,
-          checkedIn: Boolean(emp.hubCheckedInAt),
-          assignable: Boolean(emp.hubCheckedInAt) && emp.isAvailable !== false && emp.acceptingRequests !== false,
-          isLateWorker: Boolean(emp.hubCheckedInAt) && Boolean(emp.lateWorkerFlaggedAt),
-          lastLatitude: emp.lastLatitude ?? null,
-          lastLongitude: emp.lastLongitude ?? null,
-          lastLocationAt: emp.lastLocationAt ?? null,
-        })),
+        employees: employees.map((emp) => {
+          const checkedIn = Boolean(emp.hubCheckedInAt);
+          const checkedOutToday =
+            !checkedIn &&
+            Boolean(emp.lastHubCheckOutAt && new Date(emp.lastHubCheckOutAt) >= startOfToday);
+          const timing = computeShiftTiming(emp.hubCheckedInAt || emp.lastHubCheckInAt);
+          return {
+            ...emp,
+            checkedIn,
+            checkedOutToday,
+            workedHours: timing.workedHours,
+            assignable:
+              checkedIn && emp.isAvailable !== false && emp.acceptingRequests !== false,
+            isLateWorker: checkedIn && Boolean(emp.lateWorkerFlaggedAt),
+            lastLatitude: emp.lastLatitude ?? null,
+            lastLongitude: emp.lastLongitude ?? null,
+            lastLocationAt: emp.lastLocationAt ?? null,
+          };
+        }),
         houseOfMasters,
       },
       200
     );
+  } catch (err: any) {
+    sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
+  }
+};
+
+/** HOM professional detail: active job + today/tomorrow assignments + live GPS. */
+export const getEmployeeDayBoard = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const actor = await resolvePortalActor(req.user!.userId);
+    if (!actor.isManager && !actor.isVendor) {
+      sendError(res, 'FORBIDDEN', 'Only hub partner or operations manager can open the day board', 403);
+      return;
+    }
+
+    const employeeId = String(req.params.id || '').trim();
+    const hubs = await assignedHubsForActor(actor);
+    const hubIds = hubs.map((h) => h.id);
+    if (hubIds.length === 0) {
+      sendError(res, 'HUB_NOT_ASSIGNED', 'No hub assigned', 403);
+      return;
+    }
+
+    const emp = await prisma.employeeProfile.findFirst({
+      where: { id: employeeId, vendorId: { in: hubIds } },
+      include: {
+        user: { select: { id: true, name: true, phone: true, email: true } },
+        vendor: { select: { id: true, companyName: true, warehouseName: true } },
+      },
+    });
+    if (!emp) {
+      sendError(res, 'NOT_FOUND', 'Professional not found on your hubs', 404);
+      return;
+    }
+
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+    const todayKey = startOfToday.toISOString().slice(0, 10);
+    const tomorrowDate = new Date(startOfToday);
+    tomorrowDate.setDate(tomorrowDate.getDate() + 1);
+    const tomorrowKey = tomorrowDate.toISOString().slice(0, 10);
+
+    const dayStatuses = [
+      'PENDING',
+      'ASSIGNED',
+      'ACCEPTED',
+      'ON_THE_WAY',
+      'ARRIVED',
+      'IN_PROGRESS',
+      'AWAITING_CUSTOMER_CONFIRMATION',
+      'AWAITING_PAYMENT',
+      'COMPLETED',
+    ] as const;
+
+    const bookings = await prisma.booking.findMany({
+      where: {
+        OR: [{ employeeId: emp.id }, { helperEmployeeId: emp.id }],
+        scheduledDate: { in: [todayKey, tomorrowKey] },
+        status: { in: [...dayStatuses] },
+      },
+      include: {
+        service: { select: { name: true } },
+        address: { select: { addressLine1: true, city: true } },
+        customer: { include: { user: { select: { name: true, phone: true } } } },
+      },
+      orderBy: [{ scheduledDate: 'asc' }, { createdAt: 'asc' }],
+    });
+
+    const mapOrder = (b: (typeof bookings)[number]) => ({
+      id: b.id,
+      bookingNumber: b.bookingNumber,
+      status: b.status,
+      scheduledDate: b.scheduledDate,
+      scheduledTimeSlot: b.scheduledTimeSlot,
+      serviceName: b.service?.name || 'Service',
+      addressLine1: b.address?.addressLine1 || '',
+      city: b.address?.city || '',
+      customerName: b.customer?.user?.name || '',
+      customerPhone: b.customer?.user?.phone || '',
+      totalAmount: b.totalAmount,
+    });
+
+    const today = bookings.filter((b) => b.scheduledDate === todayKey).map(mapOrder);
+    const tomorrow = bookings.filter((b) => b.scheduledDate === tomorrowKey).map(mapOrder);
+    const activeRaw = bookings.find((b) =>
+      ['ON_THE_WAY', 'ARRIVED', 'IN_PROGRESS', 'AWAITING_CUSTOMER_CONFIRMATION'].includes(b.status)
+    );
+
+    const timing = computeShiftTiming(emp.hubCheckedInAt);
+    const checkedIn = Boolean(emp.hubCheckedInAt);
+    const checkedOutToday =
+      !checkedIn && Boolean(emp.lastHubCheckOutAt && new Date(emp.lastHubCheckOutAt) >= startOfToday);
+
+    sendSuccess(res, {
+      employee: {
+        id: emp.id,
+        userId: emp.userId,
+        name: emp.user.name,
+        phone: emp.user.phone || emp.phone || '',
+        email: emp.user.email || '',
+        specialization: emp.specialization,
+        hubName: emp.vendor.warehouseName || emp.vendor.companyName,
+        checkedIn,
+        checkedOutToday,
+        isLateWorker: checkedIn && Boolean(emp.lateWorkerFlaggedAt),
+        workedHours: timing.workedHours,
+        lastLatitude: emp.lastLatitude,
+        lastLongitude: emp.lastLongitude,
+        lastLocationAt: emp.lastLocationAt,
+        hubCheckedInAt: emp.hubCheckedInAt,
+        lastHubCheckOutAt: emp.lastHubCheckOutAt,
+      },
+      activeOrder: activeRaw ? mapOrder(activeRaw) : null,
+      todayOrders: today,
+      tomorrowOrders: tomorrow,
+    });
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
   }

@@ -8,6 +8,8 @@ import {
   confirmUpiCollection,
   getHubAttendanceStatus,
   getTrackingSnapshot,
+  homForceHubCheckIn,
+  homForceHubCheckOut,
   hubCheckIn,
   hubCheckOut,
   pingHubLocation,
@@ -225,6 +227,28 @@ export const postHubLocation = async (req: Request, res: Response): Promise<void
       Number(req.body.longitude)
     );
     sendSuccess(res, { location });
+  } catch (err: any) {
+    if (handleDispatchError(res, err)) return;
+    sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
+  }
+};
+
+/** HOM force check-in after 09:30 — professional must be at hub (recent GPS). */
+export const postHomForceCheckIn = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const attendance = await homForceHubCheckIn(req.user!.userId, paramId(req));
+    sendSuccess(res, { attendance });
+  } catch (err: any) {
+    if (handleDispatchError(res, err)) return;
+    sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
+  }
+};
+
+/** HOM force check-out — no hub GPS required. */
+export const postHomForceCheckOut = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const attendance = await homForceHubCheckOut(req.user!.userId, paramId(req));
+    sendSuccess(res, { attendance });
   } catch (err: any) {
     if (handleDispatchError(res, err)) return;
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);

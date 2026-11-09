@@ -912,7 +912,7 @@ export async function hubCheckOut(userId: string, latitude: number, longitude: n
   return getHubAttendanceStatus(userId);
 }
 
-/** Periodic GPS ping while the professional is hub-checked-in (vendor live map). */
+/** Periodic GPS ping — allowed before check-in so HOM can force check-in when the pro is at the hub. */
 export async function pingHubLocation(userId: string, latitude: number, longitude: number) {
   if (!isValidCoordinate(latitude, longitude)) {
     throw new DispatchError('BAD_REQUEST', 'Valid GPS coordinates are required', 400);
@@ -923,9 +923,6 @@ export async function pingHubLocation(userId: string, latitude: number, longitud
   });
   if (!profile) {
     throw new DispatchError('FORBIDDEN', 'Only Working Professionals and Sales Managers can ping hub location', 403);
-  }
-  if (!profile.hubCheckedInAt) {
-    throw new DispatchError('NOT_CHECKED_IN', 'You must be checked in at the hub to share location', 409);
   }
   const now = new Date();
   await prisma.employeeProfile.update({
@@ -938,8 +935,220 @@ export async function pingHubLocation(userId: string, latitude: number, longitud
   });
   return {
     ok: true,
+    checkedIn: Boolean(profile.hubCheckedInAt),
     lastLatitude: latitude,
     lastLongitude: longitude,
     lastLocationAt: now,
   };
+}
+
+const FORCE_CHECKIN_LOCATION_MAX_AGE_MS = 15 * 60 * 1000;
+
+/**
+ * HOM force check-in after 09:30 — only when the professional's recent GPS is inside the hub radius.
+ */
+export async function homForceHubCheckIn(actorUserId: string, employeeProfileId: string) {
+  const actor = await prisma.user.findUnique({
+    where: { id: actorUserId },
+    select: {
+      role: true,
+      managerProfile: { select: { vendorId: true, zone: true } },
+    },
+  });
+  if (!actor || actor.role !== 'OPERATIONS_MANAGER') {
+    throw new DispatchError('FORBIDDEN', 'Only Hub Operation Managers can force check-in', 403);
+  }
+
+  const now = new Date();
+  const gate = new Date(now);
+  gate.setHours(CHECK_IN_START_HOUR, CHECK_IN_GRACE_MINUTES, 0, 0);
+  if (now < gate) {
+    throw new DispatchError(
+      'TOO_EARLY',
+      'Force check-in is only available after 09:30. Ask the professional to check in themselves before then.',
+      409
+    );
+  }
+
+  const profile = await prisma.employeeProfile.findUnique({
+    where: { id: employeeProfileId },
+    select: {
+      id: true,
+      userId: true,
+      vendorId: true,
+      workRadiusMeters: true,
+      hubCheckedInAt: true,
+      lastLatitude: true,
+      lastLongitude: true,
+      lastLocationAt: true,
+      vendor: { select: { latitude: true, longitude: true, companyName: true } },
+      user: { select: { name: true } },
+    },
+  });
+  if (!profile) throw new DispatchError('NOT_FOUND', 'Professional not found', 404);
+
+  if (profile.hubCheckedInAt) {
+    return getHubAttendanceStatus(profile.userId);
+  }
+
+  await assertHomOwnsEmployeeHub(actor.managerProfile, profile.vendorId);
+
+  const hubLat = profile.vendor.latitude;
+  const hubLng = profile.vendor.longitude;
+  if (!isValidCoordinate(hubLat, hubLng)) {
+    throw new DispatchError('HUB_LOCATION_MISSING', 'Hub GPS is not set. Ask Super Admin / Development Manager to pin the hub.', 409);
+  }
+  if (!isValidCoordinate(profile.lastLatitude, profile.lastLongitude) || !profile.lastLocationAt) {
+    throw new DispatchError(
+      'PROFESSIONAL_LOCATION_MISSING',
+      `${profile.user.name} must open the Partner app near the hub so GPS updates, then retry force check-in.`,
+      409
+    );
+  }
+  const ageMs = now.getTime() - new Date(profile.lastLocationAt).getTime();
+  if (ageMs > FORCE_CHECKIN_LOCATION_MAX_AGE_MS) {
+    throw new DispatchError(
+      'PROFESSIONAL_LOCATION_STALE',
+      `${profile.user.name}'s GPS is older than 15 minutes. Ask them to open the Partner app at the hub, then retry.`,
+      409
+    );
+  }
+
+  const radiusM = profile.workRadiusMeters > 0 ? profile.workRadiusMeters : DEFAULT_WORK_RADIUS_METERS;
+  const distanceM = metersBetween(
+    profile.lastLatitude as number,
+    profile.lastLongitude as number,
+    hubLat as number,
+    hubLng as number
+  );
+  if (distanceM > radiusM) {
+    throw new DispatchError(
+      'OUTSIDE_HUB_RADIUS',
+      `Force check-in blocked: ${profile.user.name} is about ${Math.round(distanceM)} m from ${profile.vendor.companyName} (need within ${Math.round(radiusM)} m).`,
+      409
+    );
+  }
+
+  await prisma.employeeProfile.update({
+    where: { id: profile.id },
+    data: {
+      hubCheckedInAt: now,
+      hubCheckedOutAt: null,
+      lastHubCheckInAt: now,
+      shiftOverdueNotifiedAt: null,
+      lateWorkerFlaggedAt: now, // arrived after 09:30 via HOM
+      lastLatitude: profile.lastLatitude,
+      lastLongitude: profile.lastLongitude,
+      lastLocationAt: now,
+      isAvailable: true,
+      acceptingRequests: true,
+    },
+  });
+
+  return getHubAttendanceStatus(profile.userId);
+}
+
+/** HOM force check-out — professional does not need to be at the hub. */
+export async function homForceHubCheckOut(actorUserId: string, employeeProfileId: string) {
+  const actor = await prisma.user.findUnique({
+    where: { id: actorUserId },
+    select: {
+      role: true,
+      managerProfile: { select: { vendorId: true, zone: true } },
+    },
+  });
+  if (!actor || actor.role !== 'OPERATIONS_MANAGER') {
+    throw new DispatchError('FORBIDDEN', 'Only Hub Operation Managers can force check-out', 403);
+  }
+
+  const profile = await prisma.employeeProfile.findUnique({
+    where: { id: employeeProfileId },
+    select: {
+      id: true,
+      userId: true,
+      vendorId: true,
+      hubCheckedInAt: true,
+      lastLatitude: true,
+      lastLongitude: true,
+    },
+  });
+  if (!profile) throw new DispatchError('NOT_FOUND', 'Professional not found', 404);
+  if (!profile.hubCheckedInAt) {
+    throw new DispatchError('NOT_CHECKED_IN', 'This professional is not checked in', 409);
+  }
+
+  await assertHomOwnsEmployeeHub(actor.managerProfile, profile.vendorId);
+
+  const activeJob = await prisma.booking.findFirst({
+    where: {
+      OR: [{ employeeId: profile.id }, { helperEmployeeId: profile.id }],
+      status: { in: ['ON_THE_WAY', 'ARRIVED', 'IN_PROGRESS'] },
+    },
+    select: { id: true, bookingNumber: true },
+  });
+  if (activeJob) {
+    throw new DispatchError(
+      'ACTIVE_JOB',
+      `Finish or reassign booking #${activeJob.bookingNumber} before force check-out.`,
+      409
+    );
+  }
+
+  const now = new Date();
+  await prisma.employeeProfile.update({
+    where: { id: profile.id },
+    data: {
+      hubCheckedInAt: null,
+      hubCheckedOutAt: now,
+      lastHubCheckOutAt: now,
+      shiftOverdueNotifiedAt: null,
+      lateWorkerFlaggedAt: null,
+      lastLocationAt: now,
+      isAvailable: false,
+      acceptingRequests: false,
+    },
+  });
+
+  return getHubAttendanceStatus(profile.userId);
+}
+
+async function assertHomOwnsEmployeeHub(
+  managerProfile: { vendorId: string | null; zone: string | null } | null | undefined,
+  employeeVendorId: string
+) {
+  if (!managerProfile) {
+    throw new DispatchError('FORBIDDEN', 'Manager hub assignment missing', 403);
+  }
+  const allowed = new Set<string>();
+  if (managerProfile.vendorId) allowed.add(managerProfile.vendorId);
+  for (const part of String(managerProfile.zone || '')
+    .split(',')
+    .map((p) => p.trim())
+    .filter(Boolean)) {
+    if (/^[0-9a-f-]{36}$/i.test(part)) allowed.add(part);
+  }
+  if (allowed.size === 0 || !allowed.has(employeeVendorId)) {
+    // Zone may contain hub names — resolve names to ids
+    if (managerProfile.zone) {
+      const names = String(managerProfile.zone)
+        .split(',')
+        .map((p) => p.trim())
+        .filter((p) => p && !/^[0-9a-f-]{36}$/i.test(p));
+      if (names.length) {
+        const hubs = await prisma.vendorProfile.findMany({
+          where: {
+            OR: [
+              { companyName: { in: names, mode: 'insensitive' } },
+              { warehouseName: { in: names, mode: 'insensitive' } },
+            ],
+          },
+          select: { id: true },
+        });
+        for (const h of hubs) allowed.add(h.id);
+      }
+    }
+  }
+  if (!allowed.has(employeeVendorId)) {
+    throw new DispatchError('FORBIDDEN', 'This professional is not on one of your assigned hubs', 403);
+  }
 }
