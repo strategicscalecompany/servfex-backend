@@ -6,6 +6,7 @@ import { hashPassword } from '../utils/password';
 import { logAuditEvent } from '../utils/audit';
 import { sendExpertWelcomeEmail, sendManagerWelcomeEmail } from '../services/email.service';
 import { getFirebaseAuth } from '../config/firebase';
+import { asDecimal, sumMoney, toMoney } from '../utils/money';
 
 export const listEmployeesQuerySchema = z.object({
   query: z.object({
@@ -566,7 +567,13 @@ export const getManagers = async (req: Request, res: Response, next: NextFunctio
         managerProfile: {
           include: {
             vendor: {
-              select: { id: true, companyName: true, warehouseName: true, warehousePhone: true, location: true },
+              select: {
+                id: true,
+                companyName: true,
+                warehouseName: true,
+                warehousePhone: true,
+                location: true,
+              },
             },
           },
         },
@@ -574,7 +581,119 @@ export const getManagers = async (req: Request, res: Response, next: NextFunctio
       orderBy: { createdAt: 'desc' },
     });
 
-    sendSuccess(res, { managers });
+    const vendors = await prisma.vendorProfile.findMany({
+      select: {
+        id: true,
+        companyName: true,
+        warehouseName: true,
+        _count: { select: { employees: true } },
+      },
+    });
+
+    const vendorById = new Map(vendors.map((v) => [v.id, v]));
+    const vendorIdByHubName = new Map<string, string>();
+    for (const v of vendors) {
+      if (v.warehouseName) vendorIdByHubName.set(v.warehouseName.trim().toLowerCase(), v.id);
+      if (v.companyName) vendorIdByHubName.set(v.companyName.trim().toLowerCase(), v.id);
+    }
+
+    const resolveHubVendorIds = (mgr: (typeof managers)[number]): string[] => {
+      const ids = new Set<string>();
+      if (mgr.managerProfile?.vendorId) ids.add(mgr.managerProfile.vendorId);
+      if (mgr.managerProfile?.vendor?.id) ids.add(mgr.managerProfile.vendor.id);
+      const zone = mgr.managerProfile?.zone || '';
+      for (const part of zone.split(',').map((p) => p.trim()).filter(Boolean)) {
+        const match = vendorIdByHubName.get(part.toLowerCase());
+        if (match) ids.add(match);
+      }
+      return [...ids];
+    };
+
+    const allHubIds = Array.from(
+      new Set(managers.flatMap((mgr) => resolveHubVendorIds(mgr)))
+    );
+
+    const since = new Date();
+    since.setDate(since.getDate() - 30);
+
+    const [bookings, escalations] = await Promise.all([
+      allHubIds.length
+        ? prisma.booking.findMany({
+            where: {
+              vendorId: { in: allHubIds },
+              createdAt: { gte: since },
+            },
+            select: {
+              vendorId: true,
+              status: true,
+              totalAmount: true,
+              paymentStatus: true,
+            },
+          })
+        : Promise.resolve([]),
+      allHubIds.length
+        ? prisma.escalationTicket.findMany({
+            where: {
+              createdAt: { gte: since },
+              booking: { vendorId: { in: allHubIds } },
+            },
+            select: {
+              status: true,
+              booking: { select: { vendorId: true } },
+            },
+          })
+        : Promise.resolve([]),
+    ]);
+
+    const enriched = managers.map((mgr) => {
+      const hubIds = resolveHubVendorIds(mgr);
+      const hubSet = new Set(hubIds);
+
+      let techniciansCount = 0;
+      for (const id of hubIds) {
+        techniciansCount += vendorById.get(id)?._count.employees || 0;
+      }
+
+      const hubBookings = bookings.filter((b) => b.vendorId && hubSet.has(b.vendorId));
+      const thirtyDaysJobs = hubBookings.length;
+      const completedOrPaid = hubBookings.filter(
+        (b) => b.status === 'COMPLETED' || b.paymentStatus === 'PAID'
+      );
+      const earnings = sumMoney(completedOrPaid.map((b) => b.totalAmount));
+
+      const hubEscalations = escalations.filter(
+        (e) => e.booking?.vendorId && hubSet.has(e.booking.vendorId)
+      );
+      const complaintsCount = hubEscalations.length;
+      const unresolvedComplaints = hubEscalations.filter((e) =>
+        ['OPEN', 'ACKNOWLEDGED', 'IN_PROGRESS'].includes(e.status)
+      ).length;
+      const resolved = Math.max(0, complaintsCount - unresolvedComplaints);
+      const slaRate =
+        complaintsCount === 0
+          ? 100
+          : Number(asDecimal(resolved).div(complaintsCount).times(100).toFixed(1));
+
+      const assignedHubs = hubIds.map((id) => {
+        const v = vendorById.get(id);
+        return v?.warehouseName || v?.companyName || id;
+      });
+
+      return {
+        ...mgr,
+        assignedHubs,
+        metrics: {
+          thirtyDaysEarnings: toMoney(earnings),
+          thirtyDaysJobs,
+          techniciansCount,
+          complaintsCount,
+          unresolvedComplaints,
+          slaRate,
+        },
+      };
+    });
+
+    sendSuccess(res, { managers: enriched });
   } catch (error) {
     next(error);
   }
