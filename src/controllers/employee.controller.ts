@@ -428,6 +428,58 @@ export const deleteEmployee = async (req: Request, res: Response, next: NextFunc
 // MANAGERIAL APPOINTMENTS & OVERSIGHT
 // ==========================================
 
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/** Resolve assigned hub vendor IDs from explicit ids, primary vendorId, and zone CSV (names or UUIDs). */
+async function resolveManagerHubAssignment(input: {
+  hubIds?: string[] | null;
+  vendorId?: string | null;
+  zone?: string | null;
+}): Promise<{ hubIds: string[]; primaryVendorId: string | null; zoneLabel: string }> {
+  const vendors = await prisma.vendorProfile.findMany({
+    select: { id: true, companyName: true, warehouseName: true },
+  });
+  const vendorById = new Map(vendors.map((v) => [v.id, v]));
+  const vendorIdByHubName = new Map<string, string>();
+  for (const v of vendors) {
+    if (v.warehouseName) vendorIdByHubName.set(v.warehouseName.trim().toLowerCase(), v.id);
+    if (v.companyName) vendorIdByHubName.set(v.companyName.trim().toLowerCase(), v.id);
+  }
+
+  const ids = new Set<string>();
+  for (const id of input.hubIds || []) {
+    if (vendorById.has(id)) ids.add(id);
+  }
+  if (input.vendorId && vendorById.has(input.vendorId)) ids.add(input.vendorId);
+
+  for (const part of String(input.zone || '')
+    .split(',')
+    .map((p) => p.trim())
+    .filter(Boolean)) {
+    if (UUID_RE.test(part) && vendorById.has(part)) {
+      ids.add(part);
+      continue;
+    }
+    const byName = vendorIdByHubName.get(part.toLowerCase());
+    if (byName) ids.add(byName);
+  }
+
+  const hubIds = [...ids];
+  const primaryVendorId = hubIds[0] || null;
+  const zoneLabel =
+    hubIds.length > 0
+      ? hubIds
+          .map((id) => {
+            const v = vendorById.get(id);
+            return v?.warehouseName || v?.companyName || id;
+          })
+          .join(', ')
+      : String(input.zone || 'Central Territory Zone').trim() || 'Central Territory Zone';
+
+  return { hubIds, primaryVendorId, zoneLabel };
+}
+
 export const createManagerSchema = z.object({
   body: z.object({
     name: z.string().min(2, 'Full name is required'),
@@ -439,12 +491,21 @@ export const createManagerSchema = z.object({
     shiftHours: z.string().optional().default('09:00 AM - 06:00 PM'),
     kind: z.enum(['OPERATIONS', 'BUSINESS_DEVELOPMENT']).optional().default('OPERATIONS'),
     vendorId: z.string().uuid().optional().nullable(),
+    hubIds: z.array(z.string().uuid()).optional(),
+  }),
+});
+
+export const updateManagerHubsSchema = z.object({
+  params: z.object({ id: z.string().uuid() }),
+  body: z.object({
+    hubIds: z.array(z.string().uuid()).min(1, 'Assign at least one partner hub'),
+    city: z.string().optional(),
   }),
 });
 
 export const createManager = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
-    const { name, email, phone, password, zone, city, shiftHours, kind, vendorId } = req.body;
+    const { name, email, phone, password, zone, city, shiftHours, kind, vendorId, hubIds } = req.body;
     const cleanEmail = email.toLowerCase().trim();
     const assignedPassword = password || `Manager@${Math.floor(1000 + Math.random() * 9000)}`;
     const managerKind = kind === 'BUSINESS_DEVELOPMENT' ? 'BUSINESS_DEVELOPMENT' : 'OPERATIONS';
@@ -458,6 +519,12 @@ export const createManager = async (req: Request, res: Response, next: NextFunct
 
     if (existingUser) {
       sendError(res, 'USER_EXISTS', 'A manager or administrator with this email or phone already exists', 409);
+      return;
+    }
+
+    const assignment = await resolveManagerHubAssignment({ hubIds, vendorId, zone });
+    if (managerKind === 'OPERATIONS' && assignment.hubIds.length === 0) {
+      sendError(res, 'VALIDATION_ERROR', 'Assign at least one partner hub to this House of Masters manager', 400);
       return;
     }
 
@@ -479,13 +546,8 @@ export const createManager = async (req: Request, res: Response, next: NextFunct
       }
     }
 
-    if (vendorId) {
-      const hub = await prisma.vendorProfile.findFirst({ where: { id: vendorId } });
-      if (!hub) {
-        sendError(res, 'NOT_FOUND', 'Assigned hub / local provider was not found', 404);
-        return;
-      }
-    }
+    const resolvedZone = assignment.zoneLabel;
+    const resolvedVendorId = assignment.primaryVendorId;
 
     const newManager = await prisma.$transaction(async (tx) => {
       const user = await tx.user.create({
@@ -501,10 +563,10 @@ export const createManager = async (req: Request, res: Response, next: NextFunct
           managerProfile: {
             create: {
               kind: managerKind,
-              zone,
+              zone: resolvedZone,
               city,
               shiftHours,
-              vendorId: vendorId || null,
+              vendorId: resolvedVendorId,
             },
           },
         },
@@ -516,7 +578,17 @@ export const createManager = async (req: Request, res: Response, next: NextFunct
         action: 'MANAGER_APPOINTED',
         entityType: 'User',
         entityId: user.id,
-        after: { name, email: cleanEmail, phone, zone, city, shiftHours, kind: managerKind, vendorId },
+        after: {
+          name,
+          email: cleanEmail,
+          phone,
+          zone: resolvedZone,
+          city,
+          shiftHours,
+          kind: managerKind,
+          vendorId: resolvedVendorId,
+          hubIds: assignment.hubIds,
+        },
         ipAddress: req.ip,
         userAgent: req.headers['user-agent'],
         tx,
@@ -529,7 +601,7 @@ export const createManager = async (req: Request, res: Response, next: NextFunct
     sendManagerWelcomeEmail({
       toEmail: cleanEmail,
       name,
-      zone,
+      zone: resolvedZone,
       city,
       phone,
       shiftHours,
@@ -539,6 +611,75 @@ export const createManager = async (req: Request, res: Response, next: NextFunct
     });
 
     sendSuccess(res, newManager, 201);
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const updateManagerHubs = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  try {
+    const id = String(req.params.id);
+    const { hubIds, city } = req.body as { hubIds: string[]; city?: string };
+
+    const manager = await prisma.user.findFirst({
+      where: { id, role: 'OPERATIONS_MANAGER', deletedAt: null },
+      include: { managerProfile: true },
+    });
+    if (!manager || !manager.managerProfile) {
+      sendError(res, 'NOT_FOUND', 'House of Masters manager not found', 404);
+      return;
+    }
+    const managerProfile = manager.managerProfile;
+
+    const assignment = await resolveManagerHubAssignment({ hubIds, zone: '' });
+    if (assignment.hubIds.length === 0) {
+      sendError(res, 'VALIDATION_ERROR', 'Assign at least one valid partner hub', 400);
+      return;
+    }
+
+    const before = {
+      zone: managerProfile.zone,
+      vendorId: managerProfile.vendorId,
+      city: managerProfile.city,
+    };
+
+    const updated = await prisma.$transaction(async (tx) => {
+      const profile = await tx.managerProfile.update({
+        where: { id: managerProfile.id },
+        data: {
+          zone: assignment.zoneLabel,
+          vendorId: assignment.primaryVendorId,
+          ...(city ? { city } : {}),
+        },
+        include: { vendor: true },
+      });
+
+      await logAuditEvent({
+        superAdminId: req.user!.userId,
+        action: 'MANAGER_HUBS_UPDATED',
+        entityType: 'ManagerProfile',
+        entityId: profile.id,
+        before,
+        after: {
+          zone: profile.zone,
+          vendorId: profile.vendorId,
+          city: profile.city,
+          hubIds: assignment.hubIds,
+        },
+        ipAddress: req.ip,
+        userAgent: req.headers['user-agent'],
+        tx,
+      });
+
+      return profile;
+    });
+
+    sendSuccess(res, {
+      id: manager.id,
+      managerProfile: updated,
+      assignedHubIds: assignment.hubIds,
+      assignedHubs: assignment.zoneLabel.split(',').map((s) => s.trim()).filter(Boolean),
+    });
   } catch (error) {
     next(error);
   }
@@ -603,6 +744,10 @@ export const getManagers = async (req: Request, res: Response, next: NextFunctio
       if (mgr.managerProfile?.vendor?.id) ids.add(mgr.managerProfile.vendor.id);
       const zone = mgr.managerProfile?.zone || '';
       for (const part of zone.split(',').map((p) => p.trim()).filter(Boolean)) {
+        if (UUID_RE.test(part) && vendorById.has(part)) {
+          ids.add(part);
+          continue;
+        }
         const match = vendorIdByHubName.get(part.toLowerCase());
         if (match) ids.add(match);
       }
@@ -682,6 +827,7 @@ export const getManagers = async (req: Request, res: Response, next: NextFunctio
       return {
         ...mgr,
         assignedHubs,
+        assignedHubIds: hubIds,
         metrics: {
           thirtyDaysEarnings: toMoney(earnings),
           thirtyDaysJobs,

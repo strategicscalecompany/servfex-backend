@@ -47,10 +47,12 @@ import {
   deleteEmployee,
   createManager,
   getManagers,
+  updateManagerHubs,
   listEmployeesQuerySchema,
   createEmployeeSchema,
   assignVendorSchema,
   createManagerSchema,
+  updateManagerHubsSchema,
 } from '../controllers/employee.controller';
 import {
   getCategories,
@@ -222,6 +224,7 @@ router.delete('/employees/:id', deleteEmployee);
 // ==========================================
 router.get('/managers', getManagers);
 router.post('/managers', validate(createManagerSchema), createManager);
+router.patch('/managers/:id/hubs', validate(updateManagerHubsSchema), updateManagerHubs);
 
 // ==========================================
 // MANAGEMENT - SPECIALIST TAGS

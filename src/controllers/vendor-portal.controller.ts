@@ -2300,10 +2300,19 @@ export const getVendorEmployees = async (req: Request, res: Response): Promise<v
       orderBy: { createdAt: 'desc' },
     });
 
-    // House of Masters managers assigned to this hub (kept separate from field employees)
-    const hubNames = [vendor?.warehouseName, vendor?.companyName]
-      .map((n) => (n || '').trim().toLowerCase())
-      .filter(Boolean);
+    // House of Masters managers assigned to this hub (kept separate from field employees).
+    // Match by ManagerProfile.vendorId and by zone CSV hub names / hub UUIDs — same rules as admin getManagers.
+    const allVendors = await prisma.vendorProfile.findMany({
+      select: { id: true, companyName: true, warehouseName: true },
+    });
+    const vendorById = new Map(allVendors.map((v) => [v.id, v]));
+    const vendorIdByHubName = new Map<string, string>();
+    for (const v of allVendors) {
+      if (v.warehouseName) vendorIdByHubName.set(v.warehouseName.trim().toLowerCase(), v.id);
+      if (v.companyName) vendorIdByHubName.set(v.companyName.trim().toLowerCase(), v.id);
+    }
+    const uuidRe =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
     const managerProfiles = await prisma.managerProfile.findMany({
       where: {
@@ -2322,16 +2331,31 @@ export const getVendorEmployees = async (req: Request, res: Response): Promise<v
             createdAt: true,
           },
         },
+        vendor: { select: { id: true } },
       },
       orderBy: { createdAt: 'desc' },
     });
 
+    const resolveManagerHubIds = (mgr: (typeof managerProfiles)[number]): string[] => {
+      const ids = new Set<string>();
+      if (mgr.vendorId) ids.add(mgr.vendorId);
+      if (mgr.vendor?.id) ids.add(mgr.vendor.id);
+      for (const part of String(mgr.zone || '')
+        .split(',')
+        .map((p) => p.trim())
+        .filter(Boolean)) {
+        if (uuidRe.test(part) && vendorById.has(part)) {
+          ids.add(part);
+          continue;
+        }
+        const byName = vendorIdByHubName.get(part.toLowerCase());
+        if (byName) ids.add(byName);
+      }
+      return [...ids];
+    };
+
     const houseOfMasters = managerProfiles
-      .filter((mgr) => {
-        if (mgr.vendorId === vendorId) return true;
-        const zone = (mgr.zone || '').toLowerCase();
-        return hubNames.some((name) => zone.includes(name));
-      })
+      .filter((mgr) => resolveManagerHubIds(mgr).includes(vendorId))
       .map((mgr) => ({
         id: mgr.id,
         userId: mgr.userId,
@@ -2339,7 +2363,7 @@ export const getVendorEmployees = async (req: Request, res: Response): Promise<v
         zone: mgr.zone,
         city: mgr.city,
         shiftHours: mgr.shiftHours,
-        vendorId: mgr.vendorId,
+        vendorId: mgr.vendorId || vendorId,
         user: mgr.user,
         portalLabel: 'House of Masters',
       }));
