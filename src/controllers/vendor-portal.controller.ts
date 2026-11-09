@@ -2273,6 +2273,11 @@ export const getVendorEmployees = async (req: Request, res: Response): Promise<v
     }
 
     const eligibleOnly = String(req.query.eligibleForAssignment || '') === 'true';
+    const vendor = await prisma.vendorProfile.findUnique({
+      where: { id: vendorId },
+      select: { id: true, companyName: true, warehouseName: true },
+    });
+
     const employees = await prisma.employeeProfile.findMany({
       where: {
         vendorId,
@@ -2295,6 +2300,50 @@ export const getVendorEmployees = async (req: Request, res: Response): Promise<v
       orderBy: { createdAt: 'desc' },
     });
 
+    // House of Masters managers assigned to this hub (kept separate from field employees)
+    const hubNames = [vendor?.warehouseName, vendor?.companyName]
+      .map((n) => (n || '').trim().toLowerCase())
+      .filter(Boolean);
+
+    const managerProfiles = await prisma.managerProfile.findMany({
+      where: {
+        kind: 'OPERATIONS',
+        user: { role: 'OPERATIONS_MANAGER', deletedAt: null },
+      },
+      include: {
+        user: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            phone: true,
+            profilePhotoUrl: true,
+            status: true,
+            createdAt: true,
+          },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    const houseOfMasters = managerProfiles
+      .filter((mgr) => {
+        if (mgr.vendorId === vendorId) return true;
+        const zone = (mgr.zone || '').toLowerCase();
+        return hubNames.some((name) => zone.includes(name));
+      })
+      .map((mgr) => ({
+        id: mgr.id,
+        userId: mgr.userId,
+        kind: mgr.kind,
+        zone: mgr.zone,
+        city: mgr.city,
+        shiftHours: mgr.shiftHours,
+        vendorId: mgr.vendorId,
+        user: mgr.user,
+        portalLabel: 'House of Masters',
+      }));
+
     sendSuccess(
       res,
       {
@@ -2307,6 +2356,7 @@ export const getVendorEmployees = async (req: Request, res: Response): Promise<v
           lastLongitude: emp.lastLongitude ?? null,
           lastLocationAt: emp.lastLocationAt ?? null,
         })),
+        houseOfMasters,
       },
       200
     );
