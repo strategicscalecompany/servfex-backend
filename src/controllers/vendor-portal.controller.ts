@@ -920,12 +920,20 @@ async function assignedHubsForActor(actor: Awaited<ReturnType<typeof resolvePort
   return Array.from(hubs.values());
 }
 
-/** Resolve a service only if Super Admin already assigned it to this hub. */
+/** Resolve a hub-assigned catalog service + effective sell price (customPrice or catalog base). */
 async function resolveAssignedHubService(
   serviceId: string | undefined,
   serviceName: string | undefined,
   vendorId: string
-) {
+): Promise<{ service: { id: string; name: string; startingPrice: string }; price: string } | null> {
+  const toEffective = (row: {
+    customPrice: string | null;
+    service: { id: string; name: string; startingPrice: string };
+  }) => ({
+    service: row.service,
+    price: row.customPrice && String(row.customPrice).trim() !== '' ? toMoney(row.customPrice) : toMoney(row.service.startingPrice),
+  });
+
   if (serviceId) {
     const assigned = await prisma.vendorService.findFirst({
       where: {
@@ -936,7 +944,7 @@ async function resolveAssignedHubService(
       },
       include: { service: true },
     });
-    if (assigned?.service) return assigned.service;
+    if (assigned?.service) return toEffective(assigned);
   }
 
   const trimmedName = (serviceName || '').trim();
@@ -955,7 +963,7 @@ async function resolveAssignedHubService(
     include: { service: true },
   });
 
-  return assignedByName?.service || null;
+  return assignedByName?.service ? toEffective(assignedByName) : null;
 }
 
 function cityFromAddress(addressLine1: string, city?: string): string {
@@ -1300,19 +1308,28 @@ export const searchDeskServices = async (req: Request, res: Response): Promise<v
         isActive: true,
         serviceId: { in: nameMatchIds },
       },
-      select: { serviceId: true },
+      select: { serviceId: true, customPrice: true },
     });
-    const assignedIds = new Set(assignments.map((row) => row.serviceId));
+    const assignmentByServiceId = new Map(assignments.map((row) => [row.serviceId, row]));
 
     const services = nameMatches
-      .filter((service) => assignedIds.has(service.id))
+      .filter((service) => assignmentByServiceId.has(service.id))
       .sort((a, b) => a.name.localeCompare(b.name))
       .slice(0, 20)
-      .map((service) => ({
-        id: service.id,
-        name: service.name,
-        startingPrice: service.startingPrice,
-      }));
+      .map((service) => {
+        const assignment = assignmentByServiceId.get(service.id);
+        const startingPrice =
+          assignment?.customPrice && String(assignment.customPrice).trim() !== ''
+            ? toMoney(assignment.customPrice)
+            : toMoney(service.startingPrice);
+        return {
+          id: service.id,
+          name: service.name,
+          startingPrice,
+          catalogStartingPrice: toMoney(service.startingPrice),
+          customPrice: assignment?.customPrice ? toMoney(assignment.customPrice) : null,
+        };
+      });
 
     sendSuccess(res, { services });
   } catch (err: any) {
@@ -3143,8 +3160,8 @@ export const createHubBooking = async (req: Request, res: Response): Promise<voi
       return;
     }
 
-    const service = await resolveAssignedHubService(serviceId || undefined, serviceName, targetVendorId);
-    if (!service) {
+    const assigned = await resolveAssignedHubService(serviceId || undefined, serviceName, targetVendorId);
+    if (!assigned) {
       sendError(
         res,
         'SERVICE_NOT_ASSIGNED',
@@ -3153,6 +3170,7 @@ export const createHubBooking = async (req: Request, res: Response): Promise<voi
       );
       return;
     }
+    const { service, price: hubSellPrice } = assigned;
 
     // Desk bookings (Sales Manager / Hub OM) go to the hub Provider first.
     // The Provider assigns a Working Professional and sets the expert payout.
@@ -3291,9 +3309,9 @@ export const createHubBooking = async (req: Request, res: Response): Promise<voi
         scheduledDate: slotDate,
         scheduledTimeSlot: slotTime,
         status: 'PENDING',
-        basePrice: toMoney(service.startingPrice),
+        basePrice: hubSellPrice,
         taxes: toMoney(0),
-        totalAmount: toMoney(service.startingPrice),
+        totalAmount: hubSellPrice,
         notes: notes || null,
         bookingSource,
         assignmentStrategy: 'DIRECT_EXPERT',
