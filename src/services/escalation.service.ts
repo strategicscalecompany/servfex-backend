@@ -133,12 +133,45 @@ export async function sweepMissedRingingCalls(now = new Date()): Promise<number>
   return ringing.length;
 }
 
+async function resolveManagerHubIds(managerProfile: {
+  vendorId?: string | null;
+  zone?: string | null;
+}): Promise<string[]> {
+  const ids = new Set<string>();
+  if (managerProfile.vendorId) ids.add(managerProfile.vendorId);
+  const parts = String(managerProfile.zone || '')
+    .split(',')
+    .map((p) => p.trim())
+    .filter(Boolean);
+  if (parts.length === 0) return [...ids];
+
+  const vendors = await prisma.vendorProfile.findMany({
+    select: { id: true, companyName: true, warehouseName: true },
+  });
+  const byId = new Map(vendors.map((v) => [v.id, v.id]));
+  const byName = new Map<string, string>();
+  for (const v of vendors) {
+    if (v.warehouseName) byName.set(v.warehouseName.trim().toLowerCase(), v.id);
+    if (v.companyName) byName.set(v.companyName.trim().toLowerCase(), v.id);
+  }
+  const uuidRe =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  for (const part of parts) {
+    if (uuidRe.test(part) && byId.has(part)) ids.add(part);
+    else {
+      const match = byName.get(part.toLowerCase());
+      if (match) ids.add(match);
+    }
+  }
+  return [...ids];
+}
+
 export async function listEscalationsForActor(userId: string, status?: string) {
   const user = await prisma.user.findUnique({
     where: { id: userId },
     select: {
       role: true,
-      managerProfile: { select: { vendorId: true, kind: true } },
+      managerProfile: { select: { vendorId: true, kind: true, zone: true } },
       vendorProfile: { select: { id: true } },
       employeeProfile: { select: { id: true, vendorId: true } },
     },
@@ -149,8 +182,12 @@ export async function listEscalationsForActor(userId: string, status?: string) {
   if (status) where.status = status;
   if (user.role === 'SUPER_ADMIN') {
     // platform-wide
-  } else if (user.managerProfile?.vendorId) {
-    where.booking = { vendorId: user.managerProfile.vendorId };
+  } else if (user.managerProfile) {
+    const hubIds = await resolveManagerHubIds(user.managerProfile);
+    if (hubIds.length === 0) {
+      throw new DispatchError('HUB_NOT_ASSIGNED', 'This manager is not assigned to a hub yet', 403);
+    }
+    where.booking = { vendorId: hubIds.length === 1 ? hubIds[0] : { in: hubIds } };
   } else if (user.vendorProfile) {
     where.booking = { vendorId: user.vendorProfile.id };
   } else if (user.employeeProfile) {

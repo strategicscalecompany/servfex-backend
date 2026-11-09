@@ -524,7 +524,7 @@ export const createManager = async (req: Request, res: Response, next: NextFunct
 
     const assignment = await resolveManagerHubAssignment({ hubIds, vendorId, zone });
     if (managerKind === 'OPERATIONS' && assignment.hubIds.length === 0) {
-      sendError(res, 'VALIDATION_ERROR', 'Assign at least one partner hub to this House of Masters manager', 400);
+      sendError(res, 'VALIDATION_ERROR', 'Assign at least one partner hub to this Hub Operation Manager', 400);
       return;
     }
 
@@ -626,7 +626,7 @@ export const updateManagerHubs = async (req: Request, res: Response, next: NextF
       include: { managerProfile: true },
     });
     if (!manager || !manager.managerProfile) {
-      sendError(res, 'NOT_FOUND', 'House of Masters manager not found', 404);
+      sendError(res, 'NOT_FOUND', 'Hub Operation Manager not found', 404);
       return;
     }
     const managerProfile = manager.managerProfile;

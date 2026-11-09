@@ -27,7 +27,7 @@ import {
   verifyStartOtpForExpert,
 } from '../services/execution.service';
 import { isValidUpiId, normalizeUpiId } from '../utils/upi';
-import { toMoney, toMoneyOrNull } from '../utils/money';
+import { asDecimal, sumMoney, toMoney, toMoneyOrNull } from '../utils/money';
 import { sendPushToUserIds } from '../services/push.service';
 import { env } from '../config/env';
 import { estimatePayloadBytes, MAX_DOCUMENT_BYTES, resolveHostedUrl } from '../utils/cloudinary';
@@ -626,21 +626,18 @@ export const uploadVendorDocument = async (req: Request, res: Response): Promise
 
 export const getVendorServices = async (req: Request, res: Response): Promise<void> => {
   try {
-    const userId = req.user!.userId;
-    const user = await prisma.user.findUnique({
-      where: { id: userId },
-      include: { vendorProfile: true, employeeProfile: true },
-    });
-
-    const vendorId = user?.vendorProfile?.id || user?.employeeProfile?.vendorId;
-    if (!vendorId) {
-      sendError(res, 'NOT_FOUND', 'Vendor or Employee profile not found', 404);
+    const actor = await resolvePortalActor(req.user!.userId);
+    const hubs = await assignedHubsForActor(actor);
+    const hubIds = hubs.map((h) => h.id);
+    const vendorId = actor.vendorId || hubIds[0] || null;
+    if (!vendorId && hubIds.length === 0) {
+      sendError(res, 'NOT_FOUND', 'Vendor, employee, or hub manager profile not found', 404);
       return;
     }
 
     const services = await prisma.vendorService.findMany({
       where: {
-        vendorId,
+        vendorId: hubIds.length > 1 ? { in: hubIds } : vendorId!,
         isActive: true,
         service: {
           isActive: true,
@@ -815,6 +812,9 @@ const hubSelect = {
   userId: true,
 } as const;
 
+const HUB_UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
 async function resolvePortalActor(userId: string) {
   const user = await prisma.user.findUnique({
     where: { id: userId },
@@ -835,6 +835,9 @@ async function resolvePortalActor(userId: string) {
         select: {
           id: true,
           vendorId: true,
+          zone: true,
+          city: true,
+          shiftHours: true,
           vendor: { select: hubSelect },
         },
       },
@@ -867,15 +870,52 @@ function formatHubOption(hub: {
   };
 }
 
-function assignedHubsForActor(actor: Awaited<ReturnType<typeof resolvePortalActor>>) {
+/** Resolve all hubs for the portal actor (HOM multi-hub via vendorId + zone CSV names/UUIDs). */
+async function assignedHubsForActor(actor: Awaited<ReturnType<typeof resolvePortalActor>>) {
   const hubs = new Map<string, ReturnType<typeof formatHubOption>>();
-  const push = (hub?: { id: string; companyName: string; warehouseName?: string | null; location: string; warehouseLocation?: string | null } | null) => {
+  const push = (
+    hub?: {
+      id: string;
+      companyName: string;
+      warehouseName?: string | null;
+      location: string;
+      warehouseLocation?: string | null;
+    } | null
+  ) => {
     if (!hub) return;
     hubs.set(hub.id, formatHubOption(hub));
   };
   push(actor.user?.vendorProfile || null);
   push(actor.user?.employeeProfile?.vendor || null);
   push(actor.user?.managerProfile?.vendor || null);
+
+  if (actor.isManager) {
+    const zone = actor.user?.managerProfile?.zone || '';
+    const parts = zone
+      .split(',')
+      .map((p) => p.trim())
+      .filter(Boolean);
+    if (parts.length > 0 || actor.user?.managerProfile?.vendorId) {
+      const vendors = await prisma.vendorProfile.findMany({ select: hubSelect });
+      const byId = new Map(vendors.map((v) => [v.id, v]));
+      const byName = new Map<string, (typeof vendors)[number]>();
+      for (const v of vendors) {
+        if (v.warehouseName) byName.set(v.warehouseName.trim().toLowerCase(), v);
+        if (v.companyName) byName.set(v.companyName.trim().toLowerCase(), v);
+      }
+      if (actor.user?.managerProfile?.vendorId) {
+        push(byId.get(actor.user.managerProfile.vendorId) || null);
+      }
+      for (const part of parts) {
+        if (HUB_UUID_RE.test(part)) {
+          push(byId.get(part) || null);
+        } else {
+          push(byName.get(part.toLowerCase()) || null);
+        }
+      }
+    }
+  }
+
   return Array.from(hubs.values());
 }
 
@@ -935,7 +975,7 @@ export const getDeskContext = async (req: Request, res: Response): Promise<void>
       return;
     }
 
-    const hubs = assignedHubsForActor(actor);
+    const hubs = await assignedHubsForActor(actor);
     let technicians: Array<{
       id: string;
       name: string;
@@ -1032,6 +1072,94 @@ export const getDeskContext = async (req: Request, res: Response): Promise<void>
   }
 };
 
+/** Rolling 30-day hub metrics for Hub Operation Manager (HOM) portal dashboard. */
+export const getManagerDashboard = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const actor = await resolvePortalActor(req.user!.userId);
+    if (!actor.isManager) {
+      sendError(res, 'FORBIDDEN', 'Only Hub Operation Managers can open this dashboard', 403);
+      return;
+    }
+
+    const hubs = await assignedHubsForActor(actor);
+    const hubIds = hubs.map((h) => h.id);
+    if (hubIds.length === 0) {
+      sendError(res, 'HUB_NOT_ASSIGNED', 'This manager is not assigned to a local provider hub yet', 403);
+      return;
+    }
+
+    const since = new Date();
+    since.setDate(since.getDate() - 30);
+
+    const [employeeCount, servicesCount, bookings, openBookingsCount, escalations] = await Promise.all([
+      prisma.employeeProfile.count({
+        where: { vendorId: { in: hubIds }, user: { deletedAt: null } },
+      }),
+      prisma.vendorService.count({
+        where: { vendorId: { in: hubIds }, isActive: true, service: { isActive: true, deletedAt: null } },
+      }),
+      prisma.booking.findMany({
+        where: { vendorId: { in: hubIds }, createdAt: { gte: since } },
+        select: { status: true, totalAmount: true, paymentStatus: true },
+      }),
+      prisma.booking.count({
+        where: {
+          vendorId: { in: hubIds },
+          status: { notIn: ['COMPLETED', 'CANCELLED'] },
+        },
+      }),
+      prisma.escalationTicket.findMany({
+        where: {
+          createdAt: { gte: since },
+          booking: { vendorId: { in: hubIds } },
+        },
+        select: { status: true },
+      }),
+    ]);
+
+    const thirtyDaysJobs = bookings.length;
+    const completedOrPaid = bookings.filter(
+      (b) => b.status === 'COMPLETED' || b.paymentStatus === 'PAID'
+    );
+    const earnings = sumMoney(completedOrPaid.map((b) => b.totalAmount));
+    const complaintsCount = escalations.length;
+    const unresolvedComplaints = escalations.filter((e) =>
+      ['OPEN', 'ACKNOWLEDGED', 'IN_PROGRESS'].includes(e.status)
+    ).length;
+    const resolved = Math.max(0, complaintsCount - unresolvedComplaints);
+    const slaRate =
+      complaintsCount === 0
+        ? 100
+        : Number(asDecimal(resolved).div(complaintsCount).times(100).toFixed(1));
+
+    sendSuccess(res, {
+      role: 'OPERATIONS_MANAGER',
+      portalLabel: 'Hub Operation Manager',
+      periodDays: 30,
+      hubs,
+      manager: {
+        name: actor.user?.name || '',
+        city: actor.user?.managerProfile?.city || '',
+        zone: actor.user?.managerProfile?.zone || '',
+        shiftHours: actor.user?.managerProfile?.shiftHours || '',
+      },
+      metrics: {
+        techniciansCount: employeeCount,
+        employeesCount: employeeCount,
+        servicesCount,
+        thirtyDaysJobs,
+        openBookingsCount,
+        thirtyDaysEarnings: toMoney(earnings),
+        complaintsCount,
+        unresolvedComplaints,
+        slaRate,
+      },
+    });
+  } catch (err: any) {
+    sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
+  }
+};
+
 export const searchDeskServices = async (req: Request, res: Response): Promise<void> => {
   try {
     const actor = await resolvePortalActor(req.user!.userId);
@@ -1046,7 +1174,7 @@ export const searchDeskServices = async (req: Request, res: Response): Promise<v
       return;
     }
 
-    const hubs = assignedHubsForActor(actor);
+    const hubs = await assignedHubsForActor(actor);
     const requestedVendorId = String(req.query.vendorId || '').trim();
     let hubIds = hubs.map((hub) => hub.id);
 
@@ -1185,7 +1313,7 @@ export const getVendorOrders = async (req: Request, res: Response): Promise<void
 
     let where: any = {};
     if (isVendor || isManager) {
-      const hubIds = assignedHubsForActor(actor).map((hub) => hub.id);
+      const hubIds = (await assignedHubsForActor(actor)).map((hub) => hub.id);
       if (hubIds.length === 0) {
         sendError(res, 'HUB_NOT_ASSIGNED', 'This manager is not assigned to a local provider hub yet', 403);
         return;
@@ -1254,7 +1382,7 @@ export const getVendorOrderById = async (req: Request, res: Response): Promise<v
 
     let where: any = { id };
     if (isVendor || isManager) {
-      const hubIds = assignedHubsForActor(actor).map((hub) => hub.id);
+      const hubIds = (await assignedHubsForActor(actor)).map((hub) => hub.id);
       if (hubIds.length === 0) {
         sendError(res, 'HUB_NOT_ASSIGNED', 'This manager is not assigned to a local provider hub yet', 403);
         return;
@@ -2300,7 +2428,7 @@ export const getVendorEmployees = async (req: Request, res: Response): Promise<v
       orderBy: { createdAt: 'desc' },
     });
 
-    // House of Masters managers assigned to this hub (kept separate from field employees).
+    // Hub Operation Managers assigned to this hub (kept separate from field employees).
     // Match by ManagerProfile.vendorId and by zone CSV hub names / hub UUIDs — same rules as admin getManagers.
     const allVendors = await prisma.vendorProfile.findMany({
       select: { id: true, companyName: true, warehouseName: true },
@@ -2365,7 +2493,7 @@ export const getVendorEmployees = async (req: Request, res: Response): Promise<v
         shiftHours: mgr.shiftHours,
         vendorId: mgr.vendorId || vendorId,
         user: mgr.user,
-        portalLabel: 'House of Masters',
+        portalLabel: 'Hub Operation Manager',
       }));
 
     sendSuccess(
@@ -2775,7 +2903,7 @@ export const createHubBooking = async (req: Request, res: Response): Promise<voi
       return;
     }
 
-    const hubs = assignedHubsForActor(actor);
+    const hubs = await assignedHubsForActor(actor);
     if (hubs.length === 0) {
       sendError(res, 'HUB_NOT_ASSIGNED', 'You are not assigned to a fulfillment hub', 403);
       return;
