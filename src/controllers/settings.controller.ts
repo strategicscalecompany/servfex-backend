@@ -69,11 +69,11 @@ export const homeLayoutSchema = z.object({
       .array(
         z.object({
           id: z.string(),
-          tag: z.string(),
-          headline: z.string(),
-          subtext: z.string(),
-          accentColor: z.string(),
-          bgColor: z.string(),
+          tag: z.string().optional().default(''),
+          headline: z.string().optional().default(''),
+          subtext: z.string().optional().default(''),
+          accentColor: z.string().optional().default('#FFD166'),
+          bgColor: z.string().optional().default('#1A1A2E'),
           isActive: z.boolean(),
           targetCategoryId: z.string().nullable().optional(),
           targetServiceId: z.string().nullable().optional(),
