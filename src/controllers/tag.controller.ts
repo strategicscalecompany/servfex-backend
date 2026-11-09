@@ -351,10 +351,32 @@ export const vendorSetEmployeeTags = async (req: Request, res: Response): Promis
           { kind: TagKind.HOM_FLEXIBLE, vendorId },
         ],
       },
-      select: { id: true },
+      select: { id: true, kind: true },
     });
     if (allowed.length !== tagIds.length) {
       sendError(res, 'BAD_REQUEST', 'One or more tags are not available for this hub', 400);
+      return;
+    }
+
+    const adminIds = allowed.filter((t) => t.kind === TagKind.ADMIN_SPECIALIST).map((t) => t.id);
+    const hubIds = allowed.filter((t) => t.kind === TagKind.HOM_FLEXIBLE).map((t) => t.id);
+    // Admin specialist tags are solo + category-bound; never mix with hub-created tags.
+    if (adminIds.length > 0 && hubIds.length > 0) {
+      sendError(
+        res,
+        'TAG_KIND_MIX',
+        'Assign either admin specialist tags or hub tags — not both on the same professional',
+        400
+      );
+      return;
+    }
+    if (adminIds.length > 1) {
+      sendError(
+        res,
+        'ADMIN_TAG_SOLO',
+        'A professional can have only one admin specialist tag (it locks them to that tag’s categories)',
+        400
+      );
       return;
     }
 
