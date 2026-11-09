@@ -4,6 +4,7 @@ import { Prisma } from '@prisma/client';
 import { prisma } from '../config/prisma';
 import { sendSuccess, sendError } from '../utils/response';
 import { haversineKm, isValidCoordinate } from '../services/dispatch.rules';
+import { toMoney } from '../utils/money';
 
 interface CacheEntry<T> {
   data: T;
@@ -41,6 +42,8 @@ type CatalogReachability = {
   matchedHubId?: string | null;
   matchedHubName?: string | null;
   distanceKm?: number | null;
+  /** Nearest-hub VendorService.customPrice by serviceId (null = use catalog base). */
+  priceByServiceId: Map<string, string | null>;
 };
 
 const OUT_OF_AREA_MESSAGE =
@@ -63,9 +66,15 @@ const resolveReachableServiceIds = async (
   latitude: number | null,
   longitude: number | null
 ): Promise<CatalogReachability> => {
+  const emptyReachability = (): CatalogReachability => ({
+    serviceIds: new Set(),
+    inServiceArea: false,
+    priceByServiceId: new Map(),
+  });
+
   const hasCustomerPoint = isValidCoordinate(latitude, longitude);
   if (!hasCustomerPoint) {
-    return { serviceIds: new Set(), inServiceArea: false };
+    return emptyReachability();
   }
 
   const hubs = await prisma.vendorProfile.findMany({
@@ -102,7 +111,7 @@ const resolveReachableServiceIds = async (
   }
 
   if (covering.length === 0) {
-    return { serviceIds: new Set(), inServiceArea: false };
+    return emptyReachability();
   }
 
   covering.sort((a, b) => a.distanceKm - b.distanceKm);
@@ -113,8 +122,17 @@ const resolveReachableServiceIds = async (
       isActive: true,
       vendorId: nearest.id,
     },
-    select: { serviceId: true },
+    select: { serviceId: true, customPrice: true },
   });
+
+  const priceByServiceId = new Map<string, string | null>();
+  for (const row of assignments) {
+    const custom =
+      row.customPrice != null && String(row.customPrice).trim() !== ''
+        ? toMoney(row.customPrice)
+        : null;
+    priceByServiceId.set(row.serviceId, custom);
+  }
 
   return {
     serviceIds: new Set(assignments.map((row) => row.serviceId)),
@@ -122,6 +140,7 @@ const resolveReachableServiceIds = async (
     matchedHubId: nearest.id,
     matchedHubName: nearest.name,
     distanceKm: nearest.distanceKm,
+    priceByServiceId,
   };
 };
 
@@ -245,12 +264,39 @@ const sanitizeCatalogService = (s: any) => ({
     : null,
 });
 
+/**
+ * Authoritative hub sell price: VendorService.customPrice overrides catalog startingPrice
+ * and package discountedPrice for the customer's matched fulfillment hub.
+ */
+const applyHubSellPrice = (service: any, sellPrice: string | null | undefined) => {
+  const base = sanitizeCatalogService(service);
+  if (!sellPrice) return base;
+  const packages = Array.isArray(base.packages)
+    ? base.packages.map((pkg: any) => {
+        const catalogSell = pkg.discountedPrice ?? pkg.originalPrice ?? base.startingPrice;
+        return {
+          ...pkg,
+          originalPrice: pkg.originalPrice ?? catalogSell,
+          discountedPrice: sellPrice,
+        };
+      })
+    : base.packages;
+  return {
+    ...base,
+    startingPrice: sellPrice,
+    packages,
+  };
+};
+
+const withHubPricing = (service: any, reachability: CatalogReachability) =>
+  applyHubSellPrice(service, reachability.priceByServiceId.get(service.id));
+
 const parseRequestedIds = (raw: unknown): string[] => {
   const values = Array.isArray(raw) ? raw : typeof raw === 'string' ? raw.split(',') : [];
   return [...new Set(values.map((id) => String(id).trim()).filter((id) => id.length > 0))];
 };
 
-const loadCatalogServicesByIds = async (ids: string[]) => {
+const loadCatalogServicesByIds = async (ids: string[], reachability?: CatalogReachability) => {
   if (ids.length === 0) return [];
   const fetched = await prisma.service.findMany({
     where: {
@@ -260,15 +306,21 @@ const loadCatalogServicesByIds = async (ids: string[]) => {
     },
     include: CATALOG_SERVICE_INCLUDE,
   });
-  const byId = new Map(fetched.map((s) => [s.id, sanitizeCatalogService(s)]));
+  const byId = new Map(
+    fetched.map((s) => [
+      s.id,
+      reachability ? withHubPricing(s, reachability) : sanitizeCatalogService(s),
+    ])
+  );
   return ids.map((id) => byId.get(id)).filter(Boolean);
 };
 
 const attachHomeSectionServices = async (
-  sections: Array<{ id: string; title: string; subtitle: string; serviceIds: string[]; enabled: boolean }>
+  sections: Array<{ id: string; title: string; subtitle: string; serviceIds: string[]; enabled: boolean }>,
+  reachability?: CatalogReachability
 ) => {
   const allIds = [...new Set(sections.flatMap((section) => section.serviceIds))];
-  const loaded = await loadCatalogServicesByIds(allIds);
+  const loaded = await loadCatalogServicesByIds(allIds, reachability);
   const byId = new Map(loaded.map((service: any) => [service.id, service]));
   return sections.map((section) => ({
     ...section,
@@ -400,10 +452,15 @@ export const getCatalogCategories = async (req: Request, res: Response): Promise
       orphansByCategory.set(svc.categoryId, list);
     }
 
+    const pricedService = (svc: any) => withHubPricing(svc, reachability);
+
     const sanitizedCategories = categories
       .map((cat) => {
         const subCategories = (cat.subCategories || [])
-          .map((sub) => ({ ...sub, services: sub.services || [] }))
+          .map((sub) => ({
+            ...sub,
+            services: (sub.services || []).map(pricedService),
+          }))
           .filter((sub) => sub.services.length > 0);
 
         const orphanTiles = (orphansByCategory.get(cat.id) || []).map((svc) => ({
@@ -415,7 +472,7 @@ export const getCatalogCategories = async (req: Request, res: Response): Promise
           isActive: true,
           createdAt: new Date(0),
           updatedAt: new Date(0),
-          services: [svc],
+          services: [pricedService(svc)],
           isSyntheticServiceTile: true,
         }));
 
@@ -536,8 +593,8 @@ export const getCatalogServices = async (req: Request, res: Response): Promise<v
         ? filteredRequestedIds
             .map((id) => servicesById.get(id))
             .filter((s): s is NonNullable<typeof s> => s != null)
-            .map(sanitizeCatalogService)
-        : services.map(sanitizeCatalogService);
+            .map((s) => withHubPricing(s, reachability))
+        : services.map((s) => withHubPricing(s, reachability));
 
     const resultData = {
       services: sanitizedServices,
@@ -566,8 +623,15 @@ export const getCatalogServices = async (req: Request, res: Response): Promise<v
 export const getCatalogServiceById = async (req: Request, res: Response): Promise<void> => {
   try {
     const id = req.params.id as string;
+    const latitude = parseCoord(req.query.latitude ?? req.query.lat);
+    const longitude = parseCoord(req.query.longitude ?? req.query.lng);
+    const locKey =
+      isValidCoordinate(latitude, longitude)
+        ? `${(latitude as number).toFixed(3)}:${(longitude as number).toFixed(3)}`
+        : 'noloc';
+    const reachability = await resolveReachableServiceIds(latitude, longitude);
 
-    const cacheKey = `service:${id}`;
+    const cacheKey = `service:${id}:${locKey}:${reachability.matchedHubId || 'none'}`;
     const cached = catalogMemoryCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) {
       res.setHeader('Cache-Control', 'private, max-age=60, stale-while-revalidate=120');
@@ -612,7 +676,10 @@ export const getCatalogServiceById = async (req: Request, res: Response): Promis
       return;
     }
 
-    const resultData = { service };
+    const resultData = {
+      service: withHubPricing(service, reachability),
+      coverage: coveragePayload(reachability),
+    };
     catalogMemoryCache.set(cacheKey, { data: resultData, expiresAt: Date.now() + CACHE_TTL_MS });
 
     res.setHeader('Cache-Control', 'private, max-age=60, stale-while-revalidate=120');
@@ -711,19 +778,7 @@ export const getPopularServices = async (req: Request, res: Response): Promise<v
       });
     }
 
-    const sanitizedServices = services.map((s) => ({
-      ...s,
-      imageUrl: s.imageUrl && s.imageUrl.startsWith('data:') && s.imageUrl.length > 2000 ? (s.iconUrl || '') : s.imageUrl,
-      category: s.category
-        ? {
-            ...s.category,
-            icon:
-              s.category.icon && s.category.icon.startsWith('data:') && s.category.icon.length > 2000
-                ? s.category.iconUrl || ''
-                : s.category.icon,
-          }
-        : null,
-    }));
+    const sanitizedServices = services.map((s) => withHubPricing(s, reachability));
 
     const resultData = {
       services: sanitizedServices,
@@ -814,7 +869,7 @@ export const getCatalogHomeLayout = async (req: Request, res: Response): Promise
         ? section.serviceIds.filter((id: string) => reachability.serviceIds.has(id))
         : [],
     }));
-    const serviceSections = await attachHomeSectionServices(rawSections);
+    const serviceSections = await attachHomeSectionServices(rawSections, reachability);
     const updatedAt = config?.updatedAt ? config.updatedAt.getTime() : Date.now();
     const payload = {
       ...data,

@@ -32,6 +32,7 @@ import { asDecimal, sumMoney, toMoney, toMoneyOrNull } from '../utils/money';
 import { sendPushToUserIds } from '../services/push.service';
 import { env } from '../config/env';
 import { estimatePayloadBytes, MAX_DOCUMENT_BYTES, resolveHostedUrl } from '../utils/cloudinary';
+import { invalidateCatalogCache } from './catalog.controller';
 import {
   BEFORE_PHOTO_ELIGIBLE_STATUSES,
   COMPLETABLE_JOB_STATUSES,
@@ -724,6 +725,7 @@ export const addVendorService = async (req: Request, res: Response): Promise<voi
       },
     });
 
+    invalidateCatalogCache();
     sendSuccess(res, { service: vendorService }, 201);
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
@@ -768,6 +770,7 @@ export const updateVendorService = async (req: Request, res: Response): Promise<
       include: { service: true },
     });
 
+    invalidateCatalogCache();
     sendSuccess(res, { service: updated }, 200);
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
@@ -794,6 +797,7 @@ export const deleteVendorService = async (req: Request, res: Response): Promise<
       where: { id, vendorId },
     });
 
+    invalidateCatalogCache();
     sendSuccess(res, null, 200);
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);

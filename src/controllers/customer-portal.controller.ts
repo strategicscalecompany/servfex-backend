@@ -690,7 +690,7 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
           user: { select: { id: true, name: true } },
           vendorServices: {
             where: { isActive: true },
-            select: { serviceId: true },
+            select: { serviceId: true, customPrice: true },
           },
           employees: {
             where: { isAvailable: true },
@@ -758,6 +758,12 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
       basePrice = asDecimal(
         selectedPackage.discountedPrice ?? selectedPackage.originalPrice ?? service.startingPrice
       );
+    }
+
+    // Authoritative hub sell price: matched partner VendorService.customPrice wins over catalog.
+    const hubAssignment = matchedVendor?.vendorServices.find((vs) => vs.serviceId === serviceId);
+    if (hubAssignment?.customPrice != null && String(hubAssignment.customPrice).trim() !== '') {
+      basePrice = asDecimal(hubAssignment.customPrice);
     }
 
     // Zero GST / taxes and zero extra commission markup on bookings
