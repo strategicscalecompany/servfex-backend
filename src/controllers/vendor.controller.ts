@@ -37,7 +37,7 @@ export const createVendorSchema = z.object({
     location: z.string().optional().default('Main Hub'),
     bio: z.string().optional(),
     commissionRate: z.number().min(0).max(100).optional().default(0.0),
-    // Additional partner and warehouse onboarding fields
+    // Additional partner and hub onboarding fields
     partnerImage: z.string().optional(),
     warehouseName: z.string().optional(),
     warehouseLocation: z.string().optional(),
@@ -403,7 +403,7 @@ export const createVendor = async (req: Request, res: Response, next: NextFuncti
     // 1. Process partner image upload if provided (base64 or remote URL)
     const uploadedPartnerImage = await resolveHostedUrl(partnerImage, 'servfex/avatars');
 
-    // 2. Process warehouse image upload if provided
+    // 2. Process hub image upload if provided
     const uploadedWarehouseImage = await resolveHostedUrl(warehouseImage, 'servfex/warehouses');
 
     if (Array.isArray(documents) && documents.length > 0) {

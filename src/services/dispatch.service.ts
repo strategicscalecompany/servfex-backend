@@ -394,7 +394,7 @@ export async function offerToExpertInTx(tx: Tx, p: OfferParams): Promise<void> {
 
 async function notifyOffer(tx: Tx, p: OfferParams): Promise<void> {
   const { booking, employee } = p;
-  const warehouse = booking.vendor?.warehouseName || booking.vendor?.companyName || 'your warehouse';
+  const hub = booking.vendor?.warehouseName || booking.vendor?.companyName || 'your hub';
   const etaLabel =
     typeof p.etaMinutes === 'number' && p.etaMinutes >= 60
       ? p.etaMinutes >= 1440
@@ -405,7 +405,7 @@ async function notifyOffer(tx: Tx, p: OfferParams): Promise<void> {
   await tx.notification.create({
     data: {
       title: `New Job Assignment #${booking.bookingNumber}`,
-      message: `You have been assigned ${booking.service.name} from ${warehouse}.${etaLabel} Open the job and start when you are ready.`,
+      message: `You have been assigned ${booking.service.name} from ${hub}.${etaLabel} Open the job and start when you are ready.`,
       target: 'SPECIFIC_USER',
       targetUserId: employee.userId,
     },
@@ -625,7 +625,7 @@ async function autoAssignInTx(tx: Tx, booking: DispatchBooking, now: Date): Prom
   const windowReason = `Auto-assigned after ${env.PROVIDER_RESPONSE_WINDOW_SECONDS}s without provider action`;
   const nearbyReason = booking.outOfRadiusDispatch
     ? 'Auto-assigned nearest eligible professional (customer outside vendor service radius)'
-    : 'Auto-assigned nearest eligible professional after warehouse pool was empty';
+    : 'Auto-assigned nearest eligible professional after hub pool was empty';
 
   if (booking.vendorId && !booking.outOfRadiusDispatch) {
     const { candidates, nameById } = await loadExpertCandidates(tx, booking);
@@ -692,7 +692,7 @@ async function handleNoExpertInTx(
       await tx.notification.create({
         data: {
           title: `No expert available #${booking.bookingNumber}`,
-          message: `No eligible expert in your warehouse is free for ${booking.service.name} (${booking.scheduledDate}, ${booking.scheduledTimeSlot}). Free up an expert or assign manually.`,
+          message: `No eligible expert in your hub is free for ${booking.service.name} (${booking.scheduledDate}, ${booking.scheduledTimeSlot}). Free up an expert or assign manually.`,
           target: 'SPECIFIC_USER',
           targetUserId: booking.vendor.userId,
         },
@@ -846,7 +846,7 @@ export interface ManualAssignInput {
 }
 
 /**
- * Provider picks a specific expert from ITS OWN warehouse. Loses cleanly (409 ASSIGNMENT_CONFLICT) when the
+ * Provider picks a specific expert from ITS OWN hub. Loses cleanly (409 ASSIGNMENT_CONFLICT) when the
  * auto-assign worker got there first. Sets arrival ETA (hours/days) but leaves the job ASSIGNED —
  * the professional starts when ready (no Accept step).
  */
@@ -881,7 +881,7 @@ export async function assignExpertManually(input: ManualAssignInput) {
       include: { user: { select: { name: true, status: true, deletedAt: true } } },
     });
     if (!employee) {
-      throw new DispatchError('EXPERT_NOT_IN_WAREHOUSE', 'Expert does not belong to your warehouse', 400);
+      throw new DispatchError('EXPERT_NOT_IN_WAREHOUSE', 'Expert does not belong to your hub', 400);
     }
     if (isTestingWorkflowEnabled() && employee.expertKind === 'SALES_MANAGER') {
       throw new DispatchError(

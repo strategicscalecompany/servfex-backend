@@ -920,7 +920,7 @@ async function assignedHubsForActor(actor: Awaited<ReturnType<typeof resolvePort
   return Array.from(hubs.values());
 }
 
-/** Resolve a service only if Super Admin already assigned it to this hub/warehouse. */
+/** Resolve a service only if Super Admin already assigned it to this hub. */
 async function resolveAssignedHubService(
   serviceId: string | undefined,
   serviceName: string | undefined,
@@ -2411,7 +2411,7 @@ export const assignEmployeeToOrder = async (req: Request, res: Response): Promis
             newStatus: 'ASSIGNED',
             changedBy: userId,
             changedByRole: 'VENDOR',
-            reason: resolvedInstructions || `Dispatched to warehouse team with payout ₹${resolvedPayout || 'standard'}`,
+            reason: resolvedInstructions || `Dispatched to hub team with payout ₹${resolvedPayout || 'standard'}`,
           },
         },
       };
@@ -2438,19 +2438,19 @@ export const assignEmployeeToOrder = async (req: Request, res: Response): Promis
         },
       });
 
-      const warehouseLabel = vendorProfile.warehouseName || vendorProfile.companyName;
+      const hubLabel = vendorProfile.warehouseName || vendorProfile.companyName;
       const payoutText = resolvedPayout ? ` ₹${Number(resolvedPayout).toFixed(2)}` : '';
 
-      const warehouseExperts = await tx.employeeProfile.findMany({
+      const hubExperts = await tx.employeeProfile.findMany({
         where: { vendorId: vendorProfile.id, isAvailable: true },
         include: { user: true },
       });
 
-      for (const exp of warehouseExperts) {
+      for (const exp of hubExperts) {
         await tx.notification.create({
           data: {
-            title: `New Warehouse Order Available #${b.bookingNumber}`,
-            message: `New booking for ${booking.service.name} at ${warehouseLabel}. Expert Fare:${payoutText}. Tap to review and accept!`,
+            title: `New Hub Order Available #${b.bookingNumber}`,
+            message: `New booking for ${booking.service.name} at ${hubLabel}. Expert Fare:${payoutText}. Tap to review and accept!`,
             target: 'SPECIFIC_USER',
             targetUserId: exp.userId,
           },
@@ -3148,7 +3148,7 @@ export const createHubBooking = async (req: Request, res: Response): Promise<voi
       sendError(
         res,
         'SERVICE_NOT_ASSIGNED',
-        'Select a service that Super Admin has assigned to this hub/warehouse',
+        'Select a service that Super Admin has assigned to this hub',
         400
       );
       return;

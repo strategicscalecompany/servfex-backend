@@ -8,7 +8,7 @@ import { isTestingWorkflowEnabled, uniqueHostedImageUrls } from '../config/testi
 const PHONE_PATTERN = /^[+\d][\d\s-]{8,19}$/;
 
 export const createSalesVisitSchema = z.object({
-  locationName: z.string().min(2, 'Warehouse / hub / location name is required'),
+  locationName: z.string().min(2, 'Hub / location name is required'),
   addressLine: z.string().min(3, 'Location address is required'),
   latitude: z.number().min(-90).max(90).optional(),
   longitude: z.number().min(-180).max(180).optional(),

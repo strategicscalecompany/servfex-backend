@@ -794,7 +794,7 @@ router.post('/resolve-maps-url', async (req: Request, res: Response): Promise<vo
         lat,
         lng,
         formattedAddress: formattedAddress || `${lat.toFixed(6)}, ${lng.toFixed(6)}`,
-        placeName: placeName || 'Warehouse Depot',
+        placeName: placeName || 'Hub Depot',
         resolvedUrl,
       },
     });
