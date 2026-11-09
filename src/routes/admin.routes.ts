@@ -224,6 +224,23 @@ router.get('/managers', getManagers);
 router.post('/managers', validate(createManagerSchema), createManager);
 
 // ==========================================
+// MANAGEMENT - SPECIALIST TAGS
+// ==========================================
+import {
+  adminListTags,
+  adminCreateTag,
+  adminUpdateTagCategories,
+  adminDeactivateTag,
+  createAdminTagSchema,
+  updateTagCategoriesSchema,
+} from '../controllers/tag.controller';
+
+router.get('/tags', adminListTags);
+router.post('/tags', validate(createAdminTagSchema), adminCreateTag);
+router.put('/tags/:id/categories', validate(updateTagCategoriesSchema), adminUpdateTagCategories);
+router.delete('/tags/:id', adminDeactivateTag);
+
+// ==========================================
 // MANAGEMENT - CATEGORIES
 // ==========================================
 router.get('/categories', getCategories);

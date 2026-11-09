@@ -27,6 +27,10 @@ import {
   isPlaceholderEmail,
   phonePlaceholderEmail,
 } from '../services/customer-onboarding.service';
+import { consumeSlotHold, SlotHoldError } from '../services/slot.hold';
+import { assignCrewToBooking, pickCrewForSlot } from '../services/crew.assign';
+import { resolveRequiredProfessionals } from '../services/tag.eligibility';
+import { formatTimeSlotLabel } from '../config/scheduling';
 
 // -------------------------------------------------------------
 // Validation Schemas
@@ -124,6 +128,10 @@ export const createBookingSchema = z.object({
       return today.toISOString().split('T')[0];
     }),
   scheduledTimeSlot: z.string().min(1, 'Scheduled time slot is required'),
+  scheduledStartAt: z.string().min(10).optional().nullable(),
+  scheduledEndAt: z.string().min(10).optional().nullable(),
+  slotHoldId: z.string().uuid().optional().nullable(),
+  slotType: z.enum(['NORMAL', 'EXPRESS']).optional(),
   paymentMethod: z.enum(['ONLINE', 'CASH', 'UPI', 'CARD', 'WALLET']).default('ONLINE'),
   notes: z.string().optional(),
   alternateContact: z.string().optional(),
@@ -597,8 +605,49 @@ function calculateDistanceKm(lat1: number, lon1: number, lat2: number, lon2: num
 export const createBooking = async (req: Request, res: Response): Promise<void> => {
   try {
     const userId = req.user!.userId;
-    const { serviceId, packageId, addressId, scheduledDate, scheduledTimeSlot, paymentMethod, notes, vendorId, alternateContact } =
-      req.body;
+    const {
+      serviceId,
+      packageId,
+      addressId,
+      scheduledDate,
+      scheduledTimeSlot,
+      scheduledStartAt: scheduledStartAtRaw,
+      scheduledEndAt: scheduledEndAtRaw,
+      slotHoldId,
+      slotType,
+      paymentMethod,
+      notes,
+      vendorId,
+      alternateContact,
+    } = req.body;
+
+    let consumedHold: Awaited<ReturnType<typeof consumeSlotHold>> | null = null;
+    if (slotHoldId) {
+      try {
+        consumedHold = await consumeSlotHold(slotHoldId, userId);
+      } catch (err) {
+        if (err instanceof SlotHoldError) {
+          sendError(res, err.code, err.message, err.httpStatus);
+          return;
+        }
+        throw err;
+      }
+    }
+
+    const timedStart = consumedHold?.scheduledStartAt
+      ? consumedHold.scheduledStartAt
+      : scheduledStartAtRaw
+        ? new Date(scheduledStartAtRaw)
+        : null;
+    const timedEnd = consumedHold?.scheduledEndAt
+      ? consumedHold.scheduledEndAt
+      : scheduledEndAtRaw
+        ? new Date(scheduledEndAtRaw)
+        : null;
+    const effectiveSlotLabel =
+      timedStart && timedEnd ? formatTimeSlotLabel(timedStart, timedEnd) : scheduledTimeSlot;
+    const effectiveDate = consumedHold?.scheduledDate || scheduledDate;
+    const effectiveSlotType = consumedHold?.slotType || slotType || 'NORMAL';
     const savedAlternate = normalizeOptionalContact(alternateContact);
     const bookingNotes = [
       notes?.trim() || '',
@@ -725,8 +774,15 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
       ? { lat: address.latitude as number, lng: address.longitude as number }
       : null;
 
-    // In-radius hub bookings are auto-accepted by the hub; professional assignment stays ASSIGNED later.
+    // In-radius hub bookings are auto-accepted by the hub; timed slots auto-assign professionals below.
     const initialStatus = matchedVendor ? ('ACCEPTED' as const) : ('PENDING' as const);
+
+    const requiredProfessionals = assignedVendorId
+      ? await resolveRequiredProfessionals({
+          vendorId: assignedVendorId,
+          packageId: actualPackageId,
+        })
+      : consumedHold?.requiredProfessionals || 1;
 
     const newBooking = await prisma.$transaction(async (tx) => {
       const [booking] = await Promise.all([
@@ -738,8 +794,13 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
             serviceId,
             packageId: actualPackageId,
             addressId: address.id,
-            scheduledDate,
-            scheduledTimeSlot,
+            scheduledDate: effectiveDate,
+            scheduledTimeSlot: effectiveSlotLabel,
+            scheduledStartAt: timedStart,
+            scheduledEndAt: timedEnd,
+            slotType: effectiveSlotType,
+            requiredProfessionals,
+            slotHoldId: consumedHold?.id || null,
             status: initialStatus,
             dispatchDueAt,
             dispatchAttempts: 0,
@@ -765,7 +826,7 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
                 changedBy: userId,
                 changedByRole: 'CUSTOMER',
                 reason: matchedVendor
-                  ? `Hub auto-accepted — routed to ${matchedVendor.warehouseName || matchedVendor.companyName}. Slot ${scheduledDate} (${scheduledTimeSlot}). Awaiting Working Professional assignment.`
+                  ? `Hub auto-accepted — routed to ${matchedVendor.warehouseName || matchedVendor.companyName}. Slot ${effectiveDate} (${effectiveSlotLabel}).`
                   : 'Customer is outside vendor service radiuses; nearest eligible professional search armed',
               },
             },
@@ -808,19 +869,62 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
       void syncDispatchTimer(newBooking.id);
     }
 
-    // Hub Provider assigns a Working Professional manually (no timed auto-assign).
-    if (matchedVendor?.user) {
+    let bookingResult = newBooking;
+
+    // Timed in-radius bookings: auto-assign N tag-eligible professionals.
+    if (matchedVendor && timedStart && timedEnd) {
+      try {
+        const crewIds = await pickCrewForSlot({
+          vendorId: matchedVendor.id,
+          categoryId: service.categoryId,
+          startAt: timedStart,
+          endAt: timedEnd,
+          required: requiredProfessionals,
+          serviceLat: servicePoint?.lat,
+          serviceLng: servicePoint?.lng,
+          preferCheckedIn: false,
+        });
+        if (crewIds.length >= requiredProfessionals) {
+          const assigned = await assignCrewToBooking({
+            bookingId: newBooking.id,
+            employeeIds: crewIds,
+            assignedBy: 'SYSTEM',
+            method: 'AUTO',
+          });
+          if (assigned) bookingResult = assigned as typeof newBooking;
+        } else if (matchedVendor.user) {
+          void notifyUsers(
+            [matchedVendor.user.id],
+            `Needs assignment #${bookingNumber}`,
+            `${service.name} for ${effectiveDate} (${effectiveSlotLabel}) — not enough eligible professionals. Assign manually.`,
+            { bookingId: newBooking.id, type: 'booking:assignment_failed' }
+          );
+        }
+      } catch (assignErr) {
+        console.error('Timed auto-assign failed:', assignErr);
+        if (matchedVendor.user) {
+          void notifyUsers(
+            [matchedVendor.user.id],
+            `Needs assignment #${bookingNumber}`,
+            `${service.name} for ${effectiveDate} (${effectiveSlotLabel}). Auto-assign failed — assign manually.`,
+            { bookingId: newBooking.id, type: 'booking:assignment_failed' }
+          );
+        }
+      }
+    } else if (matchedVendor?.user) {
       void notifyUsers(
         [matchedVendor.user.id],
         `New booking #${bookingNumber}`,
-        `Hub auto-accepted ${service.name} for ${scheduledDate} (${scheduledTimeSlot}). Assign a checked-in Working Professional.`,
+        `Hub auto-accepted ${service.name} for ${effectiveDate} (${effectiveSlotLabel}). Assign a checked-in Working Professional.`,
         { bookingId: newBooking.id, type: 'booking:new' }
       );
     }
 
-    // Customer confirmation — slots shown; visit time shared after Provider assigns a professional.
+    const assignedAlready = Boolean(bookingResult.employeeId);
     const customerConfirmMsg = matchedVendor
-      ? `Your order for ${service.name} is confirmed for ${scheduledDate} (${scheduledTimeSlot}). We'll let you know when our professionals will visit.`
+      ? assignedAlready
+        ? `Your order for ${service.name} is confirmed for ${effectiveDate} (${effectiveSlotLabel}). A professional has been assigned.`
+        : `Your order for ${service.name} is confirmed for ${effectiveDate} (${effectiveSlotLabel}). We'll update you when professionals are assigned.`
       : `Your order for ${service.name} is confirmed. You will be assigned a Working Professional soon.`;
     prisma.notification.create({
       data: {
@@ -837,35 +941,33 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
       { bookingId: newBooking.id, type: 'booking:confirmed' }
     );
 
-    // Non-blocking informational notification to admins (for transparency / audit)
     if (admins.length > 0) {
       prisma.notification.createMany({
         data: admins.map((admin) => ({
           title: `New booking #${bookingNumber} routed to provider`,
-          message: `${service.name} on ${scheduledDate} (${scheduledTimeSlot}) in ${address.city || 'area'}. Directly assigned to ${matchedVendor ? (matchedVendor.warehouseName || matchedVendor.companyName) : 'general queue'}.`,
+          message: `${service.name} on ${effectiveDate} (${effectiveSlotLabel}) in ${address.city || 'area'}. Directly assigned to ${matchedVendor ? (matchedVendor.warehouseName || matchedVendor.companyName) : 'general queue'}.`,
           target: 'SPECIFIC_USER' as const,
           targetUserId: admin.id,
         })),
       }).catch((e) => console.error('Failed to create admin notifications:', e));
     }
 
-    // Realtime socket dispatch to Customer & Provider
     const targetUserIds = [userId];
     if (matchedVendor?.user?.id) {
       targetUserIds.push(matchedVendor.user.id);
     }
 
     emitBookingEvent('booking:new', {
-      bookingId: newBooking.id,
-      bookingNumber: newBooking.bookingNumber,
-      status: newBooking.status,
+      bookingId: bookingResult.id,
+      bookingNumber: bookingResult.bookingNumber,
+      status: bookingResult.status,
       vendorId: assignedVendorId,
-      booking: newBooking,
+      booking: bookingResult,
     }, targetUserIds);
 
-    void emitBookingRefresh(newBooking.id);
+    void emitBookingRefresh(bookingResult.id);
 
-    sendSuccess(res, { booking: newBooking }, 201);
+    sendSuccess(res, { booking: bookingResult }, 201);
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
   }

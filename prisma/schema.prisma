@@ -163,6 +163,36 @@ enum NotificationTarget {
   SPECIFIC_USER
 }
 
+/// HOM_FLEXIBLE: hub-created, fungible across linked categories (except admin-specialist categories).
+/// ADMIN_SPECIALIST: Super Admin-created; pro only does that tag's categories.
+enum TagKind {
+  HOM_FLEXIBLE
+  ADMIN_SPECIALIST
+}
+
+enum SlotType {
+  NORMAL
+  EXPRESS
+}
+
+enum SlotHoldStatus {
+  ACTIVE
+  CONSUMED
+  EXPIRED
+  RELEASED
+}
+
+enum CrewMemberRole {
+  LEAD
+  MEMBER
+}
+
+enum CrewMemberStatus {
+  ASSIGNED
+  ABSENT
+  SUBSTITUTED
+}
+
 // ==========================================
 // IDENTITY & USERS
 // ==========================================
@@ -264,6 +294,9 @@ model VendorProfile {
   bookings           Booking[]       @relation("VendorBookings")
   reviews            Review[]        @relation("VendorReviews")
   salesVisits        SalesVisit[]
+  serviceTags        ServiceTag[]
+  hubPackageConfigs  HubPackageConfig[]
+  slotHolds          SlotHold[]
 
   @@index([kycStatus])
   @@index([isActive])
@@ -307,6 +340,8 @@ model EmployeeProfile {
   assignments    BookingAssignment[]
   salesVisits    SalesVisit[]
   photos         BookingPhoto[]
+  employeeTags   EmployeeTag[]
+  crewMemberships BookingCrewMember[]
 
   @@index([vendorId])
   @@index([isAvailable])
@@ -374,6 +409,7 @@ model ServiceCategory {
 
   services      Service[]
   subCategories ServiceSubCategory[]
+  tagCategories TagCategory[]
 
   @@index([isActive])
   @@index([deletedAt])
@@ -494,6 +530,7 @@ model ServicePackage {
   features           Json?    @default("[]")
 
   bookings           Booking[]
+  hubPackageConfigs  HubPackageConfig[]
 
   @@index([serviceId])
   @@index([isActive])
@@ -547,6 +584,12 @@ model Booking {
 
   scheduledDate      String               // YYYY-MM-DD
   scheduledTimeSlot  String               // e.g. 10:00 AM - 12:00 PM
+  /// Authoritative timed window (Phase 2+). Null on legacy bookings.
+  scheduledStartAt   DateTime?
+  scheduledEndAt     DateTime?
+  slotType           SlotType             @default(NORMAL)
+  requiredProfessionals Int               @default(1)
+  slotHoldId         String?
 
   status             BookingStatus        @default(PENDING)
 
@@ -628,6 +671,7 @@ model Booking {
   messages           BookingMessage[]
   photos             BookingPhoto[]
   escalations        EscalationTicket[]
+  crewMembers        BookingCrewMember[]
 
   @@index([customerId])
   @@index([vendorId])
@@ -635,6 +679,7 @@ model Booking {
   @@index([helperEmployeeId])
   @@index([status])
   @@index([scheduledDate])
+  @@index([scheduledStartAt])
   @@index([createdAt])
   @@index([customerId, createdAt(sort: Desc)])
   @@index([customerId, status, createdAt(sort: Desc)])
@@ -645,11 +690,13 @@ model Booking {
   @@index([helperEmployeeId, status])
   @@index([vendorId, scheduledDate])
   @@index([employeeId, scheduledDate, scheduledTimeSlot])
+  @@index([employeeId, scheduledStartAt, scheduledEndAt])
   @@index([vendorId, bookingSource, createdAt(sort: Desc)])
   @@index([employeeId, scheduledDate(sort: Desc)])
   @@index([vendorId, employeeId, status])
   @@index([assignmentStrategy, status])
   @@index([outOfRadiusDispatch, status])
+  @@index([slotHoldId])
 }
 
 /// Lead-generation visit captured by a Sales Manager at a warehouse, hub, or business location.
@@ -995,6 +1042,125 @@ model AuditLog {
   @@index([createdAt])
 }
 
+
+// ==========================================
+// TAGS, SLOTS, CREW (scheduled booking)
+// ==========================================
+
+model ServiceTag {
+  id          String         @id @default(uuid()) @map("_id")
+  name        String
+  slug        String
+  kind        TagKind
+  /// Null for ADMIN_SPECIALIST (global). Set for HOM_FLEXIBLE (hub-scoped).
+  vendorId    String?
+  vendor      VendorProfile? @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  description String?
+  isActive    Boolean        @default(true)
+  createdBy   String?
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  categories    TagCategory[]
+  employeeTags  EmployeeTag[]
+
+  @@unique([slug, vendorId])
+  @@index([kind, isActive])
+  @@index([vendorId, kind, isActive])
+}
+
+model TagCategory {
+  id         String          @id @default(uuid()) @map("_id")
+  tagId      String
+  tag        ServiceTag      @relation(fields: [tagId], references: [id], onDelete: Cascade)
+  categoryId String
+  category   ServiceCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  createdAt  DateTime        @default(now())
+
+  @@unique([tagId, categoryId])
+  @@index([categoryId])
+  @@index([tagId])
+}
+
+model EmployeeTag {
+  id         String          @id @default(uuid()) @map("_id")
+  employeeId String
+  employee   EmployeeProfile @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  tagId      String
+  tag        ServiceTag      @relation(fields: [tagId], references: [id], onDelete: Cascade)
+  assignedBy String?
+  assignedAt DateTime        @default(now())
+
+  @@unique([employeeId, tagId])
+  @@index([tagId])
+  @@index([employeeId])
+}
+
+/// HOM-configured crew size for a package at a specific hub.
+model HubPackageConfig {
+  id                     String         @id @default(uuid()) @map("_id")
+  vendorId               String
+  vendor                 VendorProfile  @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  packageId              String
+  package                ServicePackage @relation(fields: [packageId], references: [id], onDelete: Cascade)
+  requiredProfessionals  Int            @default(1)
+  isActive               Boolean        @default(true)
+  updatedBy              String?
+  createdAt              DateTime       @default(now())
+  updatedAt              DateTime       @updatedAt
+
+  @@unique([vendorId, packageId])
+  @@index([vendorId, isActive])
+  @@index([packageId])
+}
+
+/// Click-time slot reservation before booking confirm.
+model SlotHold {
+  id              String         @id @default(uuid()) @map("_id")
+  customerUserId  String
+  customerId      String?
+  vendorId        String
+  vendor          VendorProfile  @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  serviceId       String
+  packageId       String?
+  addressId       String?
+  scheduledDate   String
+  scheduledStartAt DateTime
+  scheduledEndAt  DateTime
+  slotType        SlotType       @default(NORMAL)
+  requiredProfessionals Int      @default(1)
+  status          SlotHoldStatus @default(ACTIVE)
+  expiresAt       DateTime
+  priorityScore   Int            @default(0)
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  @@index([vendorId, scheduledStartAt, scheduledEndAt, status])
+  @@index([customerUserId, status])
+  @@index([expiresAt, status])
+  @@index([serviceId, scheduledDate, status])
+}
+
+model BookingCrewMember {
+  id                  String           @id @default(uuid()) @map("_id")
+  bookingId           String
+  booking             Booking          @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  employeeId          String
+  employee            EmployeeProfile  @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  role                CrewMemberRole   @default(MEMBER)
+  status              CrewMemberStatus @default(ASSIGNED)
+  replacedEmployeeId  String?
+  substitutedBy       String?
+  substitutedAt       DateTime?
+  absentAt            DateTime?
+  note                String?
+  createdAt           DateTime         @default(now())
+  updatedAt           DateTime         @updatedAt
+
+  @@unique([bookingId, employeeId])
+  @@index([employeeId, status])
+  @@index([bookingId, status])
+}
 
 // ==========================================
 // OTP AUTHENTICATION & VERIFICATION

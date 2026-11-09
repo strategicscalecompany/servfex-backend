@@ -2139,6 +2139,24 @@ export const assignEmployeeToOrder = async (req: Request, res: Response): Promis
       return;
     }
 
+    if (employee) {
+      const { isEmployeeEligibleForCategory } = await import('../services/tag.eligibility');
+      const eligible = await isEmployeeEligibleForCategory({
+        employeeId: employee.id,
+        vendorId: vendorProfile.id,
+        categoryId: booking.service.categoryId,
+      });
+      if (!eligible) {
+        sendError(
+          res,
+          'EXPERT_NOT_ELIGIBLE',
+          'This professional’s tags do not allow this service category',
+          400
+        );
+        return;
+      }
+    }
+
     const resolvedPayout = expertPayout || payout || null;
     const resolvedInstructions = (instructions || note || '').trim();
 

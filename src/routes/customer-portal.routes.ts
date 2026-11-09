@@ -67,6 +67,18 @@ router.put('/addresses/:id', validate(addressSchema), updateCustomerAddress);
 router.delete('/addresses/:id', deleteCustomerAddress);
 router.patch('/addresses/:id/default', setDefaultCustomerAddress);
 
+// Timed availability & slot holds
+import {
+  getAvailableDates,
+  getAvailableSlots,
+  holdSlot,
+  holdSlotSchema,
+} from '../controllers/scheduling.controller';
+
+router.get('/availability/dates', getAvailableDates);
+router.get('/availability/slots', getAvailableSlots);
+router.post('/slots/hold', validate(holdSlotSchema), holdSlot);
+
 // Booking Lifecycle
 router.post('/bookings', validate(createBookingSchema), createBooking);
 router.get('/bookings', getCustomerBookings);

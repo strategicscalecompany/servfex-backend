@@ -13,11 +13,14 @@ import {
 } from './dispatch.rules';
 
 const DEFAULT_WORK_RADIUS_METERS = 200;
-const MIN_SHIFT_HOURS = 8;
-/** Shift length after which the WP must return to the hub to check out. */
-export const SHIFT_HOURS = 8;
-/** Extra hours after shift end before the account is flagged Late Worker. */
-export const GRACE_HOURS = 2;
+/** Planned 10-hour day (09:00–19:00). Checkout allowed after last job even if before 10h when ops ends early. */
+const MIN_SHIFT_HOURS = 0;
+/** Mandatory online cycle after check-in. */
+export const SHIFT_HOURS = 10;
+/** Kept for compatibility; late checkout is notified to HOM instead of a 2h grace flag. */
+export const GRACE_HOURS = 0;
+export const CHECK_IN_START_HOUR = 9;
+export const CHECK_IN_GRACE_MINUTES = 30;
 
 export function computeShiftTiming(hubCheckedInAt: Date | string | null | undefined, now: Date = new Date()) {
   if (!hubCheckedInAt) {
@@ -806,7 +809,11 @@ export async function hubCheckIn(userId: string, latitude: number, longitude: nu
     );
   }
   const now = new Date();
-  await prisma.employeeProfile.update({
+  const checkInDeadline = new Date(now);
+  checkInDeadline.setHours(CHECK_IN_START_HOUR, CHECK_IN_GRACE_MINUTES, 0, 0);
+  const lateCheckIn = now > checkInDeadline;
+
+  const full = await prisma.employeeProfile.update({
     where: { id: profile.id },
     data: {
       hubCheckedInAt: now,
@@ -820,7 +827,22 @@ export async function hubCheckIn(userId: string, latitude: number, longitude: nu
       isAvailable: true,
       acceptingRequests: true,
     },
+    include: {
+      user: { select: { name: true } },
+      vendor: { select: { userId: true, companyName: true } },
+    },
   });
+
+  if (lateCheckIn && full.vendor?.userId) {
+    const { notifyUsers } = await import('./notify.service');
+    void notifyUsers(
+      [full.vendor.userId],
+      'Late hub check-in',
+      `${full.user.name} checked in after 09:30 at ${full.vendor.companyName}.`,
+      { type: 'attendance:late_check_in', employeeUserId: userId }
+    );
+  }
+
   return getHubAttendanceStatus(userId);
 }
 
@@ -841,14 +863,22 @@ export async function hubCheckOut(userId: string, latitude: number, longitude: n
   if (!profile.hubCheckedInAt) {
     throw new DispatchError('NOT_CHECKED_IN', 'You are not checked in at the hub', 409);
   }
-  const workedHours = (Date.now() - new Date(profile.hubCheckedInAt).getTime()) / (1000 * 60 * 60);
-  if (workedHours < MIN_SHIFT_HOURS) {
+  // Block checkout while an active field job is still in progress.
+  const activeJob = await prisma.booking.findFirst({
+    where: {
+      OR: [{ employeeId: profile.id }, { helperEmployeeId: profile.id }],
+      status: { in: ['ON_THE_WAY', 'ARRIVED', 'IN_PROGRESS'] },
+    },
+    select: { id: true, bookingNumber: true },
+  });
+  if (activeJob) {
     throw new DispatchError(
-      'SHIFT_TOO_SHORT',
-      `Minimum shift is ${MIN_SHIFT_HOURS} hours. Worked so far: ${workedHours.toFixed(1)} h.`,
+      'ACTIVE_JOB',
+      `Finish booking #${activeJob.bookingNumber} before checking out.`,
       409
     );
   }
+  void MIN_SHIFT_HOURS;
   const hubLat = profile.vendor.latitude;
   const hubLng = profile.vendor.longitude;
   if (!isValidCoordinate(hubLat, hubLng)) {

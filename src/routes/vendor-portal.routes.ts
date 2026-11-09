@@ -168,4 +168,30 @@ router.get('/feedback', getVendorFeedback);
 // Customer offers (partner marketing push)
 router.post('/offers', validate(sendCustomerOfferSchema), sendCustomerOffer);
 
+// Tags, hub package crew size, day-of crew recovery
+import { requireHubContext } from '../middleware/hubContext';
+import {
+  vendorListTags,
+  vendorCreateHomTag,
+  vendorSetEmployeeTags,
+  vendorListHubPackages,
+  vendorSetHubPackageCrew,
+  createHomTagSchema,
+  setEmployeeTagsSchema,
+  setHubPackageCrewSchema,
+} from '../controllers/tag.controller';
+import {
+  listBookingSubstituteOptions,
+  markBookingCrewAbsent,
+  crewAbsentSchema,
+} from '../controllers/scheduling.controller';
+
+router.get('/tags', requireHubContext, vendorListTags);
+router.post('/tags', requireHubContext, validate(createHomTagSchema), vendorCreateHomTag);
+router.put('/employees/:id/tags', requireHubContext, validate(setEmployeeTagsSchema), vendorSetEmployeeTags);
+router.get('/hub-packages', requireHubContext, vendorListHubPackages);
+router.put('/hub-packages/crew', requireHubContext, validate(setHubPackageCrewSchema), vendorSetHubPackageCrew);
+router.get('/orders/:id/substitute-options', requireHubContext, listBookingSubstituteOptions);
+router.post('/orders/:id/crew-absent', requireHubContext, validate(crewAbsentSchema), markBookingCrewAbsent);
+
 export default router;
