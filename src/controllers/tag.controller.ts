@@ -266,12 +266,55 @@ export const adminSyncCategoryTags = async (req: Request, res: Response): Promis
 
 // ---- Vendor / HOM helpers expect vendorId resolved by caller ----
 
+/** Distinct catalog categories currently assigned to this hub via VendorService. */
+export async function listHubAssignedCategories(vendorId: string) {
+  const assignments = await prisma.vendorService.findMany({
+    where: {
+      vendorId,
+      isActive: true,
+      service: {
+        isActive: true,
+        OR: [{ deletedAt: null }, { deletedAt: { isSet: false } }],
+      },
+    },
+    select: {
+      service: {
+        select: {
+          categoryId: true,
+          category: { select: { id: true, name: true } },
+        },
+      },
+    },
+  });
+
+  const byId = new Map<string, { id: string; name: string }>();
+  for (const row of assignments) {
+    const cat = row.service?.category;
+    if (cat?.id) {
+      byId.set(cat.id, { id: cat.id, name: cat.name });
+    }
+  }
+  return [...byId.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
 export async function listTagsForHub(vendorId: string) {
+  const hubCategories = await listHubAssignedCategories(vendorId);
+  const hubCategoryIds = hubCategories.map((c) => c.id);
+
   return prisma.serviceTag.findMany({
     where: {
       isActive: true,
       OR: [
-        { kind: TagKind.ADMIN_SPECIALIST, vendorId: null },
+        // Admin specialist tags only when they cover a category this hub actually offers.
+        ...(hubCategoryIds.length > 0
+          ? [
+              {
+                kind: TagKind.ADMIN_SPECIALIST,
+                vendorId: null,
+                categories: { some: { categoryId: { in: hubCategoryIds } } },
+              },
+            ]
+          : []),
         { kind: TagKind.HOM_FLEXIBLE, vendorId },
       ],
     },
@@ -279,6 +322,21 @@ export async function listTagsForHub(vendorId: string) {
     orderBy: [{ kind: 'asc' }, { name: 'asc' }],
   });
 }
+
+export const vendorListHubCategories = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const vendorId = (req as any).hubVendorId as string;
+    if (!vendorId) {
+      sendError(res, 'FORBIDDEN', 'Hub context required', 403);
+      return;
+    }
+    const categories = await listHubAssignedCategories(vendorId);
+    sendSuccess(res, { categories });
+  } catch (err) {
+    console.error(err);
+    sendError(res, 'INTERNAL_ERROR', 'Failed to list hub categories', 500);
+  }
+};
 
 export const vendorListTags = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -307,6 +365,29 @@ export const vendorCreateHomTag = async (req: Request, res: Response): Promise<v
       sendError(res, 'CONFLICT', 'A tag with this name already exists for your hub', 409);
       return;
     }
+
+    const hubCategories = await listHubAssignedCategories(vendorId);
+    const hubCategoryIds = new Set(hubCategories.map((c) => c.id));
+    if (hubCategoryIds.size === 0) {
+      sendError(
+        res,
+        'BAD_REQUEST',
+        'No categories are assigned to this hub yet. Assign services to the hub first.',
+        400
+      );
+      return;
+    }
+    const invalid = categoryIds.filter((id) => !hubCategoryIds.has(id));
+    if (invalid.length > 0) {
+      sendError(
+        res,
+        'BAD_REQUEST',
+        'Hub tags can only link categories assigned to this hub',
+        400
+      );
+      return;
+    }
+
     const tag = await prisma.serviceTag.create({
       data: {
         name: name.trim(),

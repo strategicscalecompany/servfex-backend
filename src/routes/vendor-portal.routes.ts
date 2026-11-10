@@ -180,6 +180,7 @@ router.post('/offers', validate(sendCustomerOfferSchema), sendCustomerOffer);
 import { requireHubContext } from '../middleware/hubContext';
 import {
   vendorListTags,
+  vendorListHubCategories,
   vendorCreateHomTag,
   vendorSetEmployeeTags,
   vendorListHubPackages,
@@ -195,6 +196,7 @@ import {
 } from '../controllers/scheduling.controller';
 
 router.get('/tags', requireHubContext, vendorListTags);
+router.get('/hub-categories', requireHubContext, vendorListHubCategories);
 router.post('/tags', requireHubContext, validate(createHomTagSchema), vendorCreateHomTag);
 router.put('/employees/:id/tags', requireHubContext, validate(setEmployeeTagsSchema), vendorSetEmployeeTags);
 router.get('/hub-packages', requireHubContext, vendorListHubPackages);
