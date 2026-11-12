@@ -5,14 +5,6 @@ import { sendError } from '../utils/response';
 const HUB_UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-const hubSelect = {
-  id: true,
-  companyName: true,
-  warehouseName: true,
-  location: true,
-  warehouseLocation: true,
-} as const;
-
 /** Resolve assigned hub IDs for a HOM (primary vendorId + zone CSV names/UUIDs). */
 async function resolveManagerAssignedHubIds(manager: {
   vendorId: string | null;
