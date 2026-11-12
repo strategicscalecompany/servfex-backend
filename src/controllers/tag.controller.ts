@@ -1,270 +1,17 @@
 import { Request, Response } from 'express';
-import { TagKind } from '@prisma/client';
 import { z } from 'zod';
 import { prisma } from '../config/prisma';
 import { sendError, sendSuccess } from '../utils/response';
 
-function slugify(name: string): string {
-  return name
-    .toLowerCase()
-    .trim()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-|-$/g, '')
-    .slice(0, 64);
-}
-
-export const createAdminTagSchema = z.object({
-  name: z.string().min(2).max(80),
-  description: z.string().max(500).optional(),
-  categoryIds: z.array(z.string().uuid()).min(1),
-});
-
-export const updateTagCategoriesSchema = z.object({
-  categoryIds: z.array(z.string().uuid()).min(1),
-});
-
-export const createHomTagSchema = z.object({
-  name: z.string().min(2).max(80),
-  description: z.string().max(500).optional(),
-  categoryIds: z.array(z.string().uuid()).min(1),
-});
-
-export const setEmployeeTagsSchema = z.object({
-  tagIds: z.array(z.string().uuid()),
+export const setEmployeeCatalogSchema = z.object({
+  subCategoryIds: z.array(z.string().uuid()).default([]),
+  packageIds: z.array(z.string().uuid()).default([]),
 });
 
 export const setHubPackageCrewSchema = z.object({
   packageId: z.string().uuid(),
   requiredProfessionals: z.number().int().min(1).max(4),
 });
-
-function serializeTag(tag: any) {
-  return {
-    id: tag.id,
-    name: tag.name,
-    slug: tag.slug,
-    kind: tag.kind,
-    vendorId: tag.vendorId,
-    description: tag.description,
-    isActive: tag.isActive,
-    categories: (tag.categories || []).map((c: any) => ({
-      id: c.category?.id || c.categoryId,
-      name: c.category?.name,
-    })),
-    createdAt: tag.createdAt,
-  };
-}
-
-/** Super Admin: list all ADMIN_SPECIALIST tags (+ optional all). */
-export const adminListTags = async (_req: Request, res: Response): Promise<void> => {
-  try {
-    const tags = await prisma.serviceTag.findMany({
-      where: { kind: TagKind.ADMIN_SPECIALIST },
-      include: { categories: { include: { category: { select: { id: true, name: true } } } } },
-      orderBy: { name: 'asc' },
-    });
-    sendSuccess(res, tags.map(serializeTag));
-  } catch (err) {
-    console.error(err);
-    sendError(res, 'INTERNAL_ERROR', 'Failed to list tags', 500);
-  }
-};
-
-/** Super Admin: create specialist tag. */
-export const adminCreateTag = async (req: Request, res: Response): Promise<void> => {
-  try {
-    const { name, description, categoryIds } = req.body as z.infer<typeof createAdminTagSchema>;
-    const slug = slugify(name);
-    const existing = await prisma.serviceTag.findFirst({
-      where: { slug, kind: TagKind.ADMIN_SPECIALIST, vendorId: null },
-    });
-    if (existing) {
-      sendError(res, 'CONFLICT', 'A specialist tag with this name already exists', 409);
-      return;
-    }
-    const categories = await prisma.serviceCategory.findMany({
-      where: { id: { in: categoryIds }, deletedAt: null },
-      select: { id: true },
-    });
-    if (categories.length !== categoryIds.length) {
-      sendError(res, 'BAD_REQUEST', 'One or more categories are invalid', 400);
-      return;
-    }
-
-    const tag = await prisma.serviceTag.create({
-      data: {
-        name: name.trim(),
-        slug,
-        kind: TagKind.ADMIN_SPECIALIST,
-        vendorId: null,
-        description: description || null,
-        createdBy: req.user!.userId,
-        categories: {
-          create: categoryIds.map((categoryId: string) => ({ categoryId })),
-        },
-      },
-      include: { categories: { include: { category: { select: { id: true, name: true } } } } },
-    });
-    sendSuccess(res, serializeTag(tag), 201);
-  } catch (err) {
-    console.error(err);
-    sendError(res, 'INTERNAL_ERROR', 'Failed to create tag', 500);
-  }
-};
-
-export const adminUpdateTagCategories = async (req: Request, res: Response): Promise<void> => {
-  try {
-    const id = req.params.id as string;
-    const { categoryIds } = req.body as z.infer<typeof updateTagCategoriesSchema>;
-    const tag = await prisma.serviceTag.findFirst({
-      where: { id, kind: TagKind.ADMIN_SPECIALIST },
-    });
-    if (!tag) {
-      sendError(res, 'NOT_FOUND', 'Tag not found', 404);
-      return;
-    }
-    await prisma.$transaction([
-      prisma.tagCategory.deleteMany({ where: { tagId: id } }),
-      prisma.tagCategory.createMany({
-        data: categoryIds.map((categoryId: string) => ({ tagId: id, categoryId })),
-      }),
-    ]);
-    const updated = await prisma.serviceTag.findUnique({
-      where: { id },
-      include: { categories: { include: { category: { select: { id: true, name: true } } } } },
-    });
-    sendSuccess(res, serializeTag(updated));
-  } catch (err) {
-    console.error(err);
-    sendError(res, 'INTERNAL_ERROR', 'Failed to update tag categories', 500);
-  }
-};
-
-export const adminDeactivateTag = async (req: Request, res: Response): Promise<void> => {
-  try {
-    const id = req.params.id as string;
-    const tag = await prisma.serviceTag.update({
-      where: { id },
-      data: { isActive: false },
-    });
-    sendSuccess(res, { id: tag.id, isActive: tag.isActive });
-  } catch (err) {
-    console.error(err);
-    sendError(res, 'INTERNAL_ERROR', 'Failed to deactivate tag', 500);
-  }
-};
-
-export const syncCategoryTagsSchema = z.object({
-  tagIds: z.array(z.string().uuid()).default([]),
-  create: z
-    .array(
-      z.object({
-        name: z.string().min(2).max(80),
-        description: z.string().max(500).optional(),
-      })
-    )
-    .optional()
-    .default([]),
-});
-
-/** Super Admin: set ADMIN_SPECIALIST tags linked to one category (from category modal). */
-export const adminSyncCategoryTags = async (req: Request, res: Response): Promise<void> => {
-  try {
-    const categoryId = req.params.id as string;
-    const { tagIds, create } = req.body as z.infer<typeof syncCategoryTagsSchema>;
-
-    const category = await prisma.serviceCategory.findFirst({
-      where: { id: categoryId, deletedAt: null },
-      select: { id: true },
-    });
-    if (!category) {
-      sendError(res, 'NOT_FOUND', 'Category not found', 404);
-      return;
-    }
-
-    if (tagIds.length > 0) {
-      const existing = await prisma.serviceTag.findMany({
-        where: {
-          id: { in: tagIds },
-          kind: TagKind.ADMIN_SPECIALIST,
-          vendorId: null,
-        },
-        select: { id: true },
-      });
-      if (existing.length !== tagIds.length) {
-        sendError(res, 'BAD_REQUEST', 'One or more specialist tags are invalid', 400);
-        return;
-      }
-    }
-
-    const createdTagIds: string[] = [];
-    for (const item of create || []) {
-      const name = item.name.trim();
-      const slug = slugify(name);
-      const conflict = await prisma.serviceTag.findFirst({
-        where: { slug, kind: TagKind.ADMIN_SPECIALIST, vendorId: null },
-      });
-      if (conflict) {
-        // Reuse existing specialist tag and ensure this category is linked.
-        createdTagIds.push(conflict.id);
-        continue;
-      }
-      const tag = await prisma.serviceTag.create({
-        data: {
-          name,
-          slug,
-          kind: TagKind.ADMIN_SPECIALIST,
-          vendorId: null,
-          description: item.description || null,
-          createdBy: req.user!.userId,
-          categories: { create: [{ categoryId }] },
-        },
-      });
-      createdTagIds.push(tag.id);
-    }
-
-    const desired = Array.from(new Set([...tagIds, ...createdTagIds]));
-
-    const currentLinks = await prisma.tagCategory.findMany({
-      where: {
-        categoryId,
-        tag: { kind: TagKind.ADMIN_SPECIALIST },
-      },
-      select: { id: true, tagId: true },
-    });
-    const currentTagIds = new Set(currentLinks.map((l) => l.tagId));
-    const toRemove = currentLinks.filter((l) => !desired.includes(l.tagId)).map((l) => l.id);
-    const toAdd = desired.filter((id) => !currentTagIds.has(id));
-
-    await prisma.$transaction([
-      ...(toRemove.length
-        ? [prisma.tagCategory.deleteMany({ where: { id: { in: toRemove } } })]
-        : []),
-      ...(toAdd.length
-        ? [
-            prisma.tagCategory.createMany({
-              data: toAdd.map((tagId) => ({ tagId, categoryId })),
-            }),
-          ]
-        : []),
-    ]);
-
-    const tags = await prisma.serviceTag.findMany({
-      where: {
-        kind: TagKind.ADMIN_SPECIALIST,
-        categories: { some: { categoryId } },
-      },
-      include: { categories: { include: { category: { select: { id: true, name: true } } } } },
-      orderBy: { name: 'asc' },
-    });
-    sendSuccess(res, tags.map(serializeTag));
-  } catch (err) {
-    console.error(err);
-    sendError(res, 'INTERNAL_ERROR', 'Failed to sync category tags', 500);
-  }
-};
-
-// ---- Vendor / HOM helpers expect vendorId resolved by caller ----
 
 /** Distinct catalog categories currently assigned to this hub via VendorService. */
 export async function listHubAssignedCategories(vendorId: string) {
@@ -297,30 +44,140 @@ export async function listHubAssignedCategories(vendorId: string) {
   return [...byId.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
 
-export async function listTagsForHub(vendorId: string) {
-  const hubCategories = await listHubAssignedCategories(vendorId);
-  const hubCategoryIds = hubCategories.map((c) => c.id);
-
-  return prisma.serviceTag.findMany({
+/**
+ * Hub catalog tree for professional onboarding:
+ * categories → subcategories → packages (only services assigned to this hub).
+ */
+export async function listHubCatalogTree(vendorId: string) {
+  const vendorServices = await prisma.vendorService.findMany({
     where: {
+      vendorId,
       isActive: true,
-      OR: [
-        // Admin specialist tags only when they cover a category this hub actually offers.
-        ...(hubCategoryIds.length > 0
-          ? [
-              {
-                kind: TagKind.ADMIN_SPECIALIST,
-                vendorId: null,
-                categories: { some: { categoryId: { in: hubCategoryIds } } },
-              },
-            ]
-          : []),
-        { kind: TagKind.HOM_FLEXIBLE, vendorId },
-      ],
+      service: {
+        isActive: true,
+        OR: [{ deletedAt: null }, { deletedAt: { isSet: false } }],
+      },
     },
-    include: { categories: { include: { category: { select: { id: true, name: true } } } } },
-    orderBy: [{ kind: 'asc' }, { name: 'asc' }],
+    include: {
+      service: {
+        select: {
+          id: true,
+          name: true,
+          categoryId: true,
+          subCategoryId: true,
+          category: { select: { id: true, name: true, displayOrder: true } },
+          subCategory: { select: { id: true, name: true, displayOrder: true, categoryId: true } },
+          packages: {
+            where: { isActive: true },
+            select: {
+              id: true,
+              name: true,
+              title: true,
+              displayOrder: true,
+              discountedPrice: true,
+              originalPrice: true,
+              duration: true,
+            },
+            orderBy: { displayOrder: 'asc' },
+          },
+        },
+      },
+    },
   });
+
+  type PackageNode = {
+    id: string;
+    name: string;
+    serviceId: string;
+    serviceName: string;
+    discountedPrice: string | null;
+    originalPrice: string | null;
+    duration: string | null;
+  };
+  type SubNode = {
+    id: string;
+    name: string;
+    packages: PackageNode[];
+  };
+  type CatNode = {
+    id: string;
+    name: string;
+    subCategories: SubNode[];
+  };
+
+  const categories = new Map<string, CatNode & { _order: number }>();
+  const orphanPackagesByCategory = new Map<string, PackageNode[]>();
+
+  for (const vs of vendorServices) {
+    const svc = vs.service;
+    if (!svc?.category) continue;
+
+    if (!categories.has(svc.category.id)) {
+      categories.set(svc.category.id, {
+        id: svc.category.id,
+        name: svc.category.name,
+        subCategories: [],
+        _order: svc.category.displayOrder ?? 0,
+      });
+    }
+    const cat = categories.get(svc.category.id)!;
+
+    const packages: PackageNode[] = (svc.packages || []).map((pkg) => ({
+      id: pkg.id,
+      name: pkg.name || pkg.title || 'Package',
+      serviceId: svc.id,
+      serviceName: svc.name,
+      discountedPrice: pkg.discountedPrice ?? null,
+      originalPrice: pkg.originalPrice ?? null,
+      duration: pkg.duration ?? null,
+    }));
+
+    if (svc.subCategory) {
+      let sub = cat.subCategories.find((s) => s.id === svc.subCategory!.id);
+      if (!sub) {
+        sub = {
+          id: svc.subCategory.id,
+          name: svc.subCategory.name,
+          packages: [],
+        };
+        cat.subCategories.push(sub);
+      }
+      for (const pkg of packages) {
+        if (!sub.packages.some((p) => p.id === pkg.id)) sub.packages.push(pkg);
+      }
+    } else if (packages.length > 0) {
+      const existing = orphanPackagesByCategory.get(svc.category.id) || [];
+      for (const pkg of packages) {
+        if (!existing.some((p) => p.id === pkg.id)) existing.push(pkg);
+      }
+      orphanPackagesByCategory.set(svc.category.id, existing);
+    }
+  }
+
+  // Surface packages without a subcategory under a synthetic "Other" bucket per category.
+  for (const [catId, pkgs] of orphanPackagesByCategory) {
+    const cat = categories.get(catId);
+    if (!cat || pkgs.length === 0) continue;
+    cat.subCategories.push({
+      id: `__uncategorized__:${catId}`,
+      name: 'Other packages',
+      packages: pkgs,
+    });
+  }
+
+  return [...categories.values()]
+    .sort((a, b) => a._order - b._order || a.name.localeCompare(b.name))
+    .map(({ _order, ...rest }) => ({
+      ...rest,
+      subCategories: rest.subCategories
+        .map((s) => ({
+          ...s,
+          // Synthetic ids are UI-only; clients must not POST them as subCategoryIds.
+          selectable: !s.id.startsWith('__uncategorized__:'),
+          packages: s.packages,
+        }))
+        .sort((a, b) => a.name.localeCompare(b.name)),
+    }));
 }
 
 export const vendorListHubCategories = async (req: Request, res: Response): Promise<void> => {
@@ -338,82 +195,144 @@ export const vendorListHubCategories = async (req: Request, res: Response): Prom
   }
 };
 
-export const vendorListTags = async (req: Request, res: Response): Promise<void> => {
+export const vendorListHubCatalogTree = async (req: Request, res: Response): Promise<void> => {
   try {
     const vendorId = (req as any).hubVendorId as string;
     if (!vendorId) {
       sendError(res, 'FORBIDDEN', 'Hub context required', 403);
       return;
     }
-    const tags = await listTagsForHub(vendorId);
-    sendSuccess(res, tags.map(serializeTag));
+    const tree = await listHubCatalogTree(vendorId);
+    sendSuccess(res, { categories: tree });
   } catch (err) {
     console.error(err);
-    sendError(res, 'INTERNAL_ERROR', 'Failed to list tags', 500);
+    sendError(res, 'INTERNAL_ERROR', 'Failed to list hub catalog', 500);
   }
 };
 
-export const vendorCreateHomTag = async (req: Request, res: Response): Promise<void> => {
-  try {
-    const vendorId = (req as any).hubVendorId as string;
-    const { name, description, categoryIds } = req.body as z.infer<typeof createHomTagSchema>;
-    const slug = slugify(name);
-    const existing = await prisma.serviceTag.findFirst({
-      where: { slug, vendorId, kind: TagKind.HOM_FLEXIBLE },
+async function assertHubOwnsSubCategories(vendorId: string, subCategoryIds: string[]) {
+  if (subCategoryIds.length === 0) return;
+  const realIds = subCategoryIds.filter((id) => !id.startsWith('__uncategorized__:'));
+  if (realIds.length !== subCategoryIds.length) {
+    throw Object.assign(new Error('Invalid subcategory selection'), { code: 'BAD_REQUEST' });
+  }
+  const assigned = await prisma.vendorService.findMany({
+    where: {
+      vendorId,
+      isActive: true,
+      service: { subCategoryId: { in: realIds } },
+    },
+    select: { service: { select: { subCategoryId: true } } },
+  });
+  const allowed = new Set(
+    assigned.map((a) => a.service.subCategoryId).filter((id): id is string => !!id)
+  );
+  if (realIds.some((id) => !allowed.has(id))) {
+    throw Object.assign(new Error('One or more subcategories are not assigned to this hub'), {
+      code: 'BAD_REQUEST',
     });
-    if (existing) {
-      sendError(res, 'CONFLICT', 'A tag with this name already exists for your hub', 409);
-      return;
-    }
+  }
+}
 
-    const hubCategories = await listHubAssignedCategories(vendorId);
-    const hubCategoryIds = new Set(hubCategories.map((c) => c.id));
-    if (hubCategoryIds.size === 0) {
-      sendError(
-        res,
-        'BAD_REQUEST',
-        'No categories are assigned to this hub yet. Assign services to the hub first.',
-        400
-      );
-      return;
-    }
-    const invalid = categoryIds.filter((id) => !hubCategoryIds.has(id));
-    if (invalid.length > 0) {
-      sendError(
-        res,
-        'BAD_REQUEST',
-        'Hub tags can only link categories assigned to this hub',
-        400
-      );
-      return;
-    }
-
-    const tag = await prisma.serviceTag.create({
-      data: {
-        name: name.trim(),
-        slug,
-        kind: TagKind.HOM_FLEXIBLE,
-        vendorId,
-        description: description || null,
-        createdBy: req.user!.userId,
-        categories: {
-          create: categoryIds.map((categoryId: string) => ({ categoryId })),
+async function assertHubOwnsPackages(vendorId: string, packageIds: string[]) {
+  if (packageIds.length === 0) return;
+  const assigned = await prisma.vendorService.findMany({
+    where: {
+      vendorId,
+      isActive: true,
+      service: { packages: { some: { id: { in: packageIds } } } },
+    },
+    select: {
+      service: {
+        select: {
+          packages: {
+            where: { id: { in: packageIds } },
+            select: { id: true },
+          },
         },
       },
-      include: { categories: { include: { category: { select: { id: true, name: true } } } } },
+    },
+  });
+  const allowed = new Set(assigned.flatMap((a) => a.service.packages.map((p) => p.id)));
+  if (packageIds.some((id) => !allowed.has(id))) {
+    throw Object.assign(new Error('One or more packages are not assigned to this hub'), {
+      code: 'BAD_REQUEST',
     });
-    sendSuccess(res, serializeTag(tag), 201);
-  } catch (err) {
-    console.error(err);
-    sendError(res, 'INTERNAL_ERROR', 'Failed to create tag', 500);
   }
-};
+}
 
-export const vendorSetEmployeeTags = async (req: Request, res: Response): Promise<void> => {
+async function serializeEmployeeCatalog(employeeId: string) {
+  const [subs, pkgs] = await Promise.all([
+    prisma.employeeSubCategory.findMany({
+      where: { employeeId },
+      include: {
+        subCategory: {
+          select: {
+            id: true,
+            name: true,
+            categoryId: true,
+            category: { select: { id: true, name: true } },
+          },
+        },
+      },
+    }),
+    prisma.employeePackage.findMany({
+      where: { employeeId },
+      include: {
+        package: {
+          select: {
+            id: true,
+            name: true,
+            title: true,
+            serviceId: true,
+            service: { select: { id: true, name: true, subCategoryId: true } },
+          },
+        },
+      },
+    }),
+  ]);
+
+  return {
+    subCategories: subs.map((s) => ({
+      id: s.subCategory.id,
+      name: s.subCategory.name,
+      categoryId: s.subCategory.categoryId,
+      categoryName: s.subCategory.category?.name,
+    })),
+    packages: pkgs.map((p) => ({
+      id: p.package.id,
+      name: p.package.name || p.package.title || 'Package',
+      serviceId: p.package.serviceId,
+      serviceName: p.package.service?.name,
+      subCategoryId: p.package.service?.subCategoryId,
+    })),
+  };
+}
+
+export const vendorGetEmployeeCatalog = async (req: Request, res: Response): Promise<void> => {
   try {
     const vendorId = (req as any).hubVendorId as string;
     const employeeId = req.params.id as string;
-    const { tagIds } = req.body as z.infer<typeof setEmployeeTagsSchema>;
+    const employee = await prisma.employeeProfile.findFirst({
+      where: { id: employeeId, vendorId },
+      select: { id: true },
+    });
+    if (!employee) {
+      sendError(res, 'NOT_FOUND', 'Professional not found at this hub', 404);
+      return;
+    }
+    sendSuccess(res, await serializeEmployeeCatalog(employeeId));
+  } catch (err) {
+    console.error(err);
+    sendError(res, 'INTERNAL_ERROR', 'Failed to load professional catalog', 500);
+  }
+};
+
+export const vendorSetEmployeeCatalog = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const vendorId = (req as any).hubVendorId as string;
+    const employeeId = req.params.id as string;
+    const { subCategoryIds, packageIds } = req.body as z.infer<typeof setEmployeeCatalogSchema>;
 
     const employee = await prisma.employeeProfile.findFirst({
       where: { id: employeeId, vendorId },
@@ -423,66 +342,58 @@ export const vendorSetEmployeeTags = async (req: Request, res: Response): Promis
       return;
     }
 
-    const allowed = await prisma.serviceTag.findMany({
-      where: {
-        id: { in: tagIds },
-        isActive: true,
-        OR: [
-          { kind: TagKind.ADMIN_SPECIALIST, vendorId: null },
-          { kind: TagKind.HOM_FLEXIBLE, vendorId },
-        ],
-      },
-      select: { id: true, kind: true },
-    });
-    if (allowed.length !== tagIds.length) {
-      sendError(res, 'BAD_REQUEST', 'One or more tags are not available for this hub', 400);
+    const uniqueSubs = [...new Set(subCategoryIds)];
+    const uniquePkgs = [...new Set(packageIds)];
+
+    try {
+      await assertHubOwnsSubCategories(vendorId, uniqueSubs);
+      await assertHubOwnsPackages(vendorId, uniquePkgs);
+    } catch (e: any) {
+      sendError(res, e.code || 'BAD_REQUEST', e.message || 'Invalid catalog selection', 400);
       return;
     }
 
-    const adminIds = allowed.filter((t) => t.kind === TagKind.ADMIN_SPECIALIST).map((t) => t.id);
-    const hubIds = allowed.filter((t) => t.kind === TagKind.HOM_FLEXIBLE).map((t) => t.id);
-    // Admin specialist tags are solo + category-bound; never mix with hub-created tags.
-    if (adminIds.length > 0 && hubIds.length > 0) {
+    if (uniqueSubs.length === 0 && uniquePkgs.length === 0) {
       sendError(
         res,
-        'TAG_KIND_MIX',
-        'Assign either admin specialist tags or hub tags — not both on the same professional',
-        400
-      );
-      return;
-    }
-    if (adminIds.length > 1) {
-      sendError(
-        res,
-        'ADMIN_TAG_SOLO',
-        'A professional can have only one admin specialist tag (it locks them to that tag’s categories)',
+        'BAD_REQUEST',
+        'Assign at least one subcategory or package to this professional',
         400
       );
       return;
     }
 
     await prisma.$transaction([
-      prisma.employeeTag.deleteMany({ where: { employeeId } }),
-      prisma.employeeTag.createMany({
-        data: tagIds.map((tagId: string) => ({
-          employeeId,
-          tagId,
-          assignedBy: req.user!.userId,
-        })),
-      }),
+      prisma.employeeSubCategory.deleteMany({ where: { employeeId } }),
+      prisma.employeePackage.deleteMany({ where: { employeeId } }),
+      ...(uniqueSubs.length > 0
+        ? [
+            prisma.employeeSubCategory.createMany({
+              data: uniqueSubs.map((subCategoryId) => ({
+                employeeId,
+                subCategoryId,
+                assignedBy: req.user!.userId,
+              })),
+            }),
+          ]
+        : []),
+      ...(uniquePkgs.length > 0
+        ? [
+            prisma.employeePackage.createMany({
+              data: uniquePkgs.map((packageId) => ({
+                employeeId,
+                packageId,
+                assignedBy: req.user!.userId,
+              })),
+            }),
+          ]
+        : []),
     ]);
 
-    const tags = await prisma.employeeTag.findMany({
-      where: { employeeId },
-      include: { tag: { include: { categories: { include: { category: true } } } } },
-    });
-    sendSuccess(
-      res,
-      tags.map((t) => serializeTag(t.tag))
-    );
+    sendSuccess(res, await serializeEmployeeCatalog(employeeId));
   } catch (err) {
     console.error(err);
-    sendError(res, 'INTERNAL_ERROR', 'Failed to set professional tags', 500);
+    sendError(res, 'INTERNAL_ERROR', 'Failed to set professional catalog', 500);
   }
 };
 

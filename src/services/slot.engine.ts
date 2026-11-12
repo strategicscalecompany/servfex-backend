@@ -127,6 +127,8 @@ function isFree(
 export async function countFreeEligiblePros(params: {
   vendorId: string;
   categoryId: string;
+  subCategoryId?: string | null;
+  packageId?: string | null;
   startAt: Date;
   endAt: Date;
   requireCheckedIn?: boolean;
@@ -135,6 +137,8 @@ export async function countFreeEligiblePros(params: {
   const eligibleIds = await findEligibleEmployeeIds({
     vendorId: params.vendorId,
     categoryId: params.categoryId,
+    subCategoryId: params.subCategoryId,
+    packageId: params.packageId,
     requireCheckedIn: params.requireCheckedIn,
   });
   if (eligibleIds.length === 0) return 0;
@@ -191,6 +195,7 @@ export async function countFreeEligiblePros(params: {
 export async function generateAvailableSlots(params: {
   vendorId: string;
   categoryId: string;
+  subCategoryId?: string | null;
   packageId?: string | null;
   durationMinutes: number;
   dateYmd: string;
@@ -213,6 +218,8 @@ export async function generateAvailableSlots(params: {
   const eligibleIds = await findEligibleEmployeeIds({
     vendorId: params.vendorId,
     categoryId: params.categoryId,
+    subCategoryId: params.subCategoryId,
+    packageId: params.packageId,
     requireCheckedIn: false,
   });
   const busy = await loadBusyIntervals(eligibleIds, dayStart, dayEnd);
@@ -295,6 +302,8 @@ export async function generateAvailableSlots(params: {
       const freeCount = await countFreeEligiblePros({
         vendorId: params.vendorId,
         categoryId: params.categoryId,
+        subCategoryId: params.subCategoryId,
+        packageId: params.packageId,
         startAt,
         endAt,
         requireCheckedIn: true,
@@ -328,6 +337,7 @@ export async function generateAvailableSlots(params: {
 export async function listAvailableDates(params: {
   vendorId: string;
   categoryId: string;
+  subCategoryId?: string | null;
   packageId?: string | null;
   durationMinutes: number;
   fromDateYmd: string;
@@ -342,6 +352,7 @@ export async function listAvailableDates(params: {
     const slots = await generateAvailableSlots({
       vendorId: params.vendorId,
       categoryId: params.categoryId,
+      subCategoryId: params.subCategoryId,
       packageId: params.packageId,
       durationMinutes: params.durationMinutes,
       dateYmd: ymd,

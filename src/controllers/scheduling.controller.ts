@@ -114,6 +114,7 @@ export const getAvailableDates = async (req: Request, res: Response): Promise<vo
     const dates = await listAvailableDates({
       vendorId: resolved.vendorId,
       categoryId: resolved.service.categoryId,
+      subCategoryId: resolved.service.subCategoryId,
       packageId: pkg?.id,
       durationMinutes: duration,
       fromDateYmd: from,
@@ -147,6 +148,7 @@ export const getAvailableSlots = async (req: Request, res: Response): Promise<vo
     const slots = await generateAvailableSlots({
       vendorId: resolved.vendorId,
       categoryId: resolved.service.categoryId,
+      subCategoryId: resolved.service.subCategoryId,
       packageId: pkg?.id,
       durationMinutes: duration,
       dateYmd: date,

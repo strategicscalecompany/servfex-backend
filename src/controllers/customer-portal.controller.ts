@@ -877,12 +877,14 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
 
     let bookingResult = newBooking;
 
-    // Timed in-radius bookings: auto-assign N tag-eligible professionals.
+    // Timed in-radius bookings: auto-assign N catalog-eligible professionals.
     if (matchedVendor && timedStart && timedEnd) {
       try {
         const crewIds = await pickCrewForSlot({
           vendorId: matchedVendor.id,
           categoryId: service.categoryId,
+          subCategoryId: service.subCategoryId,
+          packageId: actualPackageId,
           startAt: timedStart,
           endAt: timedEnd,
           required: requiredProfessionals,

@@ -163,13 +163,6 @@ enum NotificationTarget {
   SPECIFIC_USER
 }
 
-/// HOM_FLEXIBLE: hub-created, fungible across linked categories (except admin-specialist categories).
-/// ADMIN_SPECIALIST: Super Admin-created; pro only does that tag's categories.
-enum TagKind {
-  HOM_FLEXIBLE
-  ADMIN_SPECIALIST
-}
-
 enum SlotType {
   NORMAL
   EXPRESS
@@ -294,7 +287,6 @@ model VendorProfile {
   bookings           Booking[]       @relation("VendorBookings")
   reviews            Review[]        @relation("VendorReviews")
   salesVisits        SalesVisit[]
-  serviceTags        ServiceTag[]
   hubPackageConfigs  HubPackageConfig[]
   slotHolds          SlotHold[]
 
@@ -340,7 +332,8 @@ model EmployeeProfile {
   assignments    BookingAssignment[]
   salesVisits    SalesVisit[]
   photos         BookingPhoto[]
-  employeeTags   EmployeeTag[]
+  employeeSubCategories EmployeeSubCategory[]
+  employeePackages      EmployeePackage[]
   crewMemberships BookingCrewMember[]
 
   @@index([vendorId])
@@ -409,7 +402,6 @@ model ServiceCategory {
 
   services      Service[]
   subCategories ServiceSubCategory[]
-  tagCategories TagCategory[]
 
   @@index([isActive])
   @@index([deletedAt])
@@ -429,6 +421,7 @@ model ServiceSubCategory {
   updatedAt    DateTime        @updatedAt
 
   services     Service[]
+  employeeSubCategories EmployeeSubCategory[]
 
   @@index([categoryId])
   @@index([isActive])
@@ -531,6 +524,7 @@ model ServicePackage {
 
   bookings           Booking[]
   hubPackageConfigs  HubPackageConfig[]
+  employeePackages   EmployeePackage[]
 
   @@index([serviceId])
   @@index([isActive])
@@ -1044,55 +1038,36 @@ model AuditLog {
 
 
 // ==========================================
-// TAGS, SLOTS, CREW (scheduled booking)
+// PROFESSIONAL CATALOG ASSIGNMENTS, SLOTS, CREW
 // ==========================================
 
-model ServiceTag {
-  id          String         @id @default(uuid()) @map("_id")
-  name        String
-  slug        String
-  kind        TagKind
-  /// Null for ADMIN_SPECIALIST (global). Set for HOM_FLEXIBLE (hub-scoped).
-  vendorId    String?
-  vendor      VendorProfile? @relation(fields: [vendorId], references: [id], onDelete: Cascade)
-  description String?
-  isActive    Boolean        @default(true)
-  createdBy   String?
-  createdAt   DateTime       @default(now())
-  updatedAt   DateTime       @updatedAt
+/// Subcategories a professional is qualified to fulfill (set during Partner/HOM onboarding).
+model EmployeeSubCategory {
+  id            String              @id @default(uuid()) @map("_id")
+  employeeId    String
+  employee      EmployeeProfile     @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  subCategoryId String
+  subCategory   ServiceSubCategory  @relation(fields: [subCategoryId], references: [id], onDelete: Cascade)
+  assignedBy    String?
+  assignedAt    DateTime            @default(now())
 
-  categories    TagCategory[]
-  employeeTags  EmployeeTag[]
-
-  @@unique([slug, vendorId])
-  @@index([kind, isActive])
-  @@index([vendorId, kind, isActive])
+  @@unique([employeeId, subCategoryId])
+  @@index([subCategoryId])
+  @@index([employeeId])
 }
 
-model TagCategory {
-  id         String          @id @default(uuid()) @map("_id")
-  tagId      String
-  tag        ServiceTag      @relation(fields: [tagId], references: [id], onDelete: Cascade)
-  categoryId String
-  category   ServiceCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
-  createdAt  DateTime        @default(now())
-
-  @@unique([tagId, categoryId])
-  @@index([categoryId])
-  @@index([tagId])
-}
-
-model EmployeeTag {
+/// Packages a professional is qualified to fulfill (fine-grained; set during Partner/HOM onboarding).
+model EmployeePackage {
   id         String          @id @default(uuid()) @map("_id")
   employeeId String
   employee   EmployeeProfile @relation(fields: [employeeId], references: [id], onDelete: Cascade)
-  tagId      String
-  tag        ServiceTag      @relation(fields: [tagId], references: [id], onDelete: Cascade)
+  packageId  String
+  package    ServicePackage  @relation(fields: [packageId], references: [id], onDelete: Cascade)
   assignedBy String?
   assignedAt DateTime        @default(now())
 
-  @@unique([employeeId, tagId])
-  @@index([tagId])
+  @@unique([employeeId, packageId])
+  @@index([packageId])
   @@index([employeeId])
 }
 

@@ -2374,17 +2374,19 @@ export const assignEmployeeToOrder = async (req: Request, res: Response): Promis
     }
 
     if (employee) {
-      const { isEmployeeEligibleForCategory } = await import('../services/tag.eligibility');
-      const eligible = await isEmployeeEligibleForCategory({
+      const { isEmployeeEligibleForCatalog } = await import('../services/tag.eligibility');
+      const eligible = await isEmployeeEligibleForCatalog({
         employeeId: employee.id,
         vendorId: vendorProfile.id,
         categoryId: booking.service.categoryId,
+        subCategoryId: booking.service.subCategoryId,
+        packageId: booking.packageId,
       });
       if (!eligible) {
         sendError(
           res,
           'EXPERT_NOT_ELIGIBLE',
-          'This professional’s tags do not allow this service category',
+          'This professional is not assigned to this subcategory or package',
           400
         );
         return;

@@ -1,109 +1,156 @@
-import { TagKind } from '@prisma/client';
 import { prisma } from '../config/prisma';
 
 /**
- * Dual-tag eligibility:
- * 1. If category is covered by any ADMIN_SPECIALIST tag → only pros with that specialist tag.
- * 2. Else → pros with a HOM_FLEXIBLE tag that includes the category (hub-scoped).
+ * Catalog-assignment eligibility:
+ * A professional is eligible when they have been assigned the booking's package
+ * and/or its service subcategory (set during Partner/HOM onboarding).
+ *
+ * Migration fallback: if no professional at the hub has any catalog assignments yet,
+ * treat all hub service professionals as eligible (legacy behaviour).
  */
 
-export async function getAdminSpecialistTagIdsForCategory(categoryId: string): Promise<string[]> {
-  const links = await prisma.tagCategory.findMany({
-    where: {
-      categoryId,
-      tag: { kind: TagKind.ADMIN_SPECIALIST, isActive: true },
-    },
-    select: { tagId: true },
-  });
-  return links.map((l) => l.tagId);
+type EmployeeWhereBase = {
+  vendorId: string;
+  isAvailable: true;
+  acceptingRequests: true;
+  expertKind: 'SERVICE_PROFESSIONAL';
+  user: { status: 'ACTIVE'; deletedAt: null };
+  hubCheckedInAt?: { not: null };
+};
+
+function buildEmployeeWhereBase(params: {
+  vendorId: string;
+  requireCheckedIn?: boolean;
+}): EmployeeWhereBase {
+  return {
+    vendorId: params.vendorId,
+    isAvailable: true,
+    acceptingRequests: true,
+    expertKind: 'SERVICE_PROFESSIONAL',
+    user: { status: 'ACTIVE', deletedAt: null },
+    ...(params.requireCheckedIn ? { hubCheckedInAt: { not: null } } : {}),
+  };
 }
 
-export async function getHomFlexibleTagIdsForCategory(
-  categoryId: string,
-  vendorId: string
-): Promise<string[]> {
-  const links = await prisma.tagCategory.findMany({
-    where: {
-      categoryId,
-      tag: {
-        kind: TagKind.HOM_FLEXIBLE,
-        isActive: true,
-        vendorId,
-      },
-    },
-    select: { tagId: true },
-  });
-  return links.map((l) => l.tagId);
+async function hubHasAnyCatalogAssignments(vendorId: string): Promise<boolean> {
+  const [anySub, anyPkg] = await Promise.all([
+    prisma.employeeSubCategory.findFirst({
+      where: { employee: { vendorId } },
+      select: { id: true },
+    }),
+    prisma.employeePackage.findFirst({
+      where: { employee: { vendorId } },
+      select: { id: true },
+    }),
+  ]);
+  return !!anySub || !!anyPkg;
 }
 
-/** Categories locked to admin specialist tags (HOM-flex pros must not receive these). */
-export async function getAdminSpecialistCategoryIds(): Promise<Set<string>> {
-  const links = await prisma.tagCategory.findMany({
-    where: { tag: { kind: TagKind.ADMIN_SPECIALIST, isActive: true } },
-    select: { categoryId: true },
+async function listAllHubPros(employeeWhereBase: EmployeeWhereBase): Promise<string[]> {
+  const employees = await prisma.employeeProfile.findMany({
+    where: employeeWhereBase,
+    select: { id: true },
   });
-  return new Set(links.map((l) => l.categoryId));
+  return employees.map((e) => e.id);
 }
 
 export async function findEligibleEmployeeIds(params: {
   vendorId: string;
-  categoryId: string;
+  categoryId?: string | null;
+  subCategoryId?: string | null;
+  packageId?: string | null;
   requireCheckedIn?: boolean;
 }): Promise<string[]> {
-  const { vendorId, categoryId, requireCheckedIn = false } = params;
+  const { vendorId, categoryId, subCategoryId, packageId, requireCheckedIn = false } = params;
+  const employeeWhereBase = buildEmployeeWhereBase({ vendorId, requireCheckedIn });
 
-  const specialistTagIds = await getAdminSpecialistTagIdsForCategory(categoryId);
+  if (!(await hubHasAnyCatalogAssignments(vendorId))) {
+    return listAllHubPros(employeeWhereBase);
+  }
 
-  const employeeWhereBase = {
-    vendorId,
-    isAvailable: true,
-    acceptingRequests: true,
-    expertKind: 'SERVICE_PROFESSIONAL' as const,
-    user: { status: 'ACTIVE' as const, deletedAt: null },
-    ...(requireCheckedIn ? { hubCheckedInAt: { not: null } } : {}),
-  };
+  const eligible = new Set<string>();
 
-  if (specialistTagIds.length > 0) {
-    const tagged = await prisma.employeeTag.findMany({
+  if (packageId) {
+    const byPackage = await prisma.employeePackage.findMany({
       where: {
-        tagId: { in: specialistTagIds },
+        packageId,
         employee: employeeWhereBase,
       },
       select: { employeeId: true },
     });
-    return [...new Set(tagged.map((t) => t.employeeId))];
+    byPackage.forEach((r) => eligible.add(r.employeeId));
   }
 
-  const flexTagIds = await getHomFlexibleTagIdsForCategory(categoryId, vendorId);
-  if (flexTagIds.length === 0) {
-    // No tags configured yet: fall back to all hub service professionals (legacy behaviour).
-    const employees = await prisma.employeeProfile.findMany({
-      where: employeeWhereBase,
-      select: { id: true },
+  let resolvedSubCategoryId = subCategoryId || null;
+  if (!resolvedSubCategoryId && packageId) {
+    const pkg = await prisma.servicePackage.findUnique({
+      where: { id: packageId },
+      select: { service: { select: { subCategoryId: true } } },
     });
-    return employees.map((e) => e.id);
+    resolvedSubCategoryId = pkg?.service?.subCategoryId || null;
   }
 
-  const tagged = await prisma.employeeTag.findMany({
-    where: {
-      tagId: { in: flexTagIds },
-      employee: employeeWhereBase,
-    },
-    select: { employeeId: true },
-  });
-  return [...new Set(tagged.map((t) => t.employeeId))];
+  if (resolvedSubCategoryId) {
+    const bySub = await prisma.employeeSubCategory.findMany({
+      where: {
+        subCategoryId: resolvedSubCategoryId,
+        employee: employeeWhereBase,
+      },
+      select: { employeeId: true },
+    });
+    bySub.forEach((r) => eligible.add(r.employeeId));
+  }
+
+  // Category-only lookups (slots / crew when package unknown): any assignment under that category.
+  if (eligible.size === 0 && categoryId && !packageId && !resolvedSubCategoryId) {
+    const [bySubCat, byPkg] = await Promise.all([
+      prisma.employeeSubCategory.findMany({
+        where: {
+          subCategory: { categoryId },
+          employee: employeeWhereBase,
+        },
+        select: { employeeId: true },
+      }),
+      prisma.employeePackage.findMany({
+        where: {
+          package: { service: { categoryId } },
+          employee: employeeWhereBase,
+        },
+        select: { employeeId: true },
+      }),
+    ]);
+    bySubCat.forEach((r) => eligible.add(r.employeeId));
+    byPkg.forEach((r) => eligible.add(r.employeeId));
+  }
+
+  return [...eligible];
 }
 
-export async function isEmployeeEligibleForCategory(params: {
+export async function isEmployeeEligibleForCatalog(params: {
   employeeId: string;
   vendorId: string;
-  categoryId: string;
+  categoryId?: string | null;
+  subCategoryId?: string | null;
+  packageId?: string | null;
 }): Promise<boolean> {
   const eligible = await findEligibleEmployeeIds({
     vendorId: params.vendorId,
     categoryId: params.categoryId,
+    subCategoryId: params.subCategoryId,
+    packageId: params.packageId,
   });
   return eligible.includes(params.employeeId);
+}
+
+/** @deprecated Use isEmployeeEligibleForCatalog */
+export async function isEmployeeEligibleForCategory(params: {
+  employeeId: string;
+  vendorId: string;
+  categoryId: string;
+  subCategoryId?: string | null;
+  packageId?: string | null;
+}): Promise<boolean> {
+  return isEmployeeEligibleForCatalog(params);
 }
 
 export async function resolveRequiredProfessionals(params: {

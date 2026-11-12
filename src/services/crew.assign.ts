@@ -46,6 +46,8 @@ export async function pickCrewForSlot(params: {
   tx?: Tx;
   vendorId: string;
   categoryId: string;
+  subCategoryId?: string | null;
+  packageId?: string | null;
   startAt: Date;
   endAt: Date;
   required: number;
@@ -58,6 +60,8 @@ export async function pickCrewForSlot(params: {
   const eligible = await findEligibleEmployeeIds({
     vendorId: params.vendorId,
     categoryId: params.categoryId,
+    subCategoryId: params.subCategoryId,
+    packageId: params.packageId,
     requireCheckedIn: false,
   });
 
@@ -198,7 +202,7 @@ export async function markCrewAbsentAndMaybeSubstitute(params: {
   const booking = await prisma.booking.findUnique({
     where: { id: params.bookingId },
     include: {
-      service: { select: { categoryId: true, name: true } },
+      service: { select: { categoryId: true, subCategoryId: true, name: true } },
       crewMembers: true,
     },
   });
@@ -227,10 +231,12 @@ export async function markCrewAbsentAndMaybeSubstitute(params: {
     const eligible = await findEligibleEmployeeIds({
       vendorId: booking.vendorId,
       categoryId: booking.service.categoryId,
+      subCategoryId: booking.service.subCategoryId,
+      packageId: booking.packageId,
       requireCheckedIn: true,
     });
     if (!eligible.includes(params.substituteEmployeeId)) {
-      throw new Error('Substitute is not tag-eligible or not checked in');
+      throw new Error('Substitute is not catalog-eligible or not checked in');
     }
 
     await prisma.bookingCrewMember.create({
@@ -299,13 +305,18 @@ export async function listFreeCheckedInSubstitutes(params: {
 }): Promise<Array<{ id: string; name: string; userId: string }>> {
   const booking = await prisma.booking.findUnique({
     where: { id: params.bookingId },
-    include: { service: { select: { categoryId: true } }, crewMembers: true },
+    include: {
+      service: { select: { categoryId: true, subCategoryId: true } },
+      crewMembers: true,
+    },
   });
   if (!booking?.vendorId || !booking.scheduledStartAt || !booking.scheduledEndAt) return [];
 
   const eligible = await findEligibleEmployeeIds({
     vendorId: booking.vendorId,
     categoryId: booking.service.categoryId,
+    subCategoryId: booking.service.subCategoryId,
+    packageId: booking.packageId,
     requireCheckedIn: true,
   });
   const crewIds = new Set(booking.crewMembers.map((c) => c.employeeId));

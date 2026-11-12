@@ -176,17 +176,16 @@ router.get('/feedback', getVendorFeedback);
 // Customer offers (partner marketing push)
 router.post('/offers', validate(sendCustomerOfferSchema), sendCustomerOffer);
 
-// Tags, hub package crew size, day-of crew recovery
+// Professional catalog assignments, hub package crew size, day-of crew recovery
 import { requireHubContext } from '../middleware/hubContext';
 import {
-  vendorListTags,
   vendorListHubCategories,
-  vendorCreateHomTag,
-  vendorSetEmployeeTags,
+  vendorListHubCatalogTree,
+  vendorGetEmployeeCatalog,
+  vendorSetEmployeeCatalog,
   vendorListHubPackages,
   vendorSetHubPackageCrew,
-  createHomTagSchema,
-  setEmployeeTagsSchema,
+  setEmployeeCatalogSchema,
   setHubPackageCrewSchema,
 } from '../controllers/tag.controller';
 import {
@@ -195,10 +194,15 @@ import {
   crewAbsentSchema,
 } from '../controllers/scheduling.controller';
 
-router.get('/tags', requireHubContext, vendorListTags);
 router.get('/hub-categories', requireHubContext, vendorListHubCategories);
-router.post('/tags', requireHubContext, validate(createHomTagSchema), vendorCreateHomTag);
-router.put('/employees/:id/tags', requireHubContext, validate(setEmployeeTagsSchema), vendorSetEmployeeTags);
+router.get('/hub-catalog', requireHubContext, vendorListHubCatalogTree);
+router.get('/employees/:id/catalog', requireHubContext, vendorGetEmployeeCatalog);
+router.put(
+  '/employees/:id/catalog',
+  requireHubContext,
+  validate(setEmployeeCatalogSchema),
+  vendorSetEmployeeCatalog
+);
 router.get('/hub-packages', requireHubContext, vendorListHubPackages);
 router.put('/hub-packages/crew', requireHubContext, validate(setHubPackageCrewSchema), vendorSetHubPackageCrew);
 router.get('/orders/:id/substitute-options', requireHubContext, listBookingSubstituteOptions);

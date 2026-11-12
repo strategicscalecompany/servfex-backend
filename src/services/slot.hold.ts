@@ -105,6 +105,7 @@ export async function createSlotHold(params: {
   const free = await countFreeEligiblePros({
     vendorId: params.vendorId,
     categoryId: params.categoryId,
+    packageId: params.packageId,
     startAt: params.startAt,
     endAt: params.endAt,
     excludeHoldCapacity: true,
@@ -113,6 +114,7 @@ export async function createSlotHold(params: {
   const freeWithHolds = await countFreeEligiblePros({
     vendorId: params.vendorId,
     categoryId: params.categoryId,
+    packageId: params.packageId,
     startAt: params.startAt,
     endAt: params.endAt,
     excludeHoldCapacity: false,
