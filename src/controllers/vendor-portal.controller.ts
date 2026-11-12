@@ -629,9 +629,14 @@ export const uploadVendorDocument = async (req: Request, res: Response): Promise
 export const getVendorServices = async (req: Request, res: Response): Promise<void> => {
   try {
     const actor = await resolvePortalActor(req.user!.userId);
-    const hubs = await assignedHubsForActor(actor);
-    const hubIds = hubs.map((h) => h.id);
-    const vendorId = actor.vendorId || hubIds[0] || null;
+    let hubIds: string[];
+    try {
+      ({ hubIds } = await scopedHubIdsForActor(actor, readRequestedHubVendorId(req)));
+    } catch (scopeErr: any) {
+      sendError(res, scopeErr.code || 'FORBIDDEN', scopeErr.message, scopeErr.status || 403);
+      return;
+    }
+    const vendorId = hubIds[0] || actor.vendorId || null;
     if (!vendorId && hubIds.length === 0) {
       sendError(res, 'NOT_FOUND', 'Vendor, employee, or hub manager profile not found', 404);
       return;
@@ -875,8 +880,37 @@ function formatHubOption(hub: {
   };
 }
 
+/** Resolve hub IDs for this actor, optionally scoped to one assigned hub (`vendorId` query). */
+export async function scopedHubIdsForActor(
+  actor: Awaited<ReturnType<typeof resolvePortalActor>>,
+  requestedVendorId?: string | null
+): Promise<{ hubs: ReturnType<typeof formatHubOption>[]; hubIds: string[] }> {
+  const hubs = await assignedHubsForActor(actor);
+  const requested = (requestedVendorId || '').trim();
+  if (requested) {
+    if (!hubs.some((h) => h.id === requested)) {
+      throw Object.assign(new Error('You can only view a hub you are assigned to'), {
+        code: 'FORBIDDEN',
+        status: 403,
+      });
+    }
+    return { hubs: hubs.filter((h) => h.id === requested), hubIds: [requested] };
+  }
+  return { hubs, hubIds: hubs.map((h) => h.id) };
+}
+
+function readRequestedHubVendorId(req: { query?: any; headers?: any }): string | null {
+  const fromQuery = typeof req.query?.vendorId === 'string' ? req.query.vendorId.trim() : '';
+  if (fromQuery) return fromQuery;
+  const header =
+    (typeof req.headers?.['x-hub-vendor-id'] === 'string' && req.headers['x-hub-vendor-id']) ||
+    (typeof req.headers?.['X-Hub-Vendor-Id'] === 'string' && req.headers['X-Hub-Vendor-Id']) ||
+    '';
+  return String(header).trim() || null;
+}
+
 /** Resolve all hubs for the portal actor (HOM multi-hub via vendorId + zone CSV names/UUIDs). */
-async function assignedHubsForActor(actor: Awaited<ReturnType<typeof resolvePortalActor>>) {
+export async function assignedHubsForActor(actor: Awaited<ReturnType<typeof resolvePortalActor>>) {
   const hubs = new Map<string, ReturnType<typeof formatHubOption>>();
   const push = (
     hub?: {
@@ -1094,8 +1128,15 @@ export const getManagerDashboard = async (req: Request, res: Response): Promise<
       return;
     }
 
-    const hubs = await assignedHubsForActor(actor);
-    const hubIds = hubs.map((h) => h.id);
+    let hubIds: string[];
+    try {
+      ({ hubIds } = await scopedHubIdsForActor(actor, readRequestedHubVendorId(req)));
+    } catch (scopeErr: any) {
+      sendError(res, scopeErr.code || 'FORBIDDEN', scopeErr.message, scopeErr.status || 403);
+      return;
+    }
+    // Always return the full assigned hub list for the HOM dropdown, even when scoped.
+    const allAssignedHubs = await assignedHubsForActor(actor);
     if (hubIds.length === 0) {
       sendError(res, 'HUB_NOT_ASSIGNED', 'This manager is not assigned to a local provider hub yet', 403);
       return;
@@ -1231,7 +1272,8 @@ export const getManagerDashboard = async (req: Request, res: Response): Promise<
       role: 'OPERATIONS_MANAGER',
       portalLabel: 'Hub Operation Manager',
       periodDays: 30,
-      hubs,
+      hubs: allAssignedHubs,
+      activeHubId: hubIds.length === 1 ? hubIds[0] : null,
       manager: {
         name: actor.user?.name || '',
         city: actor.user?.managerProfile?.city || '',
@@ -1419,7 +1461,13 @@ export const getVendorOrders = async (req: Request, res: Response): Promise<void
 
     let where: any = {};
     if (isVendor || isManager) {
-      const hubIds = (await assignedHubsForActor(actor)).map((hub) => hub.id);
+      let hubIds: string[];
+      try {
+        ({ hubIds } = await scopedHubIdsForActor(actor, readRequestedHubVendorId(req)));
+      } catch (scopeErr: any) {
+        sendError(res, scopeErr.code || 'FORBIDDEN', scopeErr.message, scopeErr.status || 403);
+        return;
+      }
       if (hubIds.length === 0) {
         sendError(res, 'HUB_NOT_ASSIGNED', 'This manager is not assigned to a local provider hub yet', 403);
         return;
@@ -2502,8 +2550,15 @@ export const assignEmployeeToOrder = async (req: Request, res: Response): Promis
 export const getVendorEmployees = async (req: Request, res: Response): Promise<void> => {
   try {
     const actor = await resolvePortalActor(req.user!.userId);
-    const vendorId = actor.vendorId;
-    if (!vendorId) {
+    let hubIds: string[];
+    try {
+      ({ hubIds } = await scopedHubIdsForActor(actor, readRequestedHubVendorId(req)));
+    } catch (scopeErr: any) {
+      sendError(res, scopeErr.code || 'FORBIDDEN', scopeErr.message, scopeErr.status || 403);
+      return;
+    }
+    const vendorId = hubIds[0] || actor.vendorId;
+    if (!vendorId || hubIds.length === 0) {
       sendError(res, 'NOT_FOUND', 'Vendor profile not found', 404);
       return;
     }
@@ -2516,7 +2571,7 @@ export const getVendorEmployees = async (req: Request, res: Response): Promise<v
 
     const employees = await prisma.employeeProfile.findMany({
       where: {
-        vendorId,
+        vendorId: hubIds.length === 1 ? vendorId : { in: hubIds },
         ...(isTestingWorkflowEnabled() && eligibleOnly
           ? {
               expertKind: 'SERVICE_PROFESSIONAL',
