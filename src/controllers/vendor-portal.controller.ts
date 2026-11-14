@@ -653,7 +653,7 @@ export const getVendorServices = async (req: Request, res: Response): Promise<vo
       },
       include: {
         service: {
-          include: { category: true, packages: true },
+          include: { category: true, subCategory: true, packages: true },
         },
       },
       orderBy: { createdAt: 'desc' },

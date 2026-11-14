@@ -89,6 +89,22 @@ import {
   updateSalesVisit,
   updateSalesVisitSchema,
 } from '../controllers/sales-visit.controller';
+import { requireHubContext } from '../middleware/hubContext';
+import {
+  vendorListHubCategories,
+  vendorListHubCatalogTree,
+  vendorGetEmployeeCatalog,
+  vendorSetEmployeeCatalog,
+  vendorListHubPackages,
+  vendorSetHubPackageCrew,
+  setEmployeeCatalogSchema,
+  setHubPackageCrewSchema,
+} from '../controllers/tag.controller';
+import {
+  listBookingSubstituteOptions,
+  markBookingCrewAbsent,
+  crewAbsentSchema,
+} from '../controllers/scheduling.controller';
 
 const router = Router();
 
@@ -177,23 +193,6 @@ router.get('/feedback', getVendorFeedback);
 router.post('/offers', validate(sendCustomerOfferSchema), sendCustomerOffer);
 
 // Professional catalog assignments, hub package crew size, day-of crew recovery
-import { requireHubContext } from '../middleware/hubContext';
-import {
-  vendorListHubCategories,
-  vendorListHubCatalogTree,
-  vendorGetEmployeeCatalog,
-  vendorSetEmployeeCatalog,
-  vendorListHubPackages,
-  vendorSetHubPackageCrew,
-  setEmployeeCatalogSchema,
-  setHubPackageCrewSchema,
-} from '../controllers/tag.controller';
-import {
-  listBookingSubstituteOptions,
-  markBookingCrewAbsent,
-  crewAbsentSchema,
-} from '../controllers/scheduling.controller';
-
 router.get('/hub-categories', requireHubContext, vendorListHubCategories);
 router.get('/hub-catalog', requireHubContext, vendorListHubCatalogTree);
 router.get('/employees/:id/catalog', requireHubContext, vendorGetEmployeeCatalog);

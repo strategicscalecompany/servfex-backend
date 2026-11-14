@@ -11,6 +11,7 @@ const ALLOWED_HEADERS = [
   'X-Correlation-Id',
   'X-Idempotency-Key',
   'X-Client-Platform',
+  'X-Hub-Vendor-Id',
   'Cache-Control',
   'Pragma',
 ].join(', ');
