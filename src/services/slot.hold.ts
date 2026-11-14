@@ -108,15 +108,18 @@ export async function createSlotHold(params: {
     packageId: params.packageId,
     startAt: params.startAt,
     endAt: params.endAt,
+    requireCheckedIn: true,
     excludeHoldCapacity: true,
   });
   // Re-count with holds except we just released; still need enough free pros
+  // (same checked-in pool used for today / tomorrow / week slot offers).
   const freeWithHolds = await countFreeEligiblePros({
     vendorId: params.vendorId,
     categoryId: params.categoryId,
     packageId: params.packageId,
     startAt: params.startAt,
     endAt: params.endAt,
+    requireCheckedIn: true,
     excludeHoldCapacity: false,
   });
   void free;

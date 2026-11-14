@@ -118,7 +118,7 @@ export const getAvailableDates = async (req: Request, res: Response): Promise<vo
       packageId: pkg?.id,
       durationMinutes: duration,
       fromDateYmd: from,
-      days: 14,
+      days: 7,
     });
     sendSuccess(res, { dates, vendorId: resolved.vendorId, durationMinutes: duration });
   } catch (err) {
