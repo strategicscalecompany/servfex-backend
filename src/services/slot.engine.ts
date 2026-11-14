@@ -127,6 +127,46 @@ function isFree(
   );
 }
 
+/** Earliest instant a checked-in pro can start a new job (check-in + gap). */
+async function loadCheckInReadyAt(
+  employeeIds: string[]
+): Promise<Map<string, Date>> {
+  const map = new Map<string, Date>();
+  if (employeeIds.length === 0) return map;
+  const rows = await prisma.employeeProfile.findMany({
+    where: { id: { in: employeeIds }, hubCheckedInAt: { not: null } },
+    select: { id: true, hubCheckedInAt: true },
+  });
+  const gapMs = SLOT_GAP_MINUTES * 60 * 1000;
+  for (const row of rows) {
+    if (!row.hubCheckedInAt) continue;
+    map.set(row.id, new Date(row.hubCheckedInAt.getTime() + gapMs));
+  }
+  return map;
+}
+
+/**
+ * Pro can cover [start,end] when not busy and — for today — the slot starts
+ * at/after their check-in + 15m (e.g. check-in 12:00 → first start 12:15).
+ * Does not mutate bookings; only affects newly offered availability.
+ */
+function canCoverSlot(params: {
+  intervals: Array<{ start: Date; end: Date }>;
+  startAt: Date;
+  endAt: Date;
+  isToday: boolean;
+  checkInReadyAt?: Date | null;
+}): boolean {
+  if (
+    params.isToday &&
+    params.checkInReadyAt &&
+    params.startAt.getTime() < params.checkInReadyAt.getTime()
+  ) {
+    return false;
+  }
+  return isFree(params.intervals, params.startAt, params.endAt);
+}
+
 export async function countFreeEligiblePros(params: {
   vendorId: string;
   categoryId: string;
@@ -147,13 +187,25 @@ export async function countFreeEligiblePros(params: {
   if (eligibleIds.length === 0) return 0;
 
   const dateYmd = ymdInBookingTz(params.startAt);
+  const isToday = ymdInBookingTz(new Date()) === dateYmd;
   const windowStart = atLocalTime(dateYmd, DAY_START_HOUR);
   const windowEnd = atLocalTime(dateYmd, DAY_END_HOUR);
 
   const busy = await loadBusyIntervals(eligibleIds, windowStart, windowEnd);
+  const checkInReady = isToday ? await loadCheckInReadyAt(eligibleIds) : new Map<string, Date>();
   let free = 0;
   for (const id of eligibleIds) {
-    if (isFree(busy.get(id) || [], params.startAt, params.endAt)) free++;
+    if (
+      canCoverSlot({
+        intervals: busy.get(id) || [],
+        startAt: params.startAt,
+        endAt: params.endAt,
+        isToday,
+        checkInReadyAt: checkInReady.get(id) || null,
+      })
+    ) {
+      free++;
+    }
   }
 
   if (!params.excludeHoldCapacity) {
@@ -210,6 +262,7 @@ export async function generateAvailableSlots(params: {
 
   // Capacity for today, tomorrow, and the rest of the week is driven by
   // professionals who are hub-checked-in right now (today's attendance).
+  // Tomorrow/future still use the fixed duration grid from DAY_START (09:00 IST).
   const eligibleIds = await findEligibleEmployeeIds({
     vendorId: params.vendorId,
     categoryId: params.categoryId,
@@ -220,11 +273,14 @@ export async function generateAvailableSlots(params: {
   // Slots may finish slightly after DAY_END; load busy through the latest possible end.
   const busyHorizon = new Date(dayEnd.getTime() + durationMs);
   const busy = await loadBusyIntervals(eligibleIds, dayStart, busyHorizon);
+  // Today only: a pro who checked in at 12:00 is ready from 12:15 — morning grid
+  // starts stay on the fixed timetable but that pro does not cover them.
+  const checkInReady = isToday ? await loadCheckInReadyAt(eligibleIds) : new Map<string, Date>();
 
   const slots: SlotCandidate[] = [];
   // Offer sequential windows of service duration with a fixed gap between starts
   // (e.g. 5h job: 09:00–14:00, then 14:15–19:15). Start must be before DAY_END;
-  // end may finish slightly after 19:00.
+  // end may finish slightly after 19:00. Existing bookings are never rewritten.
   const stepMs = durationMs + SLOT_GAP_MINUTES * 60 * 1000;
   for (let t = dayStart.getTime(); t < dayEnd.getTime(); t += stepMs) {
     const startAt = new Date(t);
@@ -236,7 +292,17 @@ export async function generateAvailableSlots(params: {
 
     let freeCount = 0;
     for (const id of eligibleIds) {
-      if (isFree(busy.get(id) || [], startAt, endAt)) freeCount++;
+      if (
+        canCoverSlot({
+          intervals: busy.get(id) || [],
+          startAt,
+          endAt,
+          isToday,
+          checkInReadyAt: checkInReady.get(id) || null,
+        })
+      ) {
+        freeCount++;
+      }
     }
 
     const holdRows = await prisma.slotHold.findMany({
