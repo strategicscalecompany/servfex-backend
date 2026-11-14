@@ -290,9 +290,8 @@ export async function generateAvailableSlots(params: {
     ? await loadCheckInWindows(eligibleIds)
     : new Map<string, CheckInWindow>();
 
-  // Offer every valid START (15m grid) where a free pro can cover the full duration.
-  // Sequential packing (9 → 1:15 → 5:30 only) hid most bookable times for tomorrow.
-  // Existing bookings unchanged — travel buffer still blocks double-booking a pro.
+  // Duration-based packing: next start = previous end + 15m (e.g. 3h → 6:15 then 9:30).
+  // Not a 15m arrival grid (6:15 / 6:30 / 6:45…). Bookings unchanged.
   const MIN_EXTRA_REMAINING_MS = 45 * 60 * 1000;
   let loopEndMs = dayEnd.getTime();
   let busyHorizon = new Date(dayEnd.getTime() + durationMs);
@@ -314,22 +313,26 @@ export async function generateAvailableSlots(params: {
       }
     }
   } else {
-    // Tomorrow/future: allow starts through the hub day; job may finish after 19:00.
-    // Last start must still leave room for the full service duration before late close.
+    // Tomorrow/future: standard day from 09:00; allow one more full-duration start
+    // past 19:00 when leftover time to late close supports it (45m+ and full duration).
     const lateClose = atLocalTime(params.dateYmd, DAY_END_HOUR + 3); // 22:00 IST
-    const lastStart = lateClose.getTime() - durationMs;
-    if (lastStart + 1 > loopEndMs) loopEndMs = lastStart + 1;
+    const remainingPastDayEnd = lateClose.getTime() - dayEnd.getTime();
+    if (remainingPastDayEnd >= MIN_EXTRA_REMAINING_MS) {
+      const lastStart = lateClose.getTime() - durationMs;
+      if (lastStart + 1 > loopEndMs) loopEndMs = lastStart + 1;
+    }
     if (lateClose.getTime() > busyHorizon.getTime()) busyHorizon = lateClose;
   }
 
   const busy = await loadBusyIntervals(eligibleIds, dayStart, busyHorizon);
 
   const slots: SlotCandidate[] = [];
-  // 15-minute start grid; each offer still lasts `durationMinutes` (e.g. 4 hrs).
-  const stepMs = SLOT_STEP_MINUTES * 60 * 1000;
+  const stepMs = durationMs + SLOT_GAP_MINUTES * 60 * 1000;
+  const alignMs = SLOT_STEP_MINUTES * 60 * 1000;
   let loopStartMs = dayStart.getTime();
   if (isToday) {
-    const snapped = Math.ceil(earliestStartMs / stepMs) * stepMs;
+    // First today slot ~ now+15m, then jump by full duration+gap.
+    const snapped = Math.ceil(earliestStartMs / alignMs) * alignMs;
     loopStartMs = Math.max(dayStart.getTime(), snapped);
   }
   for (let t = loopStartMs; t < loopEndMs; t += stepMs) {
