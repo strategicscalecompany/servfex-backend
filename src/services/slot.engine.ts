@@ -12,6 +12,7 @@ import {
   intervalsOverlap,
   parseDurationMinutes,
   resolveBookingDurationMinutes,
+  ymdInBookingTz,
 } from '../config/scheduling';
 import { findEligibleEmployeeIds, resolveRequiredProfessionals } from './tag.eligibility';
 import { ACTIVE_JOB_STATUSES } from './dispatch.rules';
@@ -145,17 +146,7 @@ export async function countFreeEligiblePros(params: {
   });
   if (eligibleIds.length === 0) return 0;
 
-  const dayStart = atLocalTime(
-    params.startAt.toISOString().slice(0, 10) === params.startAt.toLocaleDateString('en-CA')
-      ? params.startAt.toLocaleDateString('en-CA')
-      : `${params.startAt.getFullYear()}-${String(params.startAt.getMonth() + 1).padStart(2, '0')}-${String(params.startAt.getDate()).padStart(2, '0')}`,
-    DAY_START_HOUR
-  );
-  // Use local YMD from startAt
-  const y = params.startAt.getFullYear();
-  const m = String(params.startAt.getMonth() + 1).padStart(2, '0');
-  const d = String(params.startAt.getDate()).padStart(2, '0');
-  const dateYmd = `${y}-${m}-${d}`;
+  const dateYmd = ymdInBookingTz(params.startAt);
   const windowStart = atLocalTime(dateYmd, DAY_START_HOUR);
   const windowEnd = atLocalTime(dateYmd, DAY_END_HOUR);
 
@@ -212,10 +203,10 @@ export async function generateAvailableSlots(params: {
   const dayEnd = atLocalTime(params.dateYmd, DAY_END_HOUR);
   const durationMs = params.durationMinutes * 60 * 1000;
 
-  const isToday =
-    now.getFullYear() === dayStart.getFullYear() &&
-    now.getMonth() === dayStart.getMonth() &&
-    now.getDate() === dayStart.getDate();
+  // Compare against India calendar day — not the EC2/UTC machine clock's local date.
+  const isToday = ymdInBookingTz(now) === params.dateYmd;
+  // Earliest bookable start: now + lead time (never offer a slot that already started).
+  const earliestStartMs = now.getTime() + SLOT_GAP_MINUTES * 60 * 1000;
 
   // Capacity for today, tomorrow, and the rest of the week is driven by
   // professionals who are hub-checked-in right now (today's attendance).
@@ -238,7 +229,10 @@ export async function generateAvailableSlots(params: {
   for (let t = dayStart.getTime(); t < dayEnd.getTime(); t += stepMs) {
     const startAt = new Date(t);
     const endAt = new Date(t + durationMs);
-    if (isToday && startAt.getTime() < now.getTime() + SLOT_GAP_MINUTES * 60 * 1000) continue;
+    // Today: only present/future starts (IST). Skip anything already underway or past.
+    if (isToday && (startAt.getTime() < earliestStartMs || endAt.getTime() <= now.getTime())) {
+      continue;
+    }
 
     let freeCount = 0;
     for (const id of eligibleIds) {

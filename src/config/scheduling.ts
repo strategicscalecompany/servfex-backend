@@ -1,9 +1,14 @@
 /** Planned bookable day and attendance defaults for timed booking. */
 
-export const DAY_START_HOUR = 9; // 09:00
-export const DAY_END_HOUR = 19; // 19:00
+/** All customer-facing slot wall clocks are India Standard Time (no DST). */
+export const BOOKING_TIMEZONE = 'Asia/Kolkata';
+/** Fixed IST offset from UTC (India does not observe DST). */
+const IST_OFFSET_MS = (5 * 60 + 30) * 60 * 1000;
+
+export const DAY_START_HOUR = 9; // 09:00 IST
+export const DAY_END_HOUR = 19; // 19:00 IST
 export const SHIFT_HOURS = 10;
-export const CHECK_IN_GRACE_MINUTES = 30; // check-in allowed until 09:30
+export const CHECK_IN_GRACE_MINUTES = 30; // check-in allowed until 09:30 IST
 /** Express-slot start rounding only; normal offers step by duration + SLOT_GAP_MINUTES. */
 export const SLOT_STEP_MINUTES = 15;
 /** Gap between consecutive duration-based slot offers (and travel buffer after a job). */
@@ -63,15 +68,33 @@ export function resolveBookingDurationMinutes(opts: {
   return 60;
 }
 
-/** Build Date for YYYY-MM-DD at local wall-clock hour:minute in Asia/Kolkata-ish server local. */
+/** YYYY-MM-DD for an instant in the booking timezone (Asia/Kolkata). */
+export function ymdInBookingTz(date: Date = new Date()): string {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: BOOKING_TIMEZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(date);
+}
+
+/**
+ * Instant when it is `hour:minute` on `dateYmd` in Asia/Kolkata.
+ * Independent of the server's OS timezone (EC2 may be UTC/EU).
+ */
 export function atLocalTime(dateYmd: string, hour: number, minute = 0): Date {
   const [y, m, d] = dateYmd.split('-').map(Number);
-  return new Date(y, m - 1, d, hour, minute, 0, 0);
+  return new Date(Date.UTC(y, m - 1, d, hour, minute, 0, 0) - IST_OFFSET_MS);
 }
 
 export function formatTimeSlotLabel(start: Date, end: Date): string {
   const fmt = (d: Date) =>
-    d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+    d.toLocaleTimeString('en-US', {
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+      timeZone: BOOKING_TIMEZONE,
+    });
   return `${fmt(start)} - ${fmt(end)}`;
 }
 
