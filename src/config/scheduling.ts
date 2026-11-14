@@ -29,6 +29,40 @@ export function parseDurationMinutes(
   return mins > 0 ? mins : 60;
 }
 
+/**
+ * Resolve bookable duration for a package/service.
+ * Prefer package duration text, then minutes, then service durationText.
+ * Avoids the Prisma default `durationMinutes: 60` masking a real "3 hrs" / "5h" label.
+ */
+export function resolveBookingDurationMinutes(opts: {
+  packageDurationMinutes?: number | null;
+  packageDurationText?: string | null;
+  serviceDurationText?: string | null;
+}): number {
+  const pkgText = (opts.packageDurationText || '').trim();
+  const svcText = (opts.serviceDurationText || '').trim();
+  const fromPkgText = parseDurationMinutes(null, pkgText || null);
+  const fromSvcText = parseDurationMinutes(null, svcText || null);
+  const fromMins =
+    opts.packageDurationMinutes != null &&
+    Number.isFinite(opts.packageDurationMinutes) &&
+    opts.packageDurationMinutes > 0
+      ? Math.round(opts.packageDurationMinutes)
+      : 0;
+
+  const isDefaultSixtyText = (t: string) => /^60\s*mins?$/i.test(t);
+
+  if (pkgText && !isDefaultSixtyText(pkgText) && fromPkgText > 0) return fromPkgText;
+  if (fromMins > 0) {
+    if (fromMins === 60 && fromSvcText > 60) return fromSvcText;
+    if (fromMins === 60 && fromPkgText > 60) return fromPkgText;
+    return fromMins;
+  }
+  if (fromPkgText > 0) return fromPkgText;
+  if (fromSvcText > 0) return fromSvcText;
+  return 60;
+}
+
 /** Build Date for YYYY-MM-DD at local wall-clock hour:minute in Asia/Kolkata-ish server local. */
 export function atLocalTime(dateYmd: string, hour: number, minute = 0): Date {
   const [y, m, d] = dateYmd.split('-').map(Number);

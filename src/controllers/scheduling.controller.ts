@@ -10,7 +10,7 @@ import {
 import {
   generateAvailableSlots,
   listAvailableDates,
-  parseDurationMinutes,
+  resolveBookingDurationMinutes,
 } from '../services/slot.engine';
 import { createSlotHold, holdToDisplay, SlotHoldError } from '../services/slot.hold';
 import {
@@ -105,7 +105,11 @@ export const getAvailableDates = async (req: Request, res: Response): Promise<vo
     const pkg = packageId
       ? resolved.service.packages.find((p) => p.id === packageId)
       : resolved.service.packages[0];
-    const duration = parseDurationMinutes(pkg?.durationMinutes, pkg?.duration || resolved.service.durationText);
+    const duration = resolveBookingDurationMinutes({
+      packageDurationMinutes: pkg?.durationMinutes,
+      packageDurationText: pkg?.duration,
+      serviceDurationText: resolved.service.durationText,
+    });
     const today = new Date();
     const from =
       fromDate ||
@@ -144,7 +148,11 @@ export const getAvailableSlots = async (req: Request, res: Response): Promise<vo
     const pkg = packageId
       ? resolved.service.packages.find((p) => p.id === packageId)
       : resolved.service.packages[0];
-    const duration = parseDurationMinutes(pkg?.durationMinutes, pkg?.duration || resolved.service.durationText);
+    const duration = resolveBookingDurationMinutes({
+      packageDurationMinutes: pkg?.durationMinutes,
+      packageDurationText: pkg?.duration,
+      serviceDurationText: resolved.service.durationText,
+    });
     const slots = await generateAvailableSlots({
       vendorId: resolved.vendorId,
       categoryId: resolved.service.categoryId,

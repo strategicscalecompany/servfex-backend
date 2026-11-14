@@ -11,6 +11,7 @@ import {
   formatTimeSlotLabel,
   intervalsOverlap,
   parseDurationMinutes,
+  resolveBookingDurationMinutes,
 } from '../config/scheduling';
 import { findEligibleEmployeeIds, resolveRequiredProfessionals } from './tag.eligibility';
 import { ACTIVE_JOB_STATUSES } from './dispatch.rules';
@@ -367,4 +368,4 @@ export async function listAvailableDates(params: {
   return dates;
 }
 
-export { parseDurationMinutes };
+export { parseDurationMinutes, resolveBookingDurationMinutes };
