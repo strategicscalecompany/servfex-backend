@@ -4,8 +4,11 @@ export const DAY_START_HOUR = 9; // 09:00
 export const DAY_END_HOUR = 19; // 19:00
 export const SHIFT_HOURS = 10;
 export const CHECK_IN_GRACE_MINUTES = 30; // check-in allowed until 09:30
-export const SLOT_STEP_MINUTES = 30;
-export const TRAVEL_BUFFER_MINUTES = 30;
+/** Express-slot start rounding only; normal offers step by duration + SLOT_GAP_MINUTES. */
+export const SLOT_STEP_MINUTES = 15;
+/** Gap between consecutive duration-based slot offers (and travel buffer after a job). */
+export const SLOT_GAP_MINUTES = 15;
+export const TRAVEL_BUFFER_MINUTES = 15;
 export const SLOT_HOLD_TTL_SECONDS = 180; // 3 minutes
 export const EXPRESS_LOOKAHEAD_HOURS = 2;
 export const MAX_REQUIRED_PROFESSIONALS = 4;

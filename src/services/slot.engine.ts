@@ -4,6 +4,7 @@ import {
   DAY_END_HOUR,
   DAY_START_HOUR,
   EXPRESS_LOOKAHEAD_HOURS,
+  SLOT_GAP_MINUTES,
   SLOT_STEP_MINUTES,
   TRAVEL_BUFFER_MINUTES,
   atLocalTime,
@@ -215,24 +216,28 @@ export async function generateAvailableSlots(params: {
     now.getMonth() === dayStart.getMonth() &&
     now.getDate() === dayStart.getDate();
 
+  // Capacity for today, tomorrow, and the rest of the week is driven by
+  // professionals who are hub-checked-in right now (today's attendance).
   const eligibleIds = await findEligibleEmployeeIds({
     vendorId: params.vendorId,
     categoryId: params.categoryId,
     subCategoryId: params.subCategoryId,
     packageId: params.packageId,
-    requireCheckedIn: false,
+    requireCheckedIn: true,
   });
-  const busy = await loadBusyIntervals(eligibleIds, dayStart, dayEnd);
+  // Slots may finish slightly after DAY_END; load busy through the latest possible end.
+  const busyHorizon = new Date(dayEnd.getTime() + durationMs);
+  const busy = await loadBusyIntervals(eligibleIds, dayStart, busyHorizon);
 
   const slots: SlotCandidate[] = [];
-  for (
-    let t = dayStart.getTime();
-    t + durationMs <= dayEnd.getTime();
-    t += SLOT_STEP_MINUTES * 60 * 1000
-  ) {
+  // Offer sequential windows of service duration with a fixed gap between starts
+  // (e.g. 5h job: 09:00–14:00, then 14:15–19:15). Start must be before DAY_END;
+  // end may finish slightly after 19:00.
+  const stepMs = durationMs + SLOT_GAP_MINUTES * 60 * 1000;
+  for (let t = dayStart.getTime(); t < dayEnd.getTime(); t += stepMs) {
     const startAt = new Date(t);
     const endAt = new Date(t + durationMs);
-    if (isToday && startAt.getTime() < now.getTime() + 15 * 60 * 1000) continue;
+    if (isToday && startAt.getTime() < now.getTime() + SLOT_GAP_MINUTES * 60 * 1000) continue;
 
     let freeCount = 0;
     for (const id of eligibleIds) {
@@ -343,7 +348,7 @@ export async function listAvailableDates(params: {
   fromDateYmd: string;
   days?: number;
 }): Promise<string[]> {
-  const days = params.days ?? 14;
+  const days = params.days ?? 7;
   const dates: string[] = [];
   const [y, m, d] = params.fromDateYmd.split('-').map(Number);
   for (let i = 0; i < days; i++) {
