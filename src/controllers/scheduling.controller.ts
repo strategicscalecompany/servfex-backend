@@ -42,25 +42,69 @@ export const crewAbsentSchema = z.object({
   substituteEmployeeId: z.string().uuid().optional().nullable(),
 });
 
+/** Short TTL cache — hub routing rarely changes mid-session; avoids re-scanning all vendors. */
+const hubResolveCache = new Map<string, { at: number; value: Awaited<ReturnType<typeof resolveHubForAddressUncached>> }>();
+const HUB_CACHE_TTL_MS = 45_000;
+
 async function resolveHubForAddress(serviceId: string, addressId: string, userId: string) {
+  const key = `${userId}:${serviceId}:${addressId}`;
+  const hit = hubResolveCache.get(key);
+  if (hit && Date.now() - hit.at < HUB_CACHE_TTL_MS) return hit.value;
+  const value = await resolveHubForAddressUncached(serviceId, addressId, userId);
+  hubResolveCache.set(key, { at: Date.now(), value });
+  if (hubResolveCache.size > 500) {
+    const cutoff = Date.now() - HUB_CACHE_TTL_MS;
+    for (const [k, v] of hubResolveCache) {
+      if (v.at < cutoff) hubResolveCache.delete(k);
+    }
+  }
+  return value;
+}
+
+async function resolveHubForAddressUncached(serviceId: string, addressId: string, userId: string) {
+  // Slim queries: only the package we need + vendors that actually offer this service
+  // (or have an empty catalog = general partner). Avoid loading every employee row.
   const [service, address, candidateVendors] = await Promise.all([
     prisma.service.findFirst({
       where: { id: serviceId, isActive: true, deletedAt: null },
-      include: {
-        packages: { where: { isActive: true } },
+      select: {
+        id: true,
+        categoryId: true,
+        subCategoryId: true,
+        durationText: true,
+        packages: {
+          where: { isActive: true },
+          select: { id: true, durationMinutes: true, duration: true },
+        },
       },
     }),
-    prisma.userAddress.findFirst({ where: { id: addressId, userId } }),
+    prisma.userAddress.findFirst({
+      where: { id: addressId, userId },
+      select: {
+        id: true,
+        latitude: true,
+        longitude: true,
+        city: true,
+      },
+    }),
     prisma.vendorProfile.findMany({
-      where: { isActive: true, kycStatus: { not: 'REJECTED' } },
+      where: {
+        isActive: true,
+        kycStatus: { not: 'REJECTED' },
+        OR: [
+          { vendorServices: { none: {} } },
+          { vendorServices: { some: { serviceId, isActive: true } } },
+        ],
+      },
       select: {
         id: true,
         latitude: true,
         longitude: true,
         serviceRadiusKm: true,
         location: true,
-        vendorServices: { where: { isActive: true }, select: { serviceId: true } },
-        employees: { where: { isAvailable: true }, select: { id: true }, take: 25 },
+        _count: {
+          select: { employees: { where: { isAvailable: true } } },
+        },
       },
     }),
   ]);
@@ -73,10 +117,8 @@ async function resolveHubForAddress(serviceId: string, addressId: string, userId
     longitude: vendor.longitude,
     serviceRadiusKm: vendor.serviceRadiusKm ?? 25,
     location: vendor.location || '',
-    offersService:
-      vendor.vendorServices.length === 0 ||
-      vendor.vendorServices.some((vs) => vs.serviceId === serviceId),
-    availableExperts: vendor.employees.length,
+    offersService: true,
+    availableExperts: vendor._count.employees,
   }));
 
   const point = isValidCoordinate(address.latitude, address.longitude)
@@ -132,6 +174,7 @@ export const getAvailableDates = async (req: Request, res: Response): Promise<vo
 };
 
 export const getAvailableSlots = async (req: Request, res: Response): Promise<void> => {
+  const t0 = Date.now();
   try {
     const userId = req.user!.userId;
     const parsed = availabilityQuerySchema.safeParse(req.query);
@@ -141,6 +184,7 @@ export const getAvailableSlots = async (req: Request, res: Response): Promise<vo
     }
     const { serviceId, packageId, addressId, date } = parsed.data;
     const resolved = await resolveHubForAddress(serviceId, addressId, userId);
+    const tHub = Date.now();
     if (!resolved?.vendorId) {
       sendSuccess(res, { slots: [] });
       return;
@@ -161,6 +205,9 @@ export const getAvailableSlots = async (req: Request, res: Response): Promise<vo
       durationMinutes: duration,
       dateYmd: date,
     });
+    console.log(
+      `[slots] date=${date} hub=${tHub - t0}ms gen=${Date.now() - tHub}ms total=${Date.now() - t0}ms n=${slots.length}`
+    );
     sendSuccess(res, {
       slots: slots.map((s) => ({
         scheduledDate: s.scheduledDate,
@@ -190,11 +237,10 @@ export const holdSlot = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    const customer = await prisma.customerProfile.upsert({
-      where: { userId },
-      create: { userId },
-      update: {},
-    });
+    let customer = await prisma.customerProfile.findUnique({ where: { userId } });
+    if (!customer) {
+      customer = await prisma.customerProfile.create({ data: { userId } });
+    }
 
     const startAt = new Date(body.scheduledStartAt);
     const endAt = new Date(body.scheduledEndAt);

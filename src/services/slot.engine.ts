@@ -41,59 +41,74 @@ async function loadBusyIntervals(
 ): Promise<Map<string, Array<{ start: Date; end: Date }>>> {
   const map = new Map<string, Array<{ start: Date; end: Date }>>();
   if (employeeIds.length === 0) return map;
-
-  const bookings = await prisma.booking.findMany({
-    where: {
-      status: { in: BUSY_STATUSES },
-      OR: [
-        { employeeId: { in: employeeIds } },
-        { helperEmployeeId: { in: employeeIds } },
-        { crewMembers: { some: { employeeId: { in: employeeIds }, status: 'ASSIGNED' } } },
-      ],
-      AND: [
-        {
-          OR: [
-            {
-              scheduledStartAt: { lt: dayEnd },
-              scheduledEndAt: { gt: dayStart },
-            },
-            {
-              scheduledStartAt: null,
-              scheduledDate: dayStart.toISOString().slice(0, 10),
-            },
-          ],
-        },
-      ],
-    },
-    select: {
-      employeeId: true,
-      helperEmployeeId: true,
-      scheduledStartAt: true,
-      scheduledEndAt: true,
-      scheduledDate: true,
-      scheduledTimeSlot: true,
-      crewMembers: { where: { status: 'ASSIGNED' }, select: { employeeId: true } },
-    },
-  });
-
   for (const id of employeeIds) map.set(id, []);
 
+  const dayYmd = dayStart.toISOString().slice(0, 10);
+  const overlapOr = [
+    {
+      scheduledStartAt: { lt: dayEnd },
+      scheduledEndAt: { gt: dayStart },
+    },
+    {
+      scheduledStartAt: null,
+      scheduledDate: dayYmd,
+    },
+  ] as const;
+
+  // Split primary-role vs crew queries — nested crewMembers.some is slow on Mongo.
+  const [bookings, crewRows] = await Promise.all([
+    prisma.booking.findMany({
+      where: {
+        status: { in: BUSY_STATUSES },
+        OR: [{ employeeId: { in: employeeIds } }, { helperEmployeeId: { in: employeeIds } }],
+        AND: [{ OR: [...overlapOr] }],
+      },
+      select: {
+        employeeId: true,
+        helperEmployeeId: true,
+        scheduledStartAt: true,
+        scheduledEndAt: true,
+      },
+    }),
+    prisma.bookingCrewMember.findMany({
+      where: {
+        employeeId: { in: employeeIds },
+        status: 'ASSIGNED',
+        booking: {
+          status: { in: BUSY_STATUSES },
+          OR: [...overlapOr],
+        },
+      },
+      select: {
+        employeeId: true,
+        booking: {
+          select: {
+            scheduledStartAt: true,
+            scheduledEndAt: true,
+          },
+        },
+      },
+    }),
+  ]);
+
+  const pushBusy = (
+    id: string | null | undefined,
+    start: Date | null,
+    end: Date | null
+  ) => {
+    if (!id || !map.has(id)) return;
+    map.get(id)!.push({
+      start: start || dayStart,
+      end: end || dayEnd,
+    });
+  };
+
   for (const b of bookings) {
-    let start = b.scheduledStartAt;
-    let end = b.scheduledEndAt;
-    if (!start || !end) {
-      // Legacy string slots: treat as blocking the whole planned day for that date.
-      start = dayStart;
-      end = dayEnd;
-    }
-    const ids = new Set<string>();
-    if (b.employeeId) ids.add(b.employeeId);
-    if (b.helperEmployeeId) ids.add(b.helperEmployeeId);
-    for (const c of b.crewMembers) ids.add(c.employeeId);
-    for (const id of ids) {
-      if (!map.has(id)) continue;
-      map.get(id)!.push({ start, end });
-    }
+    pushBusy(b.employeeId, b.scheduledStartAt, b.scheduledEndAt);
+    pushBusy(b.helperEmployeeId, b.scheduledStartAt, b.scheduledEndAt);
+  }
+  for (const row of crewRows) {
+    pushBusy(row.employeeId, row.booking.scheduledStartAt, row.booking.scheduledEndAt);
   }
 
   return map;
@@ -245,6 +260,13 @@ export async function generateAvailableSlots(params: {
   // Capacity for today, tomorrow, and the rest of the week is driven by
   // professionals who are hub-checked-in right now (today's attendance).
   // Tomorrow/future still use the fixed duration grid from DAY_START (09:00 IST).
+  // Generous busy window up-front so check-in + busy + holds can load in one round-trip.
+  const MIN_EXTRA_REMAINING_MS = 45 * 60 * 1000;
+  const lateClose = atLocalTime(params.dateYmd, DAY_END_HOUR + 3); // 22:00 IST
+  const busyHorizon = isToday
+    ? new Date(Math.max(dayEnd.getTime(), now.getTime()) + SHIFT_HOURS * 60 * 60 * 1000)
+    : lateClose;
+
   const [required, eligibleIds] = await Promise.all([
     resolveRequiredProfessionals({
       vendorId: params.vendorId,
@@ -258,45 +280,10 @@ export async function generateAvailableSlots(params: {
       requireCheckedIn: true,
     }),
   ]);
-  const checkInWindows = isToday
-    ? await loadCheckInWindows(eligibleIds)
-    : new Map<string, CheckInWindow>();
 
-  // Duration-based packing: next start = previous end + 15m (e.g. 3h → 6:15 then 9:30).
-  // Not a 15m arrival grid (6:15 / 6:30 / 6:45…). Bookings unchanged.
-  const MIN_EXTRA_REMAINING_MS = 45 * 60 * 1000;
-  let loopEndMs = dayEnd.getTime();
-  let busyHorizon = new Date(dayEnd.getTime() + durationMs);
-  if (isToday) {
-    for (const w of checkInWindows.values()) {
-      const remainingAfterReady =
-        w.shiftEndAt.getTime() - Math.max(w.readyAt.getTime(), earliestStartMs);
-      if (remainingAfterReady > 30 * 60 * 1000) {
-        const lastStart = w.shiftEndAt.getTime() - durationMs;
-        if (
-          lastStart + 1 > loopEndMs &&
-          remainingAfterReady >= Math.max(durationMs, MIN_EXTRA_REMAINING_MS)
-        ) {
-          loopEndMs = lastStart + 1;
-        }
-        if (w.shiftEndAt.getTime() > busyHorizon.getTime()) {
-          busyHorizon = w.shiftEndAt;
-        }
-      }
-    }
-  } else {
-    // Tomorrow/future: standard day from 09:00; allow one more full-duration start
-    // past 19:00 when leftover time to late close supports it (45m+ and full duration).
-    const lateClose = atLocalTime(params.dateYmd, DAY_END_HOUR + 3); // 22:00 IST
-    const remainingPastDayEnd = lateClose.getTime() - dayEnd.getTime();
-    if (remainingPastDayEnd >= MIN_EXTRA_REMAINING_MS) {
-      const lastStart = lateClose.getTime() - durationMs;
-      if (lastStart + 1 > loopEndMs) loopEndMs = lastStart + 1;
-    }
-    if (lateClose.getTime() > busyHorizon.getTime()) busyHorizon = lateClose;
-  }
-
-  const [busy, activeHolds] = await Promise.all([
+  const emptyCheckIns = new Map<string, CheckInWindow>();
+  const [checkInWindows, busy, activeHolds, completedEarly] = await Promise.all([
+    isToday ? loadCheckInWindows(eligibleIds) : Promise.resolve(emptyCheckIns),
     loadBusyIntervals(eligibleIds, dayStart, busyHorizon),
     prisma.slotHold.findMany({
       where: {
@@ -312,25 +299,51 @@ export async function generateAvailableSlots(params: {
         requiredProfessionals: true,
       },
     }),
+    isToday
+      ? prisma.booking.findMany({
+          where: {
+            vendorId: params.vendorId,
+            status: { in: ['COMPLETED', 'AWAITING_CUSTOMER_CONFIRMATION', 'AWAITING_PAYMENT'] },
+            scheduledDate: params.dateYmd,
+            scheduledEndAt: { gt: now },
+            customerConfirmedAt: { not: null },
+          },
+          select: {
+            scheduledEndAt: true,
+            employeeId: true,
+          },
+          take: 50,
+        })
+      : Promise.resolve(
+          [] as Array<{ scheduledEndAt: Date | null; employeeId: string | null }>
+        ),
   ]);
 
-  const slots: SlotCandidate[] = [];
-  const stepMs = durationMs + SLOT_GAP_MINUTES * 60 * 1000;
-  const alignMs = SLOT_STEP_MINUTES * 60 * 1000;
-  let loopStartMs = dayStart.getTime();
+  // Duration-based packing: next start = previous end + 15m (e.g. 3h → 6:15 then 9:30).
+  let loopEndMs = dayEnd.getTime();
   if (isToday) {
-    // First today slot ~ now+15m, then jump by full duration+gap.
-    const snapped = Math.ceil(earliestStartMs / alignMs) * alignMs;
-    loopStartMs = Math.max(dayStart.getTime(), snapped);
-  }
-  for (let t = loopStartMs; t < loopEndMs; t += stepMs) {
-    const startAt = new Date(t);
-    const endAt = new Date(t + durationMs);
-    // Today: never offer a start that is already past / too soon.
-    if (isToday && (startAt.getTime() < earliestStartMs || endAt.getTime() <= now.getTime())) {
-      continue;
+    for (const w of checkInWindows.values()) {
+      const remainingAfterReady =
+        w.shiftEndAt.getTime() - Math.max(w.readyAt.getTime(), earliestStartMs);
+      if (remainingAfterReady > 30 * 60 * 1000) {
+        const lastStart = w.shiftEndAt.getTime() - durationMs;
+        if (
+          lastStart + 1 > loopEndMs &&
+          remainingAfterReady >= Math.max(durationMs, MIN_EXTRA_REMAINING_MS)
+        ) {
+          loopEndMs = lastStart + 1;
+        }
+      }
     }
+  } else {
+    const remainingPastDayEnd = lateClose.getTime() - dayEnd.getTime();
+    if (remainingPastDayEnd >= MIN_EXTRA_REMAINING_MS) {
+      const lastStart = lateClose.getTime() - durationMs;
+      if (lastStart + 1 > loopEndMs) loopEndMs = lastStart + 1;
+    }
+  }
 
+  const countFreeForWindow = (startAt: Date, endAt: Date): number => {
     let freeCount = 0;
     for (const id of eligibleIds) {
       if (
@@ -345,15 +358,30 @@ export async function generateAvailableSlots(params: {
         freeCount++;
       }
     }
-
     let reserved = 0;
     for (const h of activeHolds) {
       if (h.scheduledStartAt < endAt && h.scheduledEndAt > startAt) {
         reserved += h.requiredProfessionals || 1;
       }
     }
-    freeCount = Math.max(0, freeCount - reserved);
+    return Math.max(0, freeCount - reserved);
+  };
 
+  const slots: SlotCandidate[] = [];
+  const stepMs = durationMs + SLOT_GAP_MINUTES * 60 * 1000;
+  const alignMs = SLOT_STEP_MINUTES * 60 * 1000;
+  let loopStartMs = dayStart.getTime();
+  if (isToday) {
+    const snapped = Math.ceil(earliestStartMs / alignMs) * alignMs;
+    loopStartMs = Math.max(dayStart.getTime(), snapped);
+  }
+  for (let t = loopStartMs; t < loopEndMs; t += stepMs) {
+    const startAt = new Date(t);
+    const endAt = new Date(t + durationMs);
+    if (isToday && (startAt.getTime() < earliestStartMs || endAt.getTime() <= now.getTime())) {
+      continue;
+    }
+    const freeCount = countFreeForWindow(startAt, endAt);
     if (freeCount >= required) {
       slots.push({
         scheduledDate: params.dateYmd,
@@ -367,28 +395,11 @@ export async function generateAvailableSlots(params: {
     }
   }
 
-  // Express: early-finished jobs free residual intervals same day within lookahead.
-  if (isToday) {
+  // Express: reuse already-loaded busy/hold state — no per-slot DB round-trips.
+  if (isToday && completedEarly.length > 0) {
     const lookaheadEnd = new Date(now.getTime() + EXPRESS_LOOKAHEAD_HOURS * 60 * 60 * 1000);
-    const completedEarly = await prisma.booking.findMany({
-      where: {
-        vendorId: params.vendorId,
-        status: { in: ['COMPLETED', 'AWAITING_CUSTOMER_CONFIRMATION', 'AWAITING_PAYMENT'] },
-        scheduledDate: params.dateYmd,
-        scheduledEndAt: { gt: now },
-        customerConfirmedAt: { not: null },
-      },
-      select: {
-        scheduledEndAt: true,
-        employeeId: true,
-        updatedAt: true,
-      },
-      take: 50,
-    });
-
     for (const job of completedEarly) {
       if (!job.scheduledEndAt || !job.employeeId) continue;
-      // Approximate early free window: from now to original end if job already completed.
       const freeStart = now;
       const freeEnd = job.scheduledEndAt;
       if (freeEnd.getTime() - freeStart.getTime() < durationMs) continue;
@@ -401,15 +412,7 @@ export async function generateAvailableSlots(params: {
       const endAt = new Date(startAt.getTime() + durationMs);
       if (endAt > freeEnd) continue;
 
-      const freeCount = await countFreeEligiblePros({
-        vendorId: params.vendorId,
-        categoryId: params.categoryId,
-        subCategoryId: params.subCategoryId,
-        packageId: params.packageId,
-        startAt,
-        endAt,
-        requireCheckedIn: true,
-      });
+      const freeCount = countFreeForWindow(startAt, endAt);
       if (freeCount >= required) {
         slots.push({
           scheduledDate: params.dateYmd,
