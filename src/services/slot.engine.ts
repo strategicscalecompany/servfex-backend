@@ -290,19 +290,22 @@ export async function generateAvailableSlots(params: {
     ? await loadCheckInWindows(eligibleIds)
     : new Map<string, CheckInWindow>();
 
-  // Today: extend past 19:00 when a pro's 10h shift still has room for another full
-  // duration slot after a 15m gap (e.g. 6:00–9:00 then 9:15–12:15). Only full-duration
-  // extras — leftover under ~30–45m does not create a short stub slot.
+  // Offer every valid START (15m grid) where a free pro can cover the full duration.
+  // Sequential packing (9 → 1:15 → 5:30 only) hid most bookable times for tomorrow.
+  // Existing bookings unchanged — travel buffer still blocks double-booking a pro.
   const MIN_EXTRA_REMAINING_MS = 45 * 60 * 1000;
   let loopEndMs = dayEnd.getTime();
   let busyHorizon = new Date(dayEnd.getTime() + durationMs);
   if (isToday) {
     for (const w of checkInWindows.values()) {
-      const remainingAfterReady = w.shiftEndAt.getTime() - Math.max(w.readyAt.getTime(), earliestStartMs);
+      const remainingAfterReady =
+        w.shiftEndAt.getTime() - Math.max(w.readyAt.getTime(), earliestStartMs);
       if (remainingAfterReady > 30 * 60 * 1000) {
-        // Last start that still finishes inside the shift with a full-duration job.
         const lastStart = w.shiftEndAt.getTime() - durationMs;
-        if (lastStart + 1 > loopEndMs && remainingAfterReady >= Math.max(durationMs, MIN_EXTRA_REMAINING_MS)) {
+        if (
+          lastStart + 1 > loopEndMs &&
+          remainingAfterReady >= Math.max(durationMs, MIN_EXTRA_REMAINING_MS)
+        ) {
           loopEndMs = lastStart + 1;
         }
         if (w.shiftEndAt.getTime() > busyHorizon.getTime()) {
@@ -310,25 +313,29 @@ export async function generateAvailableSlots(params: {
         }
       }
     }
+  } else {
+    // Tomorrow/future: allow starts through the hub day; job may finish after 19:00.
+    // Last start must still leave room for the full service duration before late close.
+    const lateClose = atLocalTime(params.dateYmd, DAY_END_HOUR + 3); // 22:00 IST
+    const lastStart = lateClose.getTime() - durationMs;
+    if (lastStart + 1 > loopEndMs) loopEndMs = lastStart + 1;
+    if (lateClose.getTime() > busyHorizon.getTime()) busyHorizon = lateClose;
   }
 
   const busy = await loadBusyIntervals(eligibleIds, dayStart, busyHorizon);
 
   const slots: SlotCandidate[] = [];
-  // Tomorrow/future: fixed grid from DAY_START (e.g. 3h → 09:00, 12:15, …).
-  // Today: first start ~now+15m, then duration+gap; may continue into the 10h shift
-  // past DAY_END when leftover free time supports another full slot. Bookings unchanged.
-  const stepMs = durationMs + SLOT_GAP_MINUTES * 60 * 1000;
-  const alignMs = SLOT_STEP_MINUTES * 60 * 1000;
+  // 15-minute start grid; each offer still lasts `durationMinutes` (e.g. 4 hrs).
+  const stepMs = SLOT_STEP_MINUTES * 60 * 1000;
   let loopStartMs = dayStart.getTime();
   if (isToday) {
-    const snapped = Math.ceil(earliestStartMs / alignMs) * alignMs;
+    const snapped = Math.ceil(earliestStartMs / stepMs) * stepMs;
     loopStartMs = Math.max(dayStart.getTime(), snapped);
   }
   for (let t = loopStartMs; t < loopEndMs; t += stepMs) {
     const startAt = new Date(t);
     const endAt = new Date(t + durationMs);
-    // Belt-and-suspenders: never offer a start that is already past / too soon.
+    // Today: never offer a start that is already past / too soon.
     if (isToday && (startAt.getTime() < earliestStartMs || endAt.getTime() <= now.getTime())) {
       continue;
     }
