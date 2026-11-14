@@ -38,45 +38,45 @@ export async function createSlotHold(params: {
   slotType?: SlotType;
 }) {
   const now = new Date();
-  const required = await resolveRequiredProfessionals({
-    vendorId: params.vendorId,
-    packageId: params.packageId,
-  });
 
-  // Expire stale holds first
-  await prisma.slotHold.updateMany({
-    where: { status: SlotHoldStatus.ACTIVE, expiresAt: { lte: now } },
-    data: { status: SlotHoldStatus.EXPIRED },
-  });
-
-  // Existing active hold by same customer on same interval → extend
-  const mine = await prisma.slotHold.findFirst({
-    where: {
-      customerUserId: params.customerUserId,
+  // Parallel: resolve capacity need + expire stale holds + check own/competing holds.
+  const [required, , mine, competing] = await Promise.all([
+    resolveRequiredProfessionals({
       vendorId: params.vendorId,
-      scheduledStartAt: params.startAt,
-      scheduledEndAt: params.endAt,
-      status: SlotHoldStatus.ACTIVE,
-      expiresAt: { gt: now },
-    },
-  });
+      packageId: params.packageId,
+    }),
+    prisma.slotHold.updateMany({
+      where: { status: SlotHoldStatus.ACTIVE, expiresAt: { lte: now } },
+      data: { status: SlotHoldStatus.EXPIRED },
+    }),
+    prisma.slotHold.findFirst({
+      where: {
+        customerUserId: params.customerUserId,
+        vendorId: params.vendorId,
+        scheduledStartAt: params.startAt,
+        scheduledEndAt: params.endAt,
+        status: SlotHoldStatus.ACTIVE,
+        expiresAt: { gt: now },
+      },
+    }),
+    prisma.slotHold.findMany({
+      where: {
+        vendorId: params.vendorId,
+        status: SlotHoldStatus.ACTIVE,
+        expiresAt: { gt: now },
+        scheduledStartAt: params.startAt,
+        scheduledEndAt: params.endAt,
+      },
+      orderBy: { createdAt: 'asc' },
+    }),
+  ]);
+
   if (mine) {
     return prisma.slotHold.update({
       where: { id: mine.id },
       data: { expiresAt: new Date(now.getTime() + SLOT_HOLD_TTL_SECONDS * 1000) },
     });
   }
-
-  const competing = await prisma.slotHold.findMany({
-    where: {
-      vendorId: params.vendorId,
-      status: SlotHoldStatus.ACTIVE,
-      expiresAt: { gt: now },
-      scheduledStartAt: params.startAt,
-      scheduledEndAt: params.endAt,
-    },
-    orderBy: { createdAt: 'asc' },
-  });
 
   if (competing.length > 0) {
     const earliest = competing[0];
@@ -102,17 +102,7 @@ export async function createSlotHold(params: {
     });
   }
 
-  const free = await countFreeEligiblePros({
-    vendorId: params.vendorId,
-    categoryId: params.categoryId,
-    packageId: params.packageId,
-    startAt: params.startAt,
-    endAt: params.endAt,
-    requireCheckedIn: true,
-    excludeHoldCapacity: true,
-  });
-  // Re-count with holds except we just released; still need enough free pros
-  // (same checked-in pool used for today / tomorrow / week slot offers).
+  // Single capacity check (with active holds). Avoids a duplicate eligibility scan.
   const freeWithHolds = await countFreeEligiblePros({
     vendorId: params.vendorId,
     categoryId: params.categoryId,
@@ -122,7 +112,6 @@ export async function createSlotHold(params: {
     requireCheckedIn: true,
     excludeHoldCapacity: false,
   });
-  void free;
   if (freeWithHolds < required) {
     throw new SlotHoldError(
       'SLOT_UNAVAILABLE',

@@ -76,21 +76,6 @@ async function loadBusyIntervals(
     },
   });
 
-  const holds = await prisma.slotHold.findMany({
-    where: {
-      status: SlotHoldStatus.ACTIVE,
-      expiresAt: { gt: new Date() },
-      scheduledStartAt: { lt: dayEnd },
-      scheduledEndAt: { gt: dayStart },
-    },
-    select: {
-      scheduledStartAt: true,
-      scheduledEndAt: true,
-      requiredProfessionals: true,
-      vendorId: true,
-    },
-  });
-
   for (const id of employeeIds) map.set(id, []);
 
   for (const b of bookings) {
@@ -110,10 +95,6 @@ async function loadBusyIntervals(
       map.get(id)!.push({ start, end });
     }
   }
-
-  // Active holds reduce pool capacity globally for the vendor interval (not pinned to a pro yet).
-  // Tracked separately by callers via countFreePros.
-  void holds;
 
   return map;
 }
@@ -225,16 +206,6 @@ export async function countFreeEligiblePros(params: {
   }
 
   if (!params.excludeHoldCapacity) {
-    const activeHolds = await prisma.slotHold.count({
-      where: {
-        vendorId: params.vendorId,
-        status: SlotHoldStatus.ACTIVE,
-        expiresAt: { gt: new Date() },
-        scheduledStartAt: { lt: params.endAt },
-        scheduledEndAt: { gt: params.startAt },
-      },
-    });
-    // Each hold reserves requiredProfessionals from the free pool (approx).
     const holdRows = await prisma.slotHold.findMany({
       where: {
         vendorId: params.vendorId,
@@ -246,7 +217,6 @@ export async function countFreeEligiblePros(params: {
       select: { requiredProfessionals: true },
     });
     const reserved = holdRows.reduce((s, h) => s + (h.requiredProfessionals || 1), 0);
-    void activeHolds;
     free = Math.max(0, free - reserved);
   }
 
@@ -263,10 +233,6 @@ export async function generateAvailableSlots(params: {
   now?: Date;
 }): Promise<SlotCandidate[]> {
   const now = params.now ?? new Date();
-  const required = await resolveRequiredProfessionals({
-    vendorId: params.vendorId,
-    packageId: params.packageId,
-  });
   const dayStart = atLocalTime(params.dateYmd, DAY_START_HOUR);
   const dayEnd = atLocalTime(params.dateYmd, DAY_END_HOUR);
   const durationMs = params.durationMinutes * 60 * 1000;
@@ -279,13 +245,19 @@ export async function generateAvailableSlots(params: {
   // Capacity for today, tomorrow, and the rest of the week is driven by
   // professionals who are hub-checked-in right now (today's attendance).
   // Tomorrow/future still use the fixed duration grid from DAY_START (09:00 IST).
-  const eligibleIds = await findEligibleEmployeeIds({
-    vendorId: params.vendorId,
-    categoryId: params.categoryId,
-    subCategoryId: params.subCategoryId,
-    packageId: params.packageId,
-    requireCheckedIn: true,
-  });
+  const [required, eligibleIds] = await Promise.all([
+    resolveRequiredProfessionals({
+      vendorId: params.vendorId,
+      packageId: params.packageId,
+    }),
+    findEligibleEmployeeIds({
+      vendorId: params.vendorId,
+      categoryId: params.categoryId,
+      subCategoryId: params.subCategoryId,
+      packageId: params.packageId,
+      requireCheckedIn: true,
+    }),
+  ]);
   const checkInWindows = isToday
     ? await loadCheckInWindows(eligibleIds)
     : new Map<string, CheckInWindow>();
@@ -324,7 +296,23 @@ export async function generateAvailableSlots(params: {
     if (lateClose.getTime() > busyHorizon.getTime()) busyHorizon = lateClose;
   }
 
-  const busy = await loadBusyIntervals(eligibleIds, dayStart, busyHorizon);
+  const [busy, activeHolds] = await Promise.all([
+    loadBusyIntervals(eligibleIds, dayStart, busyHorizon),
+    prisma.slotHold.findMany({
+      where: {
+        vendorId: params.vendorId,
+        status: SlotHoldStatus.ACTIVE,
+        expiresAt: { gt: now },
+        scheduledStartAt: { lt: busyHorizon },
+        scheduledEndAt: { gt: dayStart },
+      },
+      select: {
+        scheduledStartAt: true,
+        scheduledEndAt: true,
+        requiredProfessionals: true,
+      },
+    }),
+  ]);
 
   const slots: SlotCandidate[] = [];
   const stepMs = durationMs + SLOT_GAP_MINUTES * 60 * 1000;
@@ -358,17 +346,12 @@ export async function generateAvailableSlots(params: {
       }
     }
 
-    const holdRows = await prisma.slotHold.findMany({
-      where: {
-        vendorId: params.vendorId,
-        status: SlotHoldStatus.ACTIVE,
-        expiresAt: { gt: now },
-        scheduledStartAt: { lt: endAt },
-        scheduledEndAt: { gt: startAt },
-      },
-      select: { requiredProfessionals: true },
-    });
-    const reserved = holdRows.reduce((s, h) => s + (h.requiredProfessionals || 1), 0);
+    let reserved = 0;
+    for (const h of activeHolds) {
+      if (h.scheduledStartAt < endAt && h.scheduledEndAt > startAt) {
+        reserved += h.requiredProfessionals || 1;
+      }
+    }
     freeCount = Math.max(0, freeCount - reserved);
 
     if (freeCount >= required) {
