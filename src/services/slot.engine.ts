@@ -4,6 +4,7 @@ import {
   DAY_END_HOUR,
   DAY_START_HOUR,
   EXPRESS_LOOKAHEAD_HOURS,
+  SHIFT_HOURS,
   SLOT_GAP_MINUTES,
   SLOT_STEP_MINUTES,
   TRAVEL_BUFFER_MINUTES,
@@ -127,27 +128,39 @@ function isFree(
   );
 }
 
-/** Earliest instant a checked-in pro can start a new job (check-in + gap). */
-async function loadCheckInReadyAt(
+type CheckInWindow = {
+  /** Earliest start after check-in + 15m. */
+  readyAt: Date;
+  /** End of planned 10h shift from check-in (exclusive upper bound for job end). */
+  shiftEndAt: Date;
+};
+
+/** Today: check-in ready time + 10h shift end per pro. */
+async function loadCheckInWindows(
   employeeIds: string[]
-): Promise<Map<string, Date>> {
-  const map = new Map<string, Date>();
+): Promise<Map<string, CheckInWindow>> {
+  const map = new Map<string, CheckInWindow>();
   if (employeeIds.length === 0) return map;
   const rows = await prisma.employeeProfile.findMany({
     where: { id: { in: employeeIds }, hubCheckedInAt: { not: null } },
     select: { id: true, hubCheckedInAt: true },
   });
   const gapMs = SLOT_GAP_MINUTES * 60 * 1000;
+  const shiftMs = SHIFT_HOURS * 60 * 60 * 1000;
   for (const row of rows) {
     if (!row.hubCheckedInAt) continue;
-    map.set(row.id, new Date(row.hubCheckedInAt.getTime() + gapMs));
+    const checkInMs = row.hubCheckedInAt.getTime();
+    map.set(row.id, {
+      readyAt: new Date(checkInMs + gapMs),
+      shiftEndAt: new Date(checkInMs + shiftMs),
+    });
   }
   return map;
 }
 
 /**
- * Pro can cover [start,end] when not busy and — for today — the slot starts
- * at/after their check-in + 15m (e.g. check-in 12:00 → first start 12:15).
+ * Pro can cover [start,end] when not busy and — for today — the slot is inside
+ * their check-in window: start ≥ check-in+15m and end ≤ check-in+10h.
  * Does not mutate bookings; only affects newly offered availability.
  */
 function canCoverSlot(params: {
@@ -155,14 +168,11 @@ function canCoverSlot(params: {
   startAt: Date;
   endAt: Date;
   isToday: boolean;
-  checkInReadyAt?: Date | null;
+  checkInWindow?: CheckInWindow | null;
 }): boolean {
-  if (
-    params.isToday &&
-    params.checkInReadyAt &&
-    params.startAt.getTime() < params.checkInReadyAt.getTime()
-  ) {
-    return false;
+  if (params.isToday && params.checkInWindow) {
+    if (params.startAt.getTime() < params.checkInWindow.readyAt.getTime()) return false;
+    if (params.endAt.getTime() > params.checkInWindow.shiftEndAt.getTime()) return false;
   }
   return isFree(params.intervals, params.startAt, params.endAt);
 }
@@ -191,8 +201,14 @@ export async function countFreeEligiblePros(params: {
   const windowStart = atLocalTime(dateYmd, DAY_START_HOUR);
   const windowEnd = atLocalTime(dateYmd, DAY_END_HOUR);
 
-  const busy = await loadBusyIntervals(eligibleIds, windowStart, windowEnd);
-  const checkInReady = isToday ? await loadCheckInReadyAt(eligibleIds) : new Map<string, Date>();
+  const checkInWindows = isToday
+    ? await loadCheckInWindows(eligibleIds)
+    : new Map<string, CheckInWindow>();
+  let horizonEnd = windowEnd;
+  for (const w of checkInWindows.values()) {
+    if (w.shiftEndAt.getTime() > horizonEnd.getTime()) horizonEnd = w.shiftEndAt;
+  }
+  const busy = await loadBusyIntervals(eligibleIds, windowStart, horizonEnd);
   let free = 0;
   for (const id of eligibleIds) {
     if (
@@ -201,7 +217,7 @@ export async function countFreeEligiblePros(params: {
         startAt: params.startAt,
         endAt: params.endAt,
         isToday,
-        checkInReadyAt: checkInReady.get(id) || null,
+        checkInWindow: checkInWindows.get(id) || null,
       })
     ) {
       free++;
@@ -270,18 +286,38 @@ export async function generateAvailableSlots(params: {
     packageId: params.packageId,
     requireCheckedIn: true,
   });
-  // Slots may finish slightly after DAY_END; load busy through the latest possible end.
-  const busyHorizon = new Date(dayEnd.getTime() + durationMs);
+  const checkInWindows = isToday
+    ? await loadCheckInWindows(eligibleIds)
+    : new Map<string, CheckInWindow>();
+
+  // Today: extend past 19:00 when a pro's 10h shift still has room for another full
+  // duration slot after a 15m gap (e.g. 6:00–9:00 then 9:15–12:15). Only full-duration
+  // extras — leftover under ~30–45m does not create a short stub slot.
+  const MIN_EXTRA_REMAINING_MS = 45 * 60 * 1000;
+  let loopEndMs = dayEnd.getTime();
+  let busyHorizon = new Date(dayEnd.getTime() + durationMs);
+  if (isToday) {
+    for (const w of checkInWindows.values()) {
+      const remainingAfterReady = w.shiftEndAt.getTime() - Math.max(w.readyAt.getTime(), earliestStartMs);
+      if (remainingAfterReady > 30 * 60 * 1000) {
+        // Last start that still finishes inside the shift with a full-duration job.
+        const lastStart = w.shiftEndAt.getTime() - durationMs;
+        if (lastStart + 1 > loopEndMs && remainingAfterReady >= Math.max(durationMs, MIN_EXTRA_REMAINING_MS)) {
+          loopEndMs = lastStart + 1;
+        }
+        if (w.shiftEndAt.getTime() > busyHorizon.getTime()) {
+          busyHorizon = w.shiftEndAt;
+        }
+      }
+    }
+  }
+
   const busy = await loadBusyIntervals(eligibleIds, dayStart, busyHorizon);
-  // Today only: a pro who checked in at 12:00 is ready from 12:15 — morning grid
-  // starts stay on the fixed timetable but that pro does not cover them.
-  const checkInReady = isToday ? await loadCheckInReadyAt(eligibleIds) : new Map<string, Date>();
 
   const slots: SlotCandidate[] = [];
   // Tomorrow/future: fixed grid from DAY_START (e.g. 3h → 09:00, 12:15, …).
-  // Today: first start is ~now+15m (snapped up), then step by duration+gap so a free
-  // pro can be booked ASAP — not forced to wait for the next 09:00-based boundary
-  // (e.g. at 5:35 show ~5:50–8:50, not only 6:45). Existing bookings are never rewritten.
+  // Today: first start ~now+15m, then duration+gap; may continue into the 10h shift
+  // past DAY_END when leftover free time supports another full slot. Bookings unchanged.
   const stepMs = durationMs + SLOT_GAP_MINUTES * 60 * 1000;
   const alignMs = SLOT_STEP_MINUTES * 60 * 1000;
   let loopStartMs = dayStart.getTime();
@@ -289,7 +325,7 @@ export async function generateAvailableSlots(params: {
     const snapped = Math.ceil(earliestStartMs / alignMs) * alignMs;
     loopStartMs = Math.max(dayStart.getTime(), snapped);
   }
-  for (let t = loopStartMs; t < dayEnd.getTime(); t += stepMs) {
+  for (let t = loopStartMs; t < loopEndMs; t += stepMs) {
     const startAt = new Date(t);
     const endAt = new Date(t + durationMs);
     // Belt-and-suspenders: never offer a start that is already past / too soon.
@@ -305,7 +341,7 @@ export async function generateAvailableSlots(params: {
           startAt,
           endAt,
           isToday,
-          checkInReadyAt: checkInReady.get(id) || null,
+          checkInWindow: checkInWindows.get(id) || null,
         })
       ) {
         freeCount++;
