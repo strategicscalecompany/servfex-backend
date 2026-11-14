@@ -278,14 +278,21 @@ export async function generateAvailableSlots(params: {
   const checkInReady = isToday ? await loadCheckInReadyAt(eligibleIds) : new Map<string, Date>();
 
   const slots: SlotCandidate[] = [];
-  // Offer sequential windows of service duration with a fixed gap between starts
-  // (e.g. 5h job: 09:00–14:00, then 14:15–19:15). Start must be before DAY_END;
-  // end may finish slightly after 19:00. Existing bookings are never rewritten.
+  // Tomorrow/future: fixed grid from DAY_START (e.g. 3h → 09:00, 12:15, …).
+  // Today: first start is ~now+15m (snapped up), then step by duration+gap so a free
+  // pro can be booked ASAP — not forced to wait for the next 09:00-based boundary
+  // (e.g. at 5:35 show ~5:50–8:50, not only 6:45). Existing bookings are never rewritten.
   const stepMs = durationMs + SLOT_GAP_MINUTES * 60 * 1000;
-  for (let t = dayStart.getTime(); t < dayEnd.getTime(); t += stepMs) {
+  const alignMs = SLOT_STEP_MINUTES * 60 * 1000;
+  let loopStartMs = dayStart.getTime();
+  if (isToday) {
+    const snapped = Math.ceil(earliestStartMs / alignMs) * alignMs;
+    loopStartMs = Math.max(dayStart.getTime(), snapped);
+  }
+  for (let t = loopStartMs; t < dayEnd.getTime(); t += stepMs) {
     const startAt = new Date(t);
     const endAt = new Date(t + durationMs);
-    // Today: only present/future starts (IST). Skip anything already underway or past.
+    // Belt-and-suspenders: never offer a start that is already past / too soon.
     if (isToday && (startAt.getTime() < earliestStartMs || endAt.getTime() <= now.getTime())) {
       continue;
     }
