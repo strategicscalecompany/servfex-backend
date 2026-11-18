@@ -215,7 +215,13 @@ router.put(
   vendorSetCatalogAssignments
 );
 router.get('/hub-packages', requireHubContext, vendorListHubPackages);
-router.put('/hub-packages/crew', requireHubContext, validate(setHubPackageCrewSchema), vendorSetHubPackageCrew);
+router.put(
+  '/hub-packages/crew',
+  requireRole('OPERATIONS_MANAGER'),
+  requireHubContext,
+  validate(setHubPackageCrewSchema),
+  vendorSetHubPackageCrew
+);
 router.get('/orders/:id/substitute-options', requireHubContext, listBookingSubstituteOptions);
 router.post('/orders/:id/crew-absent', requireHubContext, validate(crewAbsentSchema), markBookingCrewAbsent);
 

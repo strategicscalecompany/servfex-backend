@@ -821,6 +821,9 @@ export const vendorListHubPackages = async (req: Request, res: Response): Promis
             id: true,
             name: true,
             categoryId: true,
+            subCategoryId: true,
+            category: { select: { id: true, name: true } },
+            subCategory: { select: { id: true, name: true } },
             packages: {
               where: { isActive: true },
               select: {
@@ -849,6 +852,9 @@ export const vendorListHubPackages = async (req: Request, res: Response): Promis
         serviceId: vs.service.id,
         serviceName: vs.service.name,
         categoryId: vs.service.categoryId,
+        categoryName: vs.service.category?.name || null,
+        subCategoryId: vs.service.subCategoryId || null,
+        subCategoryName: vs.service.subCategory?.name || null,
         durationMinutes: pkg.durationMinutes,
         duration: pkg.duration,
         requiredProfessionals: cfgMap.get(pkg.id)?.requiredProfessionals ?? 1,
