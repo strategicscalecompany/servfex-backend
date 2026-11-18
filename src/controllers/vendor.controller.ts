@@ -392,7 +392,7 @@ export const createVendor = async (req: Request, res: Response, next: NextFuncti
           ...(phone ? [{ phone }] : []),
         ],
       },
-      include: { vendorProfile: true },
+      include: { vendorProfile: true, managerProfile: true, employeeProfile: true },
     });
 
     if (existingUser && existingUser.deletedAt === null && existingUser.vendorProfile && existingUser.vendorProfile.isActive) {
@@ -482,7 +482,7 @@ export const createVendor = async (req: Request, res: Response, next: NextFuncti
     if (firebaseUid && !existingUser) {
       const userWithUid = await prisma.user.findUnique({
         where: { firebaseUid },
-        include: { vendorProfile: true },
+        include: { vendorProfile: true, managerProfile: true, employeeProfile: true },
       });
       if (userWithUid) {
         existingUser = userWithUid;
@@ -499,6 +499,14 @@ export const createVendor = async (req: Request, res: Response, next: NextFuncti
 
       if (existingUser) {
         targetUserId = existingUser.id;
+        // Drop leftover non-partner profiles so login/hub fetch resolve a single VENDOR identity.
+        if (existingUser.managerProfile) {
+          await tx.managerProfile.delete({ where: { id: existingUser.managerProfile.id } });
+        }
+        if (existingUser.employeeProfile) {
+          await tx.employeeProfile.delete({ where: { id: existingUser.employeeProfile.id } });
+        }
+
         // User already exists - update user and attach/reactivate vendor profile
         await tx.user.update({
           where: { id: existingUser.id },

@@ -100,6 +100,39 @@ export const login = async (
       return;
     }
 
+    // Partner / expert / manager portals need their operational profile after auth.
+    if (user.role === 'VENDOR' && !user.vendorProfile) {
+      sendError(
+        res,
+        'PROFILE_NOT_FOUND',
+        'Partner hub profile is missing. Ask Super Admin to re-onboard this partner.',
+        403
+      );
+      return;
+    }
+    if (user.role === 'EMPLOYEE' && !user.employeeProfile) {
+      sendError(
+        res,
+        'PROFILE_NOT_FOUND',
+        'Expert profile is missing. Ask your Partner or Super Admin to re-onboard this account.',
+        403
+      );
+      return;
+    }
+    if (user.role === 'OPERATIONS_MANAGER' && !user.managerProfile) {
+      sendError(
+        res,
+        'PROFILE_NOT_FOUND',
+        'Manager profile is missing. Ask Super Admin to provision this manager again.',
+        403
+      );
+      return;
+    }
+    if (user.role === 'VENDOR' && user.vendorProfile && !user.vendorProfile.isActive) {
+      sendError(res, 'VENDOR_INACTIVE', 'Your Provider business profile is inactive. Please contact Super Admin.', 403);
+      return;
+    }
+
     // Update lastLoginAt
     await prisma.user.update({
       where: { id: user.id },
@@ -387,6 +420,38 @@ export const googleLogin = async (
 
     if (user.status === 'INACTIVE' || user.status === 'PENDING_APPROVAL') {
       sendError(res, 'ACCOUNT_INACTIVE', 'Your account is pending approval by Super Admin.', 403);
+      return;
+    }
+
+    if (user.role === 'VENDOR' && !user.vendorProfile) {
+      sendError(
+        res,
+        'PROFILE_NOT_FOUND',
+        'Partner hub profile is missing. Ask Super Admin to re-onboard this partner.',
+        403
+      );
+      return;
+    }
+    if (user.role === 'EMPLOYEE' && !user.employeeProfile) {
+      sendError(
+        res,
+        'PROFILE_NOT_FOUND',
+        'Expert profile is missing. Ask your Partner or Super Admin to re-onboard this account.',
+        403
+      );
+      return;
+    }
+    if (user.role === 'OPERATIONS_MANAGER' && !user.managerProfile) {
+      sendError(
+        res,
+        'PROFILE_NOT_FOUND',
+        'Manager profile is missing. Ask Super Admin to provision this manager again.',
+        403
+      );
+      return;
+    }
+    if (user.role === 'VENDOR' && user.vendorProfile && !user.vendorProfile.isActive) {
+      sendError(res, 'VENDOR_INACTIVE', 'Your Provider business profile is inactive. Please contact Super Admin.', 403);
       return;
     }
 

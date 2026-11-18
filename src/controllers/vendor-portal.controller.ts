@@ -328,10 +328,60 @@ export const registerVendor = async (req: Request, res: Response): Promise<void>
           ...(finalPhone ? [{ phone: finalPhone }] : []),
         ],
       },
-      include: { vendorProfile: true },
+      include: { vendorProfile: true, managerProfile: true, employeeProfile: true },
     });
 
     if (existing) {
+      // Auth account exists but hub profile was wiped — recreate VendorProfile so login/fetch works.
+      if (!existing.vendorProfile) {
+        const repaired = await prisma.$transaction(async (tx) => {
+          if (existing.managerProfile) {
+            await tx.managerProfile.delete({ where: { id: existing.managerProfile.id } });
+          }
+          if (existing.employeeProfile) {
+            await tx.employeeProfile.delete({ where: { id: existing.employeeProfile.id } });
+          }
+
+          await tx.user.update({
+            where: { id: existing.id },
+            data: {
+              role: 'VENDOR',
+              status: 'ACTIVE',
+              isVerified: true,
+              ...(firebaseUser?.uid && !existing.firebaseUid ? { firebaseUid: firebaseUser.uid } : {}),
+            },
+          });
+
+          await tx.vendorProfile.create({
+            data: {
+              userId: existing.id,
+              companyName: companyName || existing.name || finalEmail.split('@')[0],
+              location: location || 'Main Hub',
+              businessLicense: businessLicense || null,
+              taxId: taxId || null,
+              bio: bio || null,
+              latitude: latitude || null,
+              longitude: longitude || null,
+              kycStatus: 'APPROVED',
+              rating: 5.0,
+              reviewCount: 0,
+              commissionRate: toMoney(15),
+              isActive: true,
+            },
+          });
+
+          return tx.user.findUniqueOrThrow({
+            where: { id: existing.id },
+            include: { vendorProfile: true },
+          });
+        });
+
+        const token = generateAccessToken({ userId: repaired.id, role: repaired.role, email: repaired.email });
+        const refreshToken = generateRefreshToken({ userId: repaired.id, role: repaired.role, email: repaired.email });
+        sendSuccess(res, { user: repaired, token, refreshToken }, 200);
+        return;
+      }
+
       if (!existing.firebaseUid && firebaseUser?.uid) {
         const updated = await prisma.user.update({
           where: { id: existing.id },
