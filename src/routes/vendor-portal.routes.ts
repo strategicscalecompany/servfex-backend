@@ -95,9 +95,12 @@ import {
   vendorListHubCatalogTree,
   vendorGetEmployeeCatalog,
   vendorSetEmployeeCatalog,
+  vendorGetCatalogAssignments,
+  vendorSetCatalogAssignments,
   vendorListHubPackages,
   vendorSetHubPackageCrew,
   setEmployeeCatalogSchema,
+  setCatalogAssignmentsSchema,
   setHubPackageCrewSchema,
 } from '../controllers/tag.controller';
 import {
@@ -198,9 +201,18 @@ router.get('/hub-catalog', requireHubContext, vendorListHubCatalogTree);
 router.get('/employees/:id/catalog', requireHubContext, vendorGetEmployeeCatalog);
 router.put(
   '/employees/:id/catalog',
+  requireRole('OPERATIONS_MANAGER'),
   requireHubContext,
   validate(setEmployeeCatalogSchema),
   vendorSetEmployeeCatalog
+);
+router.get('/catalog-assignments', requireHubContext, vendorGetCatalogAssignments);
+router.put(
+  '/catalog-assignments',
+  requireRole('OPERATIONS_MANAGER'),
+  requireHubContext,
+  validate(setCatalogAssignmentsSchema),
+  vendorSetCatalogAssignments
 );
 router.get('/hub-packages', requireHubContext, vendorListHubPackages);
 router.put('/hub-packages/crew', requireHubContext, validate(setHubPackageCrewSchema), vendorSetHubPackageCrew);

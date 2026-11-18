@@ -1,7 +1,13 @@
-import { AssignmentMethod, CrewMemberRole, CrewMemberStatus, Prisma } from '@prisma/client';
+import {
+  AssignmentMethod,
+  CatalogAssignmentPriority,
+  CrewMemberRole,
+  CrewMemberStatus,
+  Prisma,
+} from '@prisma/client';
 import { prisma } from '../config/prisma';
 import { TRAVEL_BUFFER_MINUTES, intervalsOverlap } from '../config/scheduling';
-import { findEligibleEmployeeIds } from './tag.eligibility';
+import { findEligibleEmployeeIds, findEligibleEmployeesWithPriority } from './tag.eligibility';
 import { ACTIVE_JOB_STATUSES, haversineKm, isValidCoordinate } from './dispatch.rules';
 import { notifyUsers } from './notify.service';
 
@@ -57,13 +63,17 @@ export async function pickCrewForSlot(params: {
   preferCheckedIn?: boolean;
 }): Promise<string[]> {
   const db = params.tx || prisma;
-  const eligible = await findEligibleEmployeeIds({
+  const eligibleMatches = await findEligibleEmployeesWithPriority({
     vendorId: params.vendorId,
     categoryId: params.categoryId,
     subCategoryId: params.subCategoryId,
     packageId: params.packageId,
     requireCheckedIn: false,
   });
+  const priorityByEmployee = new Map(
+    eligibleMatches.map((m) => [m.employeeId, m.priority] as const)
+  );
+  const eligible = eligibleMatches.map((m) => m.employeeId);
 
   const profiles = await db.employeeProfile.findMany({
     where: { id: { in: eligible } },
@@ -77,12 +87,22 @@ export async function pickCrewForSlot(params: {
     },
   });
 
-  const scored: Array<{ id: string; score: number }> = [];
+  const scored: Array<{ id: string; score: number; primaryRank: number }> = [];
   for (const p of profiles) {
     if (await employeeBusy(db, p.id, params.startAt, params.endAt, params.excludeBookingId)) {
       continue;
     }
     let score = 0;
+    const catalogPriority = priorityByEmployee.get(p.id);
+    // Prefer PRIMARY-matched free pros; SECONDARY only when no PRIMARY is free.
+    const primaryRank =
+      catalogPriority === CatalogAssignmentPriority.PRIMARY
+        ? 0
+        : catalogPriority === CatalogAssignmentPriority.SECONDARY
+          ? 1
+          : 2;
+    if (catalogPriority === CatalogAssignmentPriority.PRIMARY) score += 100;
+    else if (catalogPriority === CatalogAssignmentPriority.SECONDARY) score += 20;
     if (p.hubCheckedInAt) score += 40;
     else if (params.preferCheckedIn) score -= 10;
     if (
@@ -100,10 +120,13 @@ export async function pickCrewForSlot(params: {
     const last = p.lastAssignedAt ? p.lastAssignedAt.getTime() : 0;
     score += Math.min(20, (Date.now() - last) / (1000 * 60 * 60)); // prefer less recently assigned
     score -= Math.min(10, p.completedJobs / 50);
-    scored.push({ id: p.id, score });
+    scored.push({ id: p.id, score, primaryRank });
   }
 
-  scored.sort((a, b) => b.score - a.score || a.id.localeCompare(b.id));
+  scored.sort(
+    (a, b) =>
+      a.primaryRank - b.primaryRank || b.score - a.score || a.id.localeCompare(b.id)
+  );
   return scored.slice(0, params.required).map((s) => s.id);
 }
 

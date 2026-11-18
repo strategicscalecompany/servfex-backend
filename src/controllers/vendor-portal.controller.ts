@@ -582,7 +582,7 @@ export const updateVendorProfile = async (req: Request, res: Response): Promise<
         sendError(
           res,
           'FORBIDDEN',
-          'Partners cannot set hub settlement UPI. Ask Super Admin or Hub Operations Manager.',
+          'Partners cannot set hub settlement UPI. Ask Super Admin or Business Operation Manager.',
           403
         );
         return;
@@ -1186,12 +1186,12 @@ export const getDeskContext = async (req: Request, res: Response): Promise<void>
   }
 };
 
-/** Rolling 30-day hub metrics for Hub Operation Manager (HOM) portal dashboard. */
+/** Rolling 30-day hub metrics for Business Operation Manager (BOM) portal dashboard. */
 export const getManagerDashboard = async (req: Request, res: Response): Promise<void> => {
   try {
     const actor = await resolvePortalActor(req.user!.userId);
     if (!actor.isManager) {
-      sendError(res, 'FORBIDDEN', 'Only Hub Operation Managers can open this dashboard', 403);
+      sendError(res, 'FORBIDDEN', 'Only Business Operation Managers can open this dashboard', 403);
       return;
     }
 
@@ -1337,7 +1337,7 @@ export const getManagerDashboard = async (req: Request, res: Response): Promise<
 
     sendSuccess(res, {
       role: 'OPERATIONS_MANAGER',
-      portalLabel: 'Hub Operation Manager',
+      portalLabel: 'Business Operation Manager',
       periodDays: 30,
       hubs: allAssignedHubs,
       activeHubId: hubIds.length === 1 ? hubIds[0] : null,
@@ -2658,7 +2658,7 @@ export const getVendorEmployees = async (req: Request, res: Response): Promise<v
       orderBy: { createdAt: 'desc' },
     });
 
-    // Hub Operation Managers assigned to this hub (kept separate from field employees).
+    // Business Operation Managers assigned to this hub (kept separate from field employees).
     // Match by ManagerProfile.vendorId and by zone CSV hub names / hub UUIDs — same rules as admin getManagers.
     const allVendors = await prisma.vendorProfile.findMany({
       select: { id: true, companyName: true, warehouseName: true },
@@ -2723,7 +2723,7 @@ export const getVendorEmployees = async (req: Request, res: Response): Promise<v
         shiftHours: mgr.shiftHours,
         vendorId: mgr.vendorId || vendorId,
         user: mgr.user,
-        portalLabel: 'Hub Operation Manager',
+        portalLabel: 'Business Operation Manager',
       }));
 
     const startOfToday = new Date();
@@ -3480,7 +3480,7 @@ export const createHubBooking = async (req: Request, res: Response): Promise<voi
         vendorUserId: userId,
         employeeIdOrUserId: technicianToAssign.id,
         expertPayout: null,
-        note: isSalesManager ? 'Assigned immediately by Sales Manager' : 'Assigned immediately by Hub Operation Manager',
+        note: isSalesManager ? 'Assigned immediately by Sales Manager' : 'Assigned immediately by Business Operation Manager',
       });
       if (assigned) {
         finalBooking = assigned;

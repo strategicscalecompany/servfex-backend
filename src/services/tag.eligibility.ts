@@ -1,9 +1,10 @@
+import { CatalogAssignmentPriority } from '@prisma/client';
 import { prisma } from '../config/prisma';
 
 /**
  * Catalog-assignment eligibility:
- * A professional is eligible when they have been assigned the booking's package
- * and/or its service subcategory (set during Partner/HOM onboarding).
+ * A professional is eligible when BOM assigned them the booking's package,
+ * subcategory, and/or parent category (Primary or Secondary).
  *
  * Migration fallback: if no professional at the hub has any catalog assignments yet,
  * treat all hub service professionals as eligible (legacy behaviour).
@@ -16,6 +17,12 @@ type EmployeeWhereBase = {
   expertKind: 'SERVICE_PROFESSIONAL';
   user: { status: 'ACTIVE'; deletedAt: null };
   hubCheckedInAt?: { not: null };
+};
+
+export type EligibleEmployeeMatch = {
+  employeeId: string;
+  /** Best match priority for this booking catalog (PRIMARY preferred over SECONDARY). */
+  priority: CatalogAssignmentPriority | null;
 };
 
 function buildEmployeeWhereBase(params: {
@@ -33,7 +40,11 @@ function buildEmployeeWhereBase(params: {
 }
 
 async function hubHasAnyCatalogAssignments(vendorId: string): Promise<boolean> {
-  const [anySub, anyPkg] = await Promise.all([
+  const [anyCat, anySub, anyPkg] = await Promise.all([
+    prisma.employeeCategory.findFirst({
+      where: { employee: { vendorId } },
+      select: { id: true },
+    }),
     prisma.employeeSubCategory.findFirst({
       where: { employee: { vendorId } },
       select: { id: true },
@@ -43,15 +54,125 @@ async function hubHasAnyCatalogAssignments(vendorId: string): Promise<boolean> {
       select: { id: true },
     }),
   ]);
-  return !!anySub || !!anyPkg;
+  return !!anyCat || !!anySub || !!anyPkg;
 }
 
-async function listAllHubPros(employeeWhereBase: EmployeeWhereBase): Promise<string[]> {
+async function listAllHubPros(employeeWhereBase: EmployeeWhereBase): Promise<EligibleEmployeeMatch[]> {
   const employees = await prisma.employeeProfile.findMany({
     where: employeeWhereBase,
     select: { id: true },
   });
-  return employees.map((e) => e.id);
+  return employees.map((e) => ({ employeeId: e.id, priority: null }));
+}
+
+function mergePriority(
+  map: Map<string, CatalogAssignmentPriority | null>,
+  employeeId: string,
+  priority: CatalogAssignmentPriority
+) {
+  const existing = map.get(employeeId);
+  if (!existing || existing === CatalogAssignmentPriority.SECONDARY) {
+    map.set(employeeId, priority);
+  }
+  if (priority === CatalogAssignmentPriority.PRIMARY) {
+    map.set(employeeId, CatalogAssignmentPriority.PRIMARY);
+  }
+}
+
+export async function findEligibleEmployeesWithPriority(params: {
+  vendorId: string;
+  categoryId?: string | null;
+  subCategoryId?: string | null;
+  packageId?: string | null;
+  requireCheckedIn?: boolean;
+}): Promise<EligibleEmployeeMatch[]> {
+  const { vendorId, categoryId, subCategoryId, packageId, requireCheckedIn = false } = params;
+  const employeeWhereBase = buildEmployeeWhereBase({ vendorId, requireCheckedIn });
+  const match = new Map<string, CatalogAssignmentPriority | null>();
+
+  let resolvedSubCategoryId = subCategoryId || null;
+  let resolvedCategoryId = categoryId || null;
+
+  if (packageId) {
+    const [byPackage, pkgMeta] = await Promise.all([
+      prisma.employeePackage.findMany({
+        where: { packageId, employee: employeeWhereBase },
+        select: { employeeId: true, priority: true },
+      }),
+      prisma.servicePackage.findUnique({
+        where: { id: packageId },
+        select: {
+          service: { select: { subCategoryId: true, categoryId: true } },
+        },
+      }),
+    ]);
+    byPackage.forEach((r) => mergePriority(match, r.employeeId, r.priority));
+    if (!resolvedSubCategoryId) {
+      resolvedSubCategoryId = pkgMeta?.service?.subCategoryId || null;
+    }
+    if (!resolvedCategoryId) {
+      resolvedCategoryId = pkgMeta?.service?.categoryId || null;
+    }
+  }
+
+  if (resolvedSubCategoryId) {
+    const [bySub, subMeta] = await Promise.all([
+      prisma.employeeSubCategory.findMany({
+        where: { subCategoryId: resolvedSubCategoryId, employee: employeeWhereBase },
+        select: { employeeId: true, priority: true },
+      }),
+      !resolvedCategoryId
+        ? prisma.serviceSubCategory.findUnique({
+            where: { id: resolvedSubCategoryId },
+            select: { categoryId: true },
+          })
+        : Promise.resolve(null),
+    ]);
+    bySub.forEach((r) => mergePriority(match, r.employeeId, r.priority));
+    if (!resolvedCategoryId) {
+      resolvedCategoryId = subMeta?.categoryId || null;
+    }
+  }
+
+  if (resolvedCategoryId) {
+    const byCat = await prisma.employeeCategory.findMany({
+      where: { categoryId: resolvedCategoryId, employee: employeeWhereBase },
+      select: { employeeId: true, priority: true },
+    });
+    byCat.forEach((r) => mergePriority(match, r.employeeId, r.priority));
+  }
+
+  // Category-only path also covers nested sub/package assignees when package/sub unknown.
+  if (resolvedCategoryId && match.size === 0 && !packageId && !subCategoryId) {
+    const [bySubCat, byPkg] = await Promise.all([
+      prisma.employeeSubCategory.findMany({
+        where: {
+          subCategory: { categoryId: resolvedCategoryId },
+          employee: employeeWhereBase,
+        },
+        select: { employeeId: true, priority: true },
+      }),
+      prisma.employeePackage.findMany({
+        where: {
+          package: { service: { categoryId: resolvedCategoryId } },
+          employee: employeeWhereBase,
+        },
+        select: { employeeId: true, priority: true },
+      }),
+    ]);
+    bySubCat.forEach((r) => mergePriority(match, r.employeeId, r.priority));
+    byPkg.forEach((r) => mergePriority(match, r.employeeId, r.priority));
+  }
+
+  if (match.size > 0) {
+    return [...match.entries()].map(([employeeId, priority]) => ({ employeeId, priority }));
+  }
+
+  if (!(await hubHasAnyCatalogAssignments(vendorId))) {
+    return listAllHubPros(employeeWhereBase);
+  }
+
+  return [];
 }
 
 export async function findEligibleEmployeeIds(params: {
@@ -61,78 +182,8 @@ export async function findEligibleEmployeeIds(params: {
   packageId?: string | null;
   requireCheckedIn?: boolean;
 }): Promise<string[]> {
-  const { vendorId, categoryId, subCategoryId, packageId, requireCheckedIn = false } = params;
-  const employeeWhereBase = buildEmployeeWhereBase({ vendorId, requireCheckedIn });
-
-  const eligible = new Set<string>();
-  let resolvedSubCategoryId = subCategoryId || null;
-
-  // Prefer direct package/subcategory lookups first — skip the hub-wide "any assignment?" probe.
-  if (packageId || resolvedSubCategoryId) {
-    const [byPackage, pkgMeta, bySubInitial] = await Promise.all([
-      packageId
-        ? prisma.employeePackage.findMany({
-            where: { packageId, employee: employeeWhereBase },
-            select: { employeeId: true },
-          })
-        : Promise.resolve([] as Array<{ employeeId: string }>),
-      !resolvedSubCategoryId && packageId
-        ? prisma.servicePackage.findUnique({
-            where: { id: packageId },
-            select: { service: { select: { subCategoryId: true } } },
-          })
-        : Promise.resolve(null),
-      resolvedSubCategoryId
-        ? prisma.employeeSubCategory.findMany({
-            where: { subCategoryId: resolvedSubCategoryId, employee: employeeWhereBase },
-            select: { employeeId: true },
-          })
-        : Promise.resolve([] as Array<{ employeeId: string }>),
-    ]);
-    byPackage.forEach((r) => eligible.add(r.employeeId));
-    bySubInitial.forEach((r) => eligible.add(r.employeeId));
-    if (!resolvedSubCategoryId) {
-      resolvedSubCategoryId = pkgMeta?.service?.subCategoryId || null;
-    }
-    if (resolvedSubCategoryId && bySubInitial.length === 0 && !subCategoryId) {
-      const bySub = await prisma.employeeSubCategory.findMany({
-        where: { subCategoryId: resolvedSubCategoryId, employee: employeeWhereBase },
-        select: { employeeId: true },
-      });
-      bySub.forEach((r) => eligible.add(r.employeeId));
-    }
-    if (eligible.size > 0) return [...eligible];
-  }
-
-  // Category-only lookups (slots / crew when package unknown).
-  if (categoryId && !packageId && !resolvedSubCategoryId) {
-    const [bySubCat, byPkg] = await Promise.all([
-      prisma.employeeSubCategory.findMany({
-        where: {
-          subCategory: { categoryId },
-          employee: employeeWhereBase,
-        },
-        select: { employeeId: true },
-      }),
-      prisma.employeePackage.findMany({
-        where: {
-          package: { service: { categoryId } },
-          employee: employeeWhereBase,
-        },
-        select: { employeeId: true },
-      }),
-    ]);
-    bySubCat.forEach((r) => eligible.add(r.employeeId));
-    byPkg.forEach((r) => eligible.add(r.employeeId));
-    if (eligible.size > 0) return [...eligible];
-  }
-
-  // Legacy hubs with no catalog assignments yet → all checked-in pros.
-  if (!(await hubHasAnyCatalogAssignments(vendorId))) {
-    return listAllHubPros(employeeWhereBase);
-  }
-
-  return [...eligible];
+  const matches = await findEligibleEmployeesWithPriority(params);
+  return matches.map((m) => m.employeeId);
 }
 
 export async function isEmployeeEligibleForCatalog(params: {

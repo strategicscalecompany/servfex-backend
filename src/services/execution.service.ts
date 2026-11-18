@@ -615,19 +615,19 @@ export async function saveProviderUpi(userId: string, upiIdRaw: unknown, vendorI
   });
   if (!user) throw new DispatchError('NOT_FOUND', 'User not found', 404);
 
-  // Settlement UPI is editable only by Hub Operations Manager via this portal API.
+  // Settlement UPI is editable only by Business Operation Manager via this portal API.
   // Super Admin edits hub UPI through /admin/vendors (create/update). Partners and pros cannot.
   if (user.role !== 'OPERATIONS_MANAGER' || !user.managerProfile) {
     throw new DispatchError(
       'FORBIDDEN',
-      'Only Super Admin or Hub Operations Manager can set the hub settlement UPI.',
+      'Only Super Admin or Business Operation Manager can set the hub settlement UPI.',
       403
     );
   }
   if (user.managerProfile.kind && user.managerProfile.kind !== 'OPERATIONS') {
     throw new DispatchError(
       'FORBIDDEN',
-      'Only Hub Operations Manager can set the hub settlement UPI.',
+      'Only Business Operation Manager can set the hub settlement UPI.',
       403
     );
   }
@@ -1030,7 +1030,7 @@ export async function homForceHubCheckIn(actorUserId: string, employeeProfileId:
     },
   });
   if (!actor || actor.role !== 'OPERATIONS_MANAGER') {
-    throw new DispatchError('FORBIDDEN', 'Only Hub Operation Managers can force check-in', 403);
+    throw new DispatchError('FORBIDDEN', 'Only Business Operation Managers (BOM) can force check-in', 403);
   }
 
   const now = new Date();
@@ -1132,7 +1132,7 @@ export async function homForceHubCheckOut(actorUserId: string, employeeProfileId
     },
   });
   if (!actor || actor.role !== 'OPERATIONS_MANAGER') {
-    throw new DispatchError('FORBIDDEN', 'Only Hub Operation Managers can force check-out', 403);
+    throw new DispatchError('FORBIDDEN', 'Only Business Operation Managers can force check-out', 403);
   }
 
   const profile = await prisma.employeeProfile.findUnique({

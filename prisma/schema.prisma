@@ -41,6 +41,12 @@ enum ExpertKind {
   SALES_MANAGER
 }
 
+/// BOM catalog assignment priority for a professional (at most one PRIMARY across all catalog rows).
+enum CatalogAssignmentPriority {
+  PRIMARY
+  SECONDARY
+}
+
 enum UserStatus {
   ACTIVE
   INACTIVE
@@ -334,6 +340,7 @@ model EmployeeProfile {
   assignments    BookingAssignment[]
   salesVisits    SalesVisit[]
   photos         BookingPhoto[]
+  employeeCategories    EmployeeCategory[]
   employeeSubCategories EmployeeSubCategory[]
   employeePackages      EmployeePackage[]
   crewMemberships BookingCrewMember[]
@@ -402,8 +409,9 @@ model ServiceCategory {
   createdAt     DateTime             @default(now())
   updatedAt     DateTime             @updatedAt
 
-  services      Service[]
-  subCategories ServiceSubCategory[]
+  services           Service[]
+  subCategories      ServiceSubCategory[]
+  employeeCategories EmployeeCategory[]
 
   @@index([isActive])
   @@index([deletedAt])
@@ -1043,34 +1051,55 @@ model AuditLog {
 // PROFESSIONAL CATALOG ASSIGNMENTS, SLOTS, CREW
 // ==========================================
 
-/// Subcategories a professional is qualified to fulfill (set during Partner/HOM onboarding).
+/// Categories a professional is qualified to fulfill (assigned by BOM from Services page).
+model EmployeeCategory {
+  id         String                     @id @default(uuid()) @map("_id")
+  employeeId String
+  employee   EmployeeProfile            @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  categoryId String
+  category   ServiceCategory            @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  priority   CatalogAssignmentPriority  @default(SECONDARY)
+  assignedBy String?
+  assignedAt DateTime                   @default(now())
+
+  @@unique([employeeId, categoryId])
+  @@index([categoryId])
+  @@index([employeeId])
+  @@index([employeeId, priority])
+}
+
+/// Subcategories a professional is qualified to fulfill (assigned by BOM from Services page).
 model EmployeeSubCategory {
-  id            String              @id @default(uuid()) @map("_id")
+  id            String                     @id @default(uuid()) @map("_id")
   employeeId    String
-  employee      EmployeeProfile     @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  employee      EmployeeProfile            @relation(fields: [employeeId], references: [id], onDelete: Cascade)
   subCategoryId String
-  subCategory   ServiceSubCategory  @relation(fields: [subCategoryId], references: [id], onDelete: Cascade)
+  subCategory   ServiceSubCategory         @relation(fields: [subCategoryId], references: [id], onDelete: Cascade)
+  priority      CatalogAssignmentPriority  @default(SECONDARY)
   assignedBy    String?
-  assignedAt    DateTime            @default(now())
+  assignedAt    DateTime                   @default(now())
 
   @@unique([employeeId, subCategoryId])
   @@index([subCategoryId])
   @@index([employeeId])
+  @@index([employeeId, priority])
 }
 
-/// Packages a professional is qualified to fulfill (fine-grained; set during Partner/HOM onboarding).
+/// Packages a professional is qualified to fulfill (assigned by BOM from Services page).
 model EmployeePackage {
-  id         String          @id @default(uuid()) @map("_id")
+  id         String                     @id @default(uuid()) @map("_id")
   employeeId String
-  employee   EmployeeProfile @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  employee   EmployeeProfile            @relation(fields: [employeeId], references: [id], onDelete: Cascade)
   packageId  String
-  package    ServicePackage  @relation(fields: [packageId], references: [id], onDelete: Cascade)
+  package    ServicePackage             @relation(fields: [packageId], references: [id], onDelete: Cascade)
+  priority   CatalogAssignmentPriority  @default(SECONDARY)
   assignedBy String?
-  assignedAt DateTime        @default(now())
+  assignedAt DateTime                   @default(now())
 
   @@unique([employeeId, packageId])
   @@index([packageId])
   @@index([employeeId])
+  @@index([employeeId, priority])
 }
 
 /// HOM-configured crew size for a package at a specific hub.

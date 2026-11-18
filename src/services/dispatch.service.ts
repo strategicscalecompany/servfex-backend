@@ -1432,7 +1432,7 @@ export async function advanceTravelStatus(
       });
     }
 
-    // Desk bookings: notify the Sales Manager / Hub Operation Manager who created or assigned the job.
+    // Desk bookings: notify the Sales Manager / Business Operation Manager who created or assigned the job.
     if (isDeskBooking && target === 'ARRIVED') {
       const creatorHistory = await tx.bookingStatusHistory.findFirst({
         where: { bookingId },

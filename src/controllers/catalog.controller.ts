@@ -47,7 +47,7 @@ type CatalogReachability = {
 };
 
 const OUT_OF_AREA_MESSAGE =
-  'Services are not available in your location. Please contact the nearest hub operations manager.';
+  'Services are not available in your location. Please contact the nearest Business Operation Manager.';
 
 const coveragePayload = (reachability: CatalogReachability) => ({
   inServiceArea: reachability.inServiceArea,
@@ -148,7 +148,7 @@ const digitsOnlyPhone = (raw: string | null | undefined): string =>
   (raw || '').replace(/\D/g, '');
 
 /**
- * Nearest active fulfillment hub + its Hub Operation Manager phone for out-of-area requests.
+ * Nearest active fulfillment hub + its Business Operation Manager phone for out-of-area requests.
  */
 const resolveNearestHubOperationsContact = async (
   latitude: number | null,
@@ -886,7 +886,7 @@ export const getCatalogHomeLayout = async (req: Request, res: Response): Promise
 };
 
 /**
- * Nearest hub operations manager contact for the customer's coordinates.
+ * Nearest Business Operation Manager contact for the customer's coordinates.
  * Public — used when the customer is outside every hub service radius.
  */
 export const getNearestHubContact = async (req: Request, res: Response): Promise<void> => {
