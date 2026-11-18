@@ -192,11 +192,23 @@ export const generateCallToken = async (req: Request, res: Response): Promise<vo
       return;
     }
 
+    // Reject local SQLite numeric ids — Agora calls require the Mongo booking UUID.
+    const uuidLike = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    if (!uuidLike.test(String(bookingId).trim())) {
+      sendError(
+        res,
+        'BAD_REQUEST',
+        'Invalid booking id for calling. Sync the order with the server and retry with the booking UUID.',
+        400
+      );
+      return;
+    }
+
     if (!env.AGORA_APP_ID || !env.AGORA_APP_CERTIFICATE) {
       sendError(
         res,
         'SERVICE_UNAVAILABLE',
-        'Agora RTC credentials are not configured on the backend server.',
+        'In-app calling is unavailable: Agora RTC credentials (AGORA_APP_ID / AGORA_APP_CERTIFICATE) are not configured on the server.',
         503
       );
       return;

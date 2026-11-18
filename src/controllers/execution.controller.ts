@@ -14,7 +14,7 @@ import {
   hubCheckOut,
   pingHubLocation,
   pingProfessionalLocation,
-  saveProfessionalUpi,
+  saveProviderUpi,
   setProfessionalAvailability,
 } from '../services/execution.service';
 import { listBookingMessages, sendBookingMessage } from '../services/chat.service';
@@ -141,7 +141,13 @@ export const updateMyAvailability = async (req: Request, res: Response): Promise
 
 export const updateMyUpi = async (req: Request, res: Response): Promise<void> => {
   try {
-    const profile = await saveProfessionalUpi(req.user!.userId, req.body.upiId);
+    const vendorId =
+      typeof req.body.vendorId === 'string' && req.body.vendorId.trim()
+        ? req.body.vendorId.trim()
+        : typeof req.query.vendorId === 'string'
+          ? req.query.vendorId
+          : null;
+    const profile = await saveProviderUpi(req.user!.userId, req.body.upiId, vendorId);
     sendSuccess(res, { profile });
   } catch (err: any) {
     if (handleDispatchError(res, err)) return;
@@ -157,7 +163,6 @@ export const getMyProfessionalProfile = async (req: Request, res: Response): Pro
         id: true,
         isAvailable: true,
         acceptingRequests: true,
-        upiId: true,
         workRadiusMeters: true,
         hubCheckedInAt: true,
         hubCheckedOutAt: true,
@@ -169,13 +174,28 @@ export const getMyProfessionalProfile = async (req: Request, res: Response): Pro
         specialization: true,
         rating: true,
         completedJobs: true,
+        vendor: {
+          select: {
+            id: true,
+            companyName: true,
+            warehouseName: true,
+            upiId: true,
+          },
+        },
       },
     });
     if (!profile) {
       sendError(res, 'NOT_FOUND', 'Professional profile not found', 404);
       return;
     }
-    sendSuccess(res, { profile });
+    // Payment UPI is hub-owned; expose it as providerUpiId so clients stop reading employee.upiId.
+    sendSuccess(res, {
+      profile: {
+        ...profile,
+        upiId: profile.vendor?.upiId || null,
+        providerUpiId: profile.vendor?.upiId || null,
+      },
+    });
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
   }

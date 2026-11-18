@@ -278,6 +278,8 @@ model VendorProfile {
   warehousePhone     String?
   warehouseImageUrl  String?
   serviceRadiusKm    Float           @default(15)
+  /// Hub / partner settlement UPI — authoritative for payment QR (not the professional's UPI).
+  upiId              String?
   createdAt          DateTime        @default(now())
   updatedAt          DateTime        @updatedAt
 

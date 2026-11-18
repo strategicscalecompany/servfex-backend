@@ -239,7 +239,6 @@ export const updateEmployeeSchema = z.object({
   specialization: z.string().min(2).optional(),
   isAvailable: z.boolean().optional(),
   acceptingRequests: z.boolean().optional(),
-  upiId: z.string().min(5).max(320).optional(),
   expertKind: expertKindSchema,
 });
 
@@ -515,6 +514,9 @@ export const getVendorProfile = async (req: Request, res: Response): Promise<voi
           rating: user.employeeProfile.rating,
           specialization: user.employeeProfile.specialization,
           expertKind: user.employeeProfile.expertKind,
+          // Hub settlement UPI for QR / display (not the professional's personal UPI).
+          upiId: user.employeeProfile.vendor.upiId || null,
+          providerUpiId: user.employeeProfile.vendor.upiId || null,
         },
         expertKind: user.employeeProfile.expertKind,
         workflow: getTestingWorkflowSnapshot(),
@@ -568,7 +570,7 @@ export const updateVendorProfile = async (req: Request, res: Response): Promise<
 
     const user = await prisma.user.findUnique({
       where: { id: userId },
-      include: { vendorProfile: true, employeeProfile: true },
+      include: { vendorProfile: true, employeeProfile: true, managerProfile: true },
     });
 
     if (!user) {
@@ -577,6 +579,16 @@ export const updateVendorProfile = async (req: Request, res: Response): Promise<
     }
 
     if (user.vendorProfile) {
+      const nextUpi =
+        req.body.upiId !== undefined
+          ? isValidUpiId(req.body.upiId)
+            ? normalizeUpiId(req.body.upiId)
+            : null
+          : undefined;
+      if (req.body.upiId !== undefined && req.body.upiId !== '' && nextUpi === null) {
+        sendError(res, 'INVALID_UPI', 'Enter a valid UPI ID such as name@upi', 400);
+        return;
+      }
       const updated = await prisma.vendorProfile.update({
         where: { id: user.vendorProfile.id },
         data: {
@@ -586,6 +598,7 @@ export const updateVendorProfile = async (req: Request, res: Response): Promise<
           ...(latitude !== undefined ? { latitude } : {}),
           ...(longitude !== undefined ? { longitude } : {}),
           ...(isActive !== undefined ? { isActive } : {}),
+          ...(nextUpi !== undefined ? { upiId: nextUpi || null } : {}),
         },
       });
       sendSuccess(res, { vendorProfile: updated }, 200);
@@ -593,6 +606,16 @@ export const updateVendorProfile = async (req: Request, res: Response): Promise<
     }
 
     if (user.employeeProfile) {
+      // Professionals cannot set settlement UPI — hub partner UPI is authoritative.
+      if (req.body.upiId !== undefined) {
+        sendError(
+          res,
+          'FORBIDDEN',
+          'Professionals cannot set payment UPI. The Partner hub UPI is used for all collections.',
+          403
+        );
+        return;
+      }
       const updated = await prisma.$transaction(async (tx) => {
         if (phone) {
           await tx.user.update({
@@ -607,9 +630,6 @@ export const updateVendorProfile = async (req: Request, res: Response): Promise<
             ...(specialization ? { specialization } : {}),
             ...(isAvailable !== undefined ? { isAvailable } : {}),
             ...(req.body.acceptingRequests !== undefined ? { acceptingRequests: req.body.acceptingRequests } : {}),
-            ...(req.body.upiId !== undefined
-              ? { upiId: isValidUpiId(req.body.upiId) ? normalizeUpiId(req.body.upiId) : undefined }
-              : {}),
           },
         });
       });
@@ -2951,7 +2971,7 @@ export const updateVendorEmployee = async (req: Request, res: Response): Promise
   try {
     const userId = req.user!.userId;
     const id = req.params.id as string;
-    const { name, phone, specialization, isAvailable, acceptingRequests, upiId, expertKind } = req.body;
+    const { name, phone, specialization, isAvailable, acceptingRequests, expertKind } = req.body;
 
     const vendorProfile = await prisma.vendorProfile.findUnique({
       where: { userId },
@@ -2989,7 +3009,6 @@ export const updateVendorEmployee = async (req: Request, res: Response): Promise
           ...(specialization ? { specialization } : {}),
           ...(isAvailable !== undefined ? { isAvailable } : {}),
           ...(acceptingRequests !== undefined ? { acceptingRequests } : {}),
-          ...(upiId !== undefined && isValidUpiId(upiId) ? { upiId: normalizeUpiId(upiId) } : {}),
           ...(expertKind ? { expertKind: normalizeExpertKind(expertKind) } : {}),
         },
         include: { user: true },

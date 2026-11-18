@@ -545,7 +545,13 @@ export async function buildPaymentQr(userId: string, bookingId: string) {
   const booking = await prisma.booking.findUnique({
     where: { id: bookingId },
     include: {
-      employee: { include: { user: { select: { id: true, name: true } } } },
+      employee: {
+        include: {
+          user: { select: { id: true, name: true } },
+          vendor: { select: { id: true, companyName: true, warehouseName: true, upiId: true } },
+        },
+      },
+      vendor: { select: { id: true, companyName: true, warehouseName: true, upiId: true } },
       service: { select: { name: true } },
     },
   });
@@ -556,14 +562,20 @@ export async function buildPaymentQr(userId: string, bookingId: string) {
   if (!['IN_PROGRESS', 'AWAITING_CUSTOMER_CONFIRMATION', 'AWAITING_PAYMENT'].includes(booking.status)) {
     throw new DispatchError('BAD_REQUEST', 'Payment QR is available after the service has started', 400);
   }
-  const upiId = normalizeUpiId(booking.employee.upiId);
+  const hub = booking.vendor || booking.employee?.vendor || null;
+  const upiId = normalizeUpiId(hub?.upiId);
   if (!isValidUpiId(upiId)) {
-    throw new DispatchError('UPI_REQUIRED', 'Save a valid UPI ID on your profile before generating a payment QR', 400);
+    throw new DispatchError(
+      'UPI_REQUIRED',
+      'Partner hub UPI is not set. Ask the Provider to save the hub UPI ID before collecting online payment',
+      400
+    );
   }
+  const payeeName = hub?.warehouseName || hub?.companyName || 'ServFex Partner';
   const amount = booking.totalAmount;
   const uri = buildUpiPaymentUri({
     upiId,
-    payeeName: booking.employee.user.name || 'ServFex Professional',
+    payeeName,
     amount,
     transactionRef: booking.bookingNumber.replace(/[^a-zA-Z0-9]/g, '').slice(0, 35),
     note: `ServFex ${booking.service.name} ${booking.bookingNumber}`,
@@ -574,25 +586,64 @@ export async function buildPaymentQr(userId: string, bookingId: string) {
     amount,
     currency: 'INR',
     upiId,
-    payeeName: booking.employee.user.name,
+    payeeName,
     uri,
     paymentStatus: booking.paymentStatus,
     note: 'QR display is not payment confirmation. Mark paid only after verified collection or reconciliation.',
   };
 }
 
-export async function saveProfessionalUpi(userId: string, upiIdRaw: unknown) {
+/**
+ * Authoritative payment UPI lives on the hub VendorProfile.
+ * Allowed actors: hub partner (VENDOR) or an operations manager assigned to that hub.
+ */
+export async function saveProviderUpi(userId: string, upiIdRaw: unknown, vendorId?: string | null) {
   const upiId = normalizeUpiId(upiIdRaw);
   if (!isValidUpiId(upiId)) {
     throw new DispatchError('INVALID_UPI', 'Enter a valid UPI ID such as name@upi', 400);
   }
-  const profile = await prisma.employeeProfile.findUnique({ where: { userId } });
-  if (!profile) throw new DispatchError('FORBIDDEN', 'Only service professionals can save a UPI ID', 403);
-  return prisma.employeeProfile.update({
-    where: { id: profile.id },
-    data: { upiId },
-    select: { id: true, upiId: true },
+
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: {
+      id: true,
+      role: true,
+      vendorProfile: { select: { id: true } },
+      managerProfile: { select: { id: true, vendorId: true, kind: true } },
+      employeeProfile: { select: { id: true } },
+    },
   });
+  if (!user) throw new DispatchError('NOT_FOUND', 'User not found', 404);
+  if (user.employeeProfile && user.role === 'EMPLOYEE') {
+    throw new DispatchError(
+      'FORBIDDEN',
+      'Professionals cannot set payment UPI. The Partner hub UPI is used for all collections.',
+      403
+    );
+  }
+
+  let targetVendorId: string | null = null;
+  if (user.vendorProfile) {
+    targetVendorId = user.vendorProfile.id;
+  } else if (user.role === 'OPERATIONS_MANAGER' && user.managerProfile) {
+    targetVendorId = (vendorId && vendorId.trim()) || user.managerProfile.vendorId || null;
+    if (!targetVendorId) {
+      throw new DispatchError('BAD_REQUEST', 'Select a hub before saving the partner UPI ID', 400);
+    }
+  } else {
+    throw new DispatchError('FORBIDDEN', 'Only the Partner or Hub Operations Manager can save hub UPI', 403);
+  }
+
+  return prisma.vendorProfile.update({
+    where: { id: targetVendorId },
+    data: { upiId },
+    select: { id: true, upiId: true, companyName: true },
+  });
+}
+
+/** @deprecated Use saveProviderUpi — payment UPI is hub-owned. */
+export async function saveProfessionalUpi(userId: string, upiIdRaw: unknown) {
+  return saveProviderUpi(userId, upiIdRaw);
 }
 
 export async function confirmUpiCollection(userId: string, bookingId: string, utrRaw: unknown) {

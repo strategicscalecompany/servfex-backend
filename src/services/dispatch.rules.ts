@@ -393,7 +393,9 @@ export function evaluateCallAccess(input: CallAccessInput): CallAccessDecision {
       return {
         allowed: false,
         code: 'CALL_NOT_AVAILABLE',
-        message: 'Sales Manager is not available for in-app calling on this desk booking yet',
+        message: !expertUserId
+          ? 'No professional is assigned to this desk booking yet'
+          : 'No Sales Manager / hub Partner is available to receive this call. Assign a Sales Manager or ensure the Partner account is active.',
         httpStatus: 409,
       };
     }

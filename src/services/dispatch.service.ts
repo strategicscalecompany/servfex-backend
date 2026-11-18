@@ -937,7 +937,10 @@ export async function assignExpertManually(input: ManualAssignInput) {
 async function loadExpertContext(tx: Tx, userId: string) {
   const profile = await tx.employeeProfile.findUnique({
     where: { userId },
-    include: { user: { select: { name: true } } },
+    include: {
+      user: { select: { name: true } },
+      vendor: { select: { id: true, upiId: true, companyName: true } },
+    },
   });
   if (!profile) throw new DispatchError('FORBIDDEN', 'Only experts can respond to assignments', 403);
   if (isTestingWorkflowEnabled() && profile.expertKind === 'SALES_MANAGER') {
@@ -1333,11 +1336,11 @@ export async function advanceTravelStatus(
       );
     }
 
-    // UPI is required before starting the journey (Accept step removed for professionals).
-    if (target === 'ON_THE_WAY' && !isValidUpiId(normalizeUpiId(expert.upiId))) {
+    // Hub / partner UPI is required before starting the journey (professionals do not own settlement UPI).
+    if (target === 'ON_THE_WAY' && !isValidUpiId(normalizeUpiId(expert.vendor?.upiId))) {
       throw new DispatchError(
         'UPI_REQUIRED',
-        'Add your UPI ID before starting the journey so you can receive online payments',
+        'Partner hub UPI is not set. Ask the Provider to save the hub UPI ID before starting the journey',
         400
       );
     }

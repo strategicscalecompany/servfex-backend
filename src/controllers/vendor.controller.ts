@@ -10,6 +10,7 @@ import { estimatePayloadBytes, MAX_DOCUMENT_BYTES, resolveHostedUrl } from '../u
 import { sendProviderWelcomeEmail } from '../services/email.service';
 import { toMoney } from '../utils/money';
 import { invalidateCatalogCache } from './catalog.controller';
+import { isValidUpiId, normalizeUpiId } from '../utils/upi';
 
 const MAX_ONBOARDING_DOCUMENTS = 30;
 
@@ -50,6 +51,12 @@ export const createVendorSchema = z.object({
       .min(0.1, 'Coverage radius must be at least 0.1 km')
       .max(200, 'Coverage radius cannot exceed 200 km')
       .optional(),
+    upiId: z
+      .string()
+      .trim()
+      .max(320)
+      .optional()
+      .refine((v) => !v || isValidUpiId(v), 'Enter a valid UPI ID such as name@upi'),
     documents: z
       .array(
         z.object({
@@ -84,6 +91,13 @@ export const updateVendorSchema = z.object({
       .max(200, 'Coverage radius cannot exceed 200 km')
       .nullable()
       .optional(),
+    upiId: z
+      .string()
+      .trim()
+      .max(320)
+      .nullable()
+      .optional()
+      .refine((v) => v === null || v === undefined || v === '' || isValidUpiId(v), 'Enter a valid UPI ID such as name@upi'),
     reason: z.string().optional(),
   }),
 });
@@ -373,12 +387,15 @@ export const createVendor = async (req: Request, res: Response, next: NextFuncti
       latitude,
       longitude,
       serviceRadiusKm,
+      upiId,
       documents,
     } = req.body;
     const parsedRadiusKm =
       typeof serviceRadiusKm === 'number' && Number.isFinite(serviceRadiusKm) && serviceRadiusKm > 0
         ? serviceRadiusKm
         : undefined;
+    const normalizedHubUpi =
+      typeof upiId === 'string' && upiId.trim() ? normalizeUpiId(upiId) : null;
     const cleanEmail = email.toLowerCase().trim();
     const finalName = name || companyName || cleanEmail.split('@')[0];
     const finalCompanyName = companyName || warehouseName || name || cleanEmail.split('@')[0];
@@ -539,6 +556,7 @@ export const createVendor = async (req: Request, res: Response, next: NextFuncti
               latitude: latitude !== undefined ? latitude : null,
               longitude: longitude !== undefined ? longitude : null,
               ...(parsedRadiusKm !== undefined ? { serviceRadiusKm: parsedRadiusKm } : {}),
+              ...(normalizedHubUpi ? { upiId: normalizedHubUpi } : {}),
               bio: bio || null,
               commissionRate: toMoney(commissionRate || 0.0),
               kycStatus: 'APPROVED',
@@ -560,6 +578,7 @@ export const createVendor = async (req: Request, res: Response, next: NextFuncti
               latitude: latitude !== undefined ? latitude : null,
               longitude: longitude !== undefined ? longitude : null,
               ...(parsedRadiusKm !== undefined ? { serviceRadiusKm: parsedRadiusKm } : {}),
+              ...(normalizedHubUpi ? { upiId: normalizedHubUpi } : {}),
               bio: bio || null,
               commissionRate: toMoney(commissionRate || 0.0),
               kycStatus: 'APPROVED',
@@ -593,6 +612,7 @@ export const createVendor = async (req: Request, res: Response, next: NextFuncti
                 latitude: latitude !== undefined ? latitude : null,
                 longitude: longitude !== undefined ? longitude : null,
                 ...(parsedRadiusKm !== undefined ? { serviceRadiusKm: parsedRadiusKm } : {}),
+                ...(normalizedHubUpi ? { upiId: normalizedHubUpi } : {}),
                 bio: bio || null,
                 commissionRate: toMoney(commissionRate || 0.0),
                 kycStatus: 'APPROVED',
@@ -878,6 +898,7 @@ export const updateVendor = async (req: Request, res: Response, next: NextFuncti
       warehousePhone,
       warehouseImageUrl,
       serviceRadiusKm,
+      upiId,
       reason,
     } = req.body;
 
@@ -906,6 +927,9 @@ export const updateVendor = async (req: Request, res: Response, next: NextFuncti
       if (warehousePhone !== undefined) data.warehousePhone = warehousePhone;
       if (warehouseImageUrl !== undefined) data.warehouseImageUrl = warehouseImageUrl;
       if (serviceRadiusKm !== undefined && serviceRadiusKm !== null) data.serviceRadiusKm = serviceRadiusKm;
+      if (upiId !== undefined) {
+        data.upiId = upiId === null || upiId === '' ? null : normalizeUpiId(upiId);
+      }
 
       const v = await tx.vendorProfile.update({
         where: { id },
