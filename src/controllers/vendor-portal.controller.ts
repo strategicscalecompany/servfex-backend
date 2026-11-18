@@ -75,7 +75,6 @@ export const updateVendorProfileSchema = z.object({
   isActive: z.boolean().optional(),
   isAvailable: z.boolean().optional(),
   acceptingRequests: z.boolean().optional(),
-  upiId: z.string().min(5).max(320).optional(),
 });
 
 export const uploadDocumentSchema = z.object({
@@ -579,14 +578,13 @@ export const updateVendorProfile = async (req: Request, res: Response): Promise<
     }
 
     if (user.vendorProfile) {
-      const nextUpi =
-        req.body.upiId !== undefined
-          ? isValidUpiId(req.body.upiId)
-            ? normalizeUpiId(req.body.upiId)
-            : null
-          : undefined;
-      if (req.body.upiId !== undefined && req.body.upiId !== '' && nextUpi === null) {
-        sendError(res, 'INVALID_UPI', 'Enter a valid UPI ID such as name@upi', 400);
+      if (req.body.upiId !== undefined) {
+        sendError(
+          res,
+          'FORBIDDEN',
+          'Partners cannot set hub settlement UPI. Ask Super Admin or Hub Operations Manager.',
+          403
+        );
         return;
       }
       const updated = await prisma.vendorProfile.update({
@@ -598,7 +596,6 @@ export const updateVendorProfile = async (req: Request, res: Response): Promise<
           ...(latitude !== undefined ? { latitude } : {}),
           ...(longitude !== undefined ? { longitude } : {}),
           ...(isActive !== undefined ? { isActive } : {}),
-          ...(nextUpi !== undefined ? { upiId: nextUpi || null } : {}),
         },
       });
       sendSuccess(res, { vendorProfile: updated }, 200);

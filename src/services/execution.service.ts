@@ -609,33 +609,56 @@ export async function saveProviderUpi(userId: string, upiIdRaw: unknown, vendorI
       id: true,
       role: true,
       vendorProfile: { select: { id: true } },
-      managerProfile: { select: { id: true, vendorId: true, kind: true } },
+      managerProfile: { select: { id: true, vendorId: true, kind: true, zone: true } },
       employeeProfile: { select: { id: true } },
     },
   });
   if (!user) throw new DispatchError('NOT_FOUND', 'User not found', 404);
-  if (user.employeeProfile && user.role === 'EMPLOYEE') {
+
+  // Settlement UPI is editable only by Hub Operations Manager via this portal API.
+  // Super Admin edits hub UPI through /admin/vendors (create/update). Partners and pros cannot.
+  if (user.role !== 'OPERATIONS_MANAGER' || !user.managerProfile) {
     throw new DispatchError(
       'FORBIDDEN',
-      'Professionals cannot set payment UPI. The Partner hub UPI is used for all collections.',
+      'Only Super Admin or Hub Operations Manager can set the hub settlement UPI.',
+      403
+    );
+  }
+  if (user.managerProfile.kind && user.managerProfile.kind !== 'OPERATIONS') {
+    throw new DispatchError(
+      'FORBIDDEN',
+      'Only Hub Operations Manager can set the hub settlement UPI.',
       403
     );
   }
 
-  let targetVendorId: string | null = null;
-  if (user.vendorProfile) {
-    targetVendorId = user.vendorProfile.id;
-  } else if (user.role === 'OPERATIONS_MANAGER' && user.managerProfile) {
-    targetVendorId = (vendorId && vendorId.trim()) || user.managerProfile.vendorId || null;
-    if (!targetVendorId) {
-      throw new DispatchError('BAD_REQUEST', 'Select a hub before saving the partner UPI ID', 400);
-    }
-  } else {
-    throw new DispatchError('FORBIDDEN', 'Only the Partner or Hub Operations Manager can save hub UPI', 403);
+  const requested = (vendorId && vendorId.trim()) || user.managerProfile.vendorId || null;
+  if (!requested) {
+    throw new DispatchError('BAD_REQUEST', 'Select a hub before saving the partner UPI ID', 400);
+  }
+
+  // Ensure HOM is assigned to this hub (direct vendorId or zone CSV of UUIDs/names).
+  const hubs = await prisma.vendorProfile.findMany({
+    select: { id: true, companyName: true, warehouseName: true },
+  });
+  const zone = user.managerProfile.zone || '';
+  const zoneParts = zone
+    .split(',')
+    .map((p) => p.trim().toLowerCase())
+    .filter(Boolean);
+  const allowed = new Set<string>();
+  if (user.managerProfile.vendorId) allowed.add(user.managerProfile.vendorId);
+  for (const hub of hubs) {
+    if (zoneParts.includes(hub.id.toLowerCase())) allowed.add(hub.id);
+    if (hub.companyName && zoneParts.includes(hub.companyName.trim().toLowerCase())) allowed.add(hub.id);
+    if (hub.warehouseName && zoneParts.includes(hub.warehouseName.trim().toLowerCase())) allowed.add(hub.id);
+  }
+  if (allowed.size > 0 && !allowed.has(requested)) {
+    throw new DispatchError('FORBIDDEN', 'You can only set UPI for a hub assigned to you', 403);
   }
 
   return prisma.vendorProfile.update({
-    where: { id: targetVendorId },
+    where: { id: requested },
     data: { upiId },
     select: { id: true, upiId: true, companyName: true },
   });
