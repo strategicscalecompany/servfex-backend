@@ -1535,41 +1535,42 @@ export const getManagerHubBoard = async (req: Request, res: Response): Promise<v
     const today = ymdInBookingTz();
     const weekFrom = addDaysYmd(today, -6);
     const monthFrom = `${today.slice(0, 7)}-01`;
-    // Load enough history for month stats + filtered list (custom may stretch further).
-    const loadTo = to >= today ? to : today;
-    const historyFrom = [from, monthFrom, weekFrom].sort()[0];
+    // Stats need at least calendar-month history (look back 90d for custom/search).
+    const historyFrom = addDaysYmd(today, -90);
+
+    const hubBoardSelect = {
+      id: true,
+      bookingNumber: true,
+      status: true,
+      paymentStatus: true,
+      scheduledDate: true,
+      scheduledTimeSlot: true,
+      scheduledStartAt: true,
+      scheduledEndAt: true,
+      totalAmount: true,
+      expertPayout: true,
+      helperPayoutAmount: true,
+      leadPayoutAmount: true,
+      service: { select: { name: true } },
+      package: { select: { name: true } },
+      customer: {
+        select: {
+          user: { select: { name: true, phone: true, email: true } },
+        },
+      },
+      employee: {
+        select: {
+          user: { select: { name: true } },
+        },
+      },
+    } as const;
 
     const bookings = await prisma.booking.findMany({
       where: {
         vendorId: { in: hubIds },
-        scheduledDate: { gte: historyFrom, lte: loadTo },
+        scheduledDate: { gte: historyFrom, lte: to >= today ? to : today },
       },
-      select: {
-        id: true,
-        bookingNumber: true,
-        status: true,
-        paymentStatus: true,
-        scheduledDate: true,
-        scheduledTimeSlot: true,
-        scheduledStartAt: true,
-        scheduledEndAt: true,
-        totalAmount: true,
-        expertPayout: true,
-        helperPayoutAmount: true,
-        leadPayoutAmount: true,
-        service: { select: { name: true } },
-        package: { select: { name: true } },
-        customer: {
-          select: {
-            user: { select: { name: true, phone: true } },
-          },
-        },
-        employee: {
-          select: {
-            user: { select: { name: true } },
-          },
-        },
-      },
+      select: hubBoardSelect,
       orderBy: [{ scheduledDate: 'desc' }, { scheduledStartAt: 'desc' }],
       take: 500,
     });
@@ -1579,18 +1580,60 @@ export const getManagerHubBoard = async (req: Request, res: Response): Promise<v
     const weekRows = bookings.filter((b) => inRange(b.scheduledDate, weekFrom, today));
     const monthRows = bookings.filter((b) => inRange(b.scheduledDate, monthFrom, today));
 
-    const q = qRaw.toLowerCase();
-    const qDigits = qRaw.replace(/\D/g, '');
+    const normalizeBookingKey = (value: string) =>
+      value
+        .toLowerCase()
+        .replace(/^#/, '')
+        .replace(/\s+/g, '')
+        .replace(/^sfx-?/i, 'sfx-');
+
+    const matchesQuery = (
+      b: {
+        id: string;
+        bookingNumber: string;
+        customer?: { user?: { name?: string | null; phone?: string | null; email?: string | null } | null } | null;
+      },
+      raw: string
+    ) => {
+      const q = raw.toLowerCase().trim();
+      if (!q) return true;
+      const qDigits = raw.replace(/\D/g, '');
+      const qKey = normalizeBookingKey(raw);
+      const bookingNo = normalizeBookingKey(b.bookingNumber || '');
+      const name = (b.customer?.user?.name || '').toLowerCase();
+      const email = (b.customer?.user?.email || '').toLowerCase();
+      const phone = (b.customer?.user?.phone || '').replace(/\D/g, '');
+      const idHit =
+        bookingNo.includes(qKey) ||
+        b.id.toLowerCase().includes(q) ||
+        (qKey.length >= 4 && bookingNo.includes(qKey.replace(/^sfx-/, '')));
+      const nameHit = name.includes(q);
+      const emailHit = email.includes(q);
+      const phoneHit =
+        qDigits.length >= 3 &&
+        (phone.includes(qDigits) ||
+          (qDigits.length >= 10 && phone.endsWith(qDigits.slice(-10))) ||
+          (phone.length >= 10 && qDigits.endsWith(phone.slice(-10))));
+      return idHit || nameHit || emailHit || phoneHit;
+    };
+
     let filtered = bookings.filter((b) => inRange(b.scheduledDate, from, to));
-    if (q) {
-      filtered = filtered.filter((b) => {
-        const bookingNo = (b.bookingNumber || '').toLowerCase();
-        const name = (b.customer?.user?.name || '').toLowerCase();
-        const phone = (b.customer?.user?.phone || '').replace(/\D/g, '');
-        const idHit = bookingNo.includes(q) || b.id.toLowerCase().includes(q);
-        const nameHit = name.includes(q);
-        const phoneHit = qDigits.length >= 3 && phone.includes(qDigits);
-        return idHit || nameHit || phoneHit;
+
+    // Search is global across the hub (not limited to Today/Week chip).
+    if (qRaw) {
+      const recent = await prisma.booking.findMany({
+        where: { vendorId: { in: hubIds } },
+        select: hubBoardSelect,
+        orderBy: [{ updatedAt: 'desc' }],
+        take: 300,
+      });
+      const byId = new Map<string, (typeof bookings)[number]>();
+      for (const b of [...bookings, ...recent]) byId.set(b.id, b);
+      filtered = [...byId.values()].filter((b) => matchesQuery(b, qRaw));
+      filtered.sort((a, b) => {
+        const da = `${a.scheduledDate}|${a.scheduledTimeSlot || ''}`;
+        const db = `${b.scheduledDate}|${b.scheduledTimeSlot || ''}`;
+        return db.localeCompare(da);
       });
     }
 
@@ -1603,6 +1646,7 @@ export const getManagerHubBoard = async (req: Request, res: Response): Promise<v
       serviceName: b.package?.name || b.service?.name || 'Service',
       customerName: b.customer?.user?.name || '',
       customerPhone: b.customer?.user?.phone || '',
+      customerEmail: b.customer?.user?.email || '',
       totalAmount: b.totalAmount,
       employeeName: b.employee?.user?.name || '',
       pastJobGrace: isJobPastGrace(
