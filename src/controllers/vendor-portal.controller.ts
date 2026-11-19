@@ -3961,6 +3961,10 @@ export const getHubOrderAvailableSlots = async (req: Request, res: Response): Pr
       return;
     }
     const booking = scoped.booking!;
+    if (!booking.vendorId) {
+      sendError(res, 'BAD_REQUEST', 'Booking is not linked to a hub', 400);
+      return;
+    }
     if (!booking.service?.categoryId) {
       sendError(res, 'BAD_REQUEST', 'Booking service is missing category metadata for slots', 400);
       return;
@@ -4038,6 +4042,11 @@ export const rescheduleHubOrder = async (req: Request, res: Response): Promise<v
     }
     if (!(endAt > startAt)) {
       sendError(res, 'BAD_REQUEST', 'scheduledEndAt must be after scheduledStartAt', 400);
+      return;
+    }
+
+    if (!booking.vendorId) {
+      sendError(res, 'BAD_REQUEST', 'Booking is not linked to a hub', 400);
       return;
     }
 
