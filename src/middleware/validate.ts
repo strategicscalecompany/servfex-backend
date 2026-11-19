@@ -1,20 +1,24 @@
 import { Request, Response, NextFunction } from 'express';
-import { AnyZodObject, ZodError, ZodTypeAny } from 'zod';
+import { AnyZodObject, ZodError, ZodObject, ZodTypeAny } from 'zod';
 import { sendError } from '../utils/response';
+
+/** True when schema is `{ body?, query?, params? }` request wrapper — not a payload that merely has a string field named `body`. */
+function isRequestWrapperSchema(schema: ZodTypeAny): boolean {
+  const shape = (schema as ZodObject<any>)?.shape;
+  if (!shape || typeof shape !== 'object') return false;
+  if (shape.query !== undefined || shape.params !== undefined) return true;
+  const bodyField = shape.body;
+  // Wrapper uses nested ZodObject for req.body. Flat schemas like `{ body: z.string() }` are payload schemas.
+  return bodyField instanceof ZodObject;
+}
 
 export const validate = (schema: ZodTypeAny | { body?: AnyZodObject; query?: AnyZodObject; params?: AnyZodObject }) => {
   return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
       if ('parseAsync' in schema) {
-        const hasWrapperShape = (schema as any).shape && (
-          (schema as any).shape.body !== undefined ||
-          (schema as any).shape.query !== undefined ||
-          (schema as any).shape.params !== undefined
-        );
-
-        if (hasWrapperShape) {
+        if (isRequestWrapperSchema(schema as ZodTypeAny)) {
           // Full request schema with body, query, params
-          const parsed = await schema.parseAsync({
+          const parsed = await (schema as ZodTypeAny).parseAsync({
             body: req.body,
             query: req.query,
             params: req.params,
@@ -24,8 +28,8 @@ export const validate = (schema: ZodTypeAny | { body?: AnyZodObject; query?: Any
           if (parsed.query !== undefined) req.query = parsed.query;
           if (parsed.params !== undefined) req.params = parsed.params;
         } else {
-          // Schema is directly for req.body
-          req.body = await schema.parseAsync(req.body);
+          // Schema is directly for req.body (e.g. chatMessageSchema `{ body: string }`)
+          req.body = await (schema as ZodTypeAny).parseAsync(req.body);
         }
       } else {
         if (schema.body) {
