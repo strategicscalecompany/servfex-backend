@@ -1428,6 +1428,194 @@ export const getManagerDashboard = async (req: Request, res: Response): Promise<
   }
 };
 
+function addDaysYmd(ymd: string, days: number): string {
+  const [y, m, d] = ymd.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d + days));
+  return dt.toISOString().slice(0, 10);
+}
+
+function periodBoundsIst(period: string, fromYmd?: string | null, toYmd?: string | null): {
+  from: string;
+  to: string;
+} {
+  const today = ymdInBookingTz();
+  const p = (period || 'today').toLowerCase();
+  if (p === 'custom' && fromYmd && toYmd && /^\d{4}-\d{2}-\d{2}$/.test(fromYmd) && /^\d{4}-\d{2}-\d{2}$/.test(toYmd)) {
+    return fromYmd <= toYmd ? { from: fromYmd, to: toYmd } : { from: toYmd, to: fromYmd };
+  }
+  if (p === 'week') return { from: addDaysYmd(today, -6), to: today };
+  if (p === 'month') {
+    const [y, m] = today.split('-');
+    return { from: `${y}-${m}-01`, to: today };
+  }
+  return { from: today, to: today };
+}
+
+function summarizeHubPeriod(
+  rows: Array<{
+    status: string;
+    paymentStatus: string;
+    totalAmount: string;
+    expertPayout: string | null;
+    helperPayoutAmount: string | null;
+    leadPayoutAmount: string | null;
+  }>
+) {
+  const counted = rows.filter((b) => b.status === 'COMPLETED' || b.paymentStatus === 'PAID');
+  const earnings = sumMoney(counted.map((b) => b.totalAmount));
+  const employeeShare = sumMoney(
+    counted.map((b) => {
+      const expert = asDecimal(b.expertPayout);
+      const helper = asDecimal(b.helperPayoutAmount);
+      const lead = asDecimal(b.leadPayoutAmount);
+      // Prefer explicit lead+helper split when present; else expertPayout.
+      if (lead.gt(0) || helper.gt(0)) return lead.plus(helper);
+      return expert;
+    })
+  );
+  let hubShare = earnings.minus(employeeShare);
+  if (hubShare.lt(0)) hubShare = asDecimal(0);
+  return {
+    orders: rows.length,
+    completedOrders: counted.length,
+    earnings: toMoney(earnings),
+    employeeShare: toMoney(employeeShare),
+    hubShare: toMoney(hubShare),
+  };
+}
+
+/**
+ * BOM hub board: searchable/filterable bookings + today/week/month earnings shares.
+ * GET /vendor/manager/hub-board?q=&period=today|week|month|custom&from=&to=
+ */
+export const getManagerHubBoard = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const actor = await resolvePortalActor(req.user!.userId);
+    if (!actor.isManager && !actor.isVendor) {
+      sendError(res, 'FORBIDDEN', 'Only hub managers can open the hub board', 403);
+      return;
+    }
+
+    let hubIds: string[];
+    try {
+      ({ hubIds } = await scopedHubIdsForActor(actor, readRequestedHubVendorId(req)));
+    } catch (scopeErr: any) {
+      sendError(res, scopeErr.code || 'FORBIDDEN', scopeErr.message, scopeErr.status || 403);
+      return;
+    }
+    if (hubIds.length === 0) {
+      sendError(res, 'HUB_NOT_ASSIGNED', 'This manager is not assigned to a local provider hub yet', 403);
+      return;
+    }
+
+    const qRaw = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    const period = typeof req.query.period === 'string' ? req.query.period : 'today';
+    const fromQ = typeof req.query.from === 'string' ? req.query.from.trim() : null;
+    const toQ = typeof req.query.to === 'string' ? req.query.to.trim() : null;
+    const { from, to } = periodBoundsIst(period, fromQ, toQ);
+    const today = ymdInBookingTz();
+    const weekFrom = addDaysYmd(today, -6);
+    const monthFrom = `${today.slice(0, 7)}-01`;
+    // Load enough history for month stats + filtered list (custom may stretch further).
+    const loadTo = to >= today ? to : today;
+    const historyFrom = [from, monthFrom, weekFrom].sort()[0];
+
+    const bookings = await prisma.booking.findMany({
+      where: {
+        vendorId: { in: hubIds },
+        scheduledDate: { gte: historyFrom, lte: loadTo },
+      },
+      select: {
+        id: true,
+        bookingNumber: true,
+        status: true,
+        paymentStatus: true,
+        scheduledDate: true,
+        scheduledTimeSlot: true,
+        scheduledStartAt: true,
+        scheduledEndAt: true,
+        totalAmount: true,
+        expertPayout: true,
+        helperPayoutAmount: true,
+        leadPayoutAmount: true,
+        service: { select: { name: true } },
+        package: { select: { name: true } },
+        customer: {
+          select: {
+            user: { select: { name: true, phone: true } },
+          },
+        },
+        employee: {
+          select: {
+            user: { select: { name: true } },
+          },
+        },
+      },
+      orderBy: [{ scheduledDate: 'desc' }, { scheduledStartAt: 'desc' }],
+      take: 500,
+    });
+
+    const inRange = (ymd: string, a: string, b: string) => ymd >= a && ymd <= b;
+    const todayRows = bookings.filter((b) => b.scheduledDate === today);
+    const weekRows = bookings.filter((b) => inRange(b.scheduledDate, weekFrom, today));
+    const monthRows = bookings.filter((b) => inRange(b.scheduledDate, monthFrom, today));
+
+    const q = qRaw.toLowerCase();
+    const qDigits = qRaw.replace(/\D/g, '');
+    let filtered = bookings.filter((b) => inRange(b.scheduledDate, from, to));
+    if (q) {
+      filtered = filtered.filter((b) => {
+        const bookingNo = (b.bookingNumber || '').toLowerCase();
+        const name = (b.customer?.user?.name || '').toLowerCase();
+        const phone = (b.customer?.user?.phone || '').replace(/\D/g, '');
+        const idHit = bookingNo.includes(q) || b.id.toLowerCase().includes(q);
+        const nameHit = name.includes(q);
+        const phoneHit = qDigits.length >= 3 && phone.includes(qDigits);
+        return idHit || nameHit || phoneHit;
+      });
+    }
+
+    const mapRow = (b: (typeof bookings)[number]) => ({
+      id: b.id,
+      bookingNumber: b.bookingNumber,
+      status: b.status,
+      scheduledDate: b.scheduledDate,
+      scheduledTimeSlot: b.scheduledTimeSlot,
+      serviceName: b.package?.name || b.service?.name || 'Service',
+      customerName: b.customer?.user?.name || '',
+      customerPhone: b.customer?.user?.phone || '',
+      totalAmount: b.totalAmount,
+      employeeName: b.employee?.user?.name || '',
+      pastJobGrace: isJobPastGrace(
+        {
+          scheduledDate: b.scheduledDate,
+          scheduledTimeSlot: b.scheduledTimeSlot,
+          scheduledStartAt: b.scheduledStartAt,
+          scheduledEndAt: b.scheduledEndAt,
+        },
+        new Date()
+      ),
+      scheduleDayExpired: isBookingScheduleDayExpired(b.scheduledDate),
+    });
+
+    sendSuccess(res, {
+      period,
+      from,
+      to,
+      query: qRaw,
+      bookings: filtered.slice(0, 100).map(mapRow),
+      bookingCount: filtered.length,
+      stats: {
+        today: summarizeHubPeriod(todayRows),
+        week: summarizeHubPeriod(weekRows),
+        month: summarizeHubPeriod(monthRows),
+      },
+    });
+  } catch (err: any) {
+    sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
+  }
+};
+
 export const searchDeskServices = async (req: Request, res: Response): Promise<void> => {
   try {
     const actor = await resolvePortalActor(req.user!.userId);
