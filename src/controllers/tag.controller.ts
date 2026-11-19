@@ -97,30 +97,27 @@ async function assertHubOwnsCategories(vendorId: string, categoryIds: string[]) 
   }
 }
 
-/** Distinct catalog categories currently assigned to this hub via VendorService. */
+/** Distinct categories that still have at least one BOM-enabled package on this hub. */
 export async function listHubAssignedCategories(vendorId: string) {
-  const assignments = await prisma.vendorService.findMany({
-    where: {
-      vendorId,
-      isActive: true,
-      service: {
-        isActive: true,
-        OR: [{ deletedAt: null }, { deletedAt: { isSet: false } }],
-      },
-    },
+  const enabled = await prisma.hubPackageConfig.findMany({
+    where: { vendorId, isActive: true },
     select: {
-      service: {
+      package: {
         select: {
-          categoryId: true,
-          category: { select: { id: true, name: true } },
+          service: {
+            select: {
+              categoryId: true,
+              category: { select: { id: true, name: true } },
+            },
+          },
         },
       },
     },
   });
 
   const byId = new Map<string, { id: string; name: string }>();
-  for (const row of assignments) {
-    const cat = row.service?.category;
+  for (const row of enabled) {
+    const cat = row.package?.service?.category;
     if (cat?.id) {
       byId.set(cat.id, { id: cat.id, name: cat.name });
     }
@@ -213,20 +210,22 @@ export async function listHubCatalogTree(vendorId: string) {
   const categories = new Map<string, CatNode & { _order: number }>();
   const orphanPackagesByCategory = new Map<string, PackageNode[]>();
 
+  const ensureCategory = (category: { id: string; name: string; displayOrder?: number | null }) => {
+    if (!categories.has(category.id)) {
+      categories.set(category.id, {
+        id: category.id,
+        name: category.name,
+        price: null,
+        subCategories: [],
+        _order: category.displayOrder ?? 0,
+      });
+    }
+    return categories.get(category.id)!;
+  };
+
   for (const vs of vendorServices) {
     const svc = vs.service;
     if (!svc?.category) continue;
-
-    if (!categories.has(svc.category.id)) {
-      categories.set(svc.category.id, {
-        id: svc.category.id,
-        name: svc.category.name,
-        price: null,
-        subCategories: [],
-        _order: svc.category.displayOrder ?? 0,
-      });
-    }
-    const cat = categories.get(svc.category.id)!;
 
     // Services page only shows packages BOM has toggled on for this hub.
     const packages: PackageNode[] = (svc.packages || [])
@@ -244,7 +243,10 @@ export async function listHubCatalogTree(vendorId: string) {
           duration: pkg.duration ?? null,
         };
       });
+    // Skip services / categories with zero enabled packages (no empty shells).
     if (packages.length === 0) continue;
+
+    const cat = ensureCategory(svc.category);
 
     if (svc.subCategory) {
       let sub = cat.subCategories.find((s) => s.id === svc.subCategory!.id);
@@ -260,7 +262,7 @@ export async function listHubCatalogTree(vendorId: string) {
       for (const pkg of packages) {
         if (!sub.packages.some((p) => p.id === pkg.id)) sub.packages.push(pkg);
       }
-    } else if (packages.length > 0) {
+    } else {
       const existing = orphanPackagesByCategory.get(svc.category.id) || [];
       for (const pkg of packages) {
         if (!existing.some((p) => p.id === pkg.id)) existing.push(pkg);
@@ -282,9 +284,9 @@ export async function listHubCatalogTree(vendorId: string) {
   }
 
   return [...categories.values()]
-    .sort((a, b) => a._order - b._order || a.name.localeCompare(b.name))
     .map(({ _order, ...rest }) => {
       const subCategories = rest.subCategories
+        .filter((s) => s.packages.length > 0)
         .map((s) => {
           const price = minPriceLabel(s.packages.map((p) => p.price));
           return {
@@ -297,11 +299,16 @@ export async function listHubCatalogTree(vendorId: string) {
         })
         .sort((a, b) => a.name.localeCompare(b.name));
       return {
+        _order,
         ...rest,
         price: minPriceLabel(subCategories.flatMap((s) => s.packages.map((p) => p.price))),
         subCategories,
       };
-    });
+    })
+    // Drop categories that have no enabled packages left.
+    .filter((c) => c.subCategories.some((s) => s.packages.length > 0))
+    .sort((a, b) => a._order - b._order || a.name.localeCompare(b.name))
+    .map(({ _order, ...rest }) => rest);
 }
 
 export const vendorListHubCategories = async (req: Request, res: Response): Promise<void> => {
