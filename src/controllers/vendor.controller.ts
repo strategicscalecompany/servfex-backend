@@ -1166,67 +1166,18 @@ export const deleteVendor = async (req: Request, res: Response, next: NextFuncti
   }
 };
 
+/**
+ * Super Admin must NOT assign catalog to hubs.
+ * Only the hub's assigned Business Operation Manager assigns packages via the vendor-app Assign tab.
+ */
 export const assignVendorService = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
-    const vendorId = req.params.id as string;
-    const { serviceId, customPrice, availability, isActive } = req.body;
-
-    if (!serviceId) {
-      sendError(res, 'BAD_REQUEST', 'Service ID is required', 400);
-      return;
-    }
-
-    const vendor = await prisma.vendorProfile.findUnique({
-      where: { id: vendorId },
-    });
-    if (!vendor) {
-      sendError(res, 'VENDOR_NOT_FOUND', 'Vendor not found', 404);
-      return;
-    }
-
-    const service = await prisma.service.findUnique({
-      where: { id: serviceId },
-    });
-    if (!service) {
-      sendError(res, 'SERVICE_NOT_FOUND', 'Service not found', 404);
-      return;
-    }
-
-    const vendorService = await prisma.vendorService.upsert({
-      where: {
-        vendorId_serviceId: { vendorId, serviceId },
-      },
-      create: {
-        vendorId,
-        serviceId,
-        customPrice: customPrice !== undefined && customPrice !== '' && customPrice !== null ? toMoney(customPrice) : null,
-        availability: availability || 'Mon-Sat: 09:00 - 18:00',
-        isActive: isActive !== undefined ? isActive : true,
-      },
-      update: {
-        ...(customPrice !== undefined ? { customPrice: customPrice !== '' && customPrice !== null ? toMoney(customPrice) : null } : {}),
-        ...(availability ? { availability } : {}),
-        ...(isActive !== undefined ? { isActive } : {}),
-      },
-      include: {
-        service: {
-          select: { id: true, name: true, startingPrice: true },
-        },
-      },
-    });
-
-    await logAuditEvent({
-      superAdminId: req.user!.userId,
-      action: 'VENDOR_SERVICE_ASSIGNED',
-      entityType: 'VendorService',
-      entityId: vendorService.id,
-      after: { vendorId, serviceId, customPrice },
-      ipAddress: req.ip,
-      userAgent: req.headers['user-agent'],
-    });
-
-    invalidateCatalogCache();
-    sendSuccess(res, vendorService, 201);
+    sendError(
+      res,
+      'FORBIDDEN',
+      'Hub catalog is assigned only by the Business Operation Manager for that hub. Super Admin cannot assign services to hubs.',
+      403
+    );
   } catch (error) {
     next(error);
   }
@@ -1234,27 +1185,12 @@ export const assignVendorService = async (req: Request, res: Response, next: Nex
 
 export const removeVendorService = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
-    const { id: vendorId, serviceId } = req.params as { id: string; serviceId: string };
-
-    await prisma.vendorService.deleteMany({
-      where: {
-        vendorId,
-        serviceId,
-      },
-    });
-
-    await logAuditEvent({
-      superAdminId: req.user!.userId,
-      action: 'VENDOR_SERVICE_REMOVED',
-      entityType: 'VendorService',
-      entityId: `${vendorId}_${serviceId}`,
-      before: { vendorId, serviceId },
-      ipAddress: req.ip,
-      userAgent: req.headers['user-agent'],
-    });
-
-    invalidateCatalogCache();
-    sendSuccess(res, { message: 'Service removed from vendor successfully' });
+    sendError(
+      res,
+      'FORBIDDEN',
+      'Hub catalog is managed only by the Business Operation Manager for that hub. Super Admin cannot unassign services from hubs.',
+      403
+    );
   } catch (error) {
     next(error);
   }

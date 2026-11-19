@@ -397,20 +397,25 @@ export const setVendorPricing = async (req: Request, res: Response, next: NextFu
     const serviceId = req.params.id as string;
     const { vendorId, customPrice, isActive, availability, reason } = req.body;
 
+    // Super Admin may adjust price on an existing BOM-assigned hub link only — never create assignments.
+    const existing = await prisma.vendorService.findUnique({
+      where: { vendorId_serviceId: { vendorId, serviceId } },
+    });
+    if (!existing) {
+      sendError(
+        res,
+        'FORBIDDEN',
+        'This hub has no BOM-assigned link for that service. Only the Business Operation Manager can assign catalog to a hub.',
+        403
+      );
+      return;
+    }
+
     const result = await prisma.$transaction(async (tx) => {
-      const vendorService = await tx.vendorService.upsert({
-        where: {
-          vendorId_serviceId: { vendorId, serviceId },
-        },
-        create: {
-          vendorId,
-          serviceId,
-          customPrice: customPrice !== undefined ? toMoneyOrNull(customPrice) : null,
-          isActive: isActive !== undefined ? isActive : true,
-          availability: availability || 'Mon-Sat: 09:00 - 18:00',
-        },
-        update: {
-          ...(customPrice !== undefined ? { customPrice: toMoney(customPrice) } : {}),
+      const vendorService = await tx.vendorService.update({
+        where: { id: existing.id },
+        data: {
+          ...(customPrice !== undefined ? { customPrice: toMoneyOrNull(customPrice) } : {}),
           ...(isActive !== undefined ? { isActive } : {}),
           ...(availability ? { availability } : {}),
         },

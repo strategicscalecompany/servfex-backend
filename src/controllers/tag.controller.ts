@@ -827,13 +827,21 @@ export const vendorSetCatalogAssignments = async (req: Request, res: Response): 
 export const vendorListHubPackages = async (req: Request, res: Response): Promise<void> => {
   try {
     const vendorId = (req as any).hubVendorId as string;
-    const [vendorServices, configs, employees] = await Promise.all([
-      prisma.vendorService.findMany({
+    // Full Super Admin catalog — BOM alone decides which packages this hub offers.
+    const [catalogPackages, vendorServices, configs, employees] = await Promise.all([
+      prisma.servicePackage.findMany({
         where: {
-          vendorId,
+          isActive: true,
           service: { isActive: true, deletedAt: null },
         },
-        include: {
+        select: {
+          id: true,
+          name: true,
+          title: true,
+          durationMinutes: true,
+          duration: true,
+          discountedPrice: true,
+          originalPrice: true,
           service: {
             select: {
               id: true,
@@ -842,22 +850,14 @@ export const vendorListHubPackages = async (req: Request, res: Response): Promis
               subCategoryId: true,
               category: { select: { id: true, name: true } },
               subCategory: { select: { id: true, name: true } },
-              packages: {
-                where: { isActive: true },
-                select: {
-                  id: true,
-                  name: true,
-                  title: true,
-                  durationMinutes: true,
-                  duration: true,
-                  discountedPrice: true,
-                  originalPrice: true,
-                },
-                orderBy: { displayOrder: 'asc' },
-              },
             },
           },
         },
+        orderBy: [{ displayOrder: 'asc' }, { name: 'asc' }],
+      }),
+      prisma.vendorService.findMany({
+        where: { vendorId },
+        select: { id: true, serviceId: true },
       }),
       prisma.hubPackageConfig.findMany({ where: { vendorId } }),
       prisma.employeeProfile.findMany({
@@ -876,6 +876,7 @@ export const vendorListHubPackages = async (req: Request, res: Response): Promis
     ]);
 
     const cfgMap = new Map(configs.map((c) => [c.packageId, c]));
+    const vsByServiceId = new Map(vendorServices.map((vs) => [vs.serviceId, vs]));
 
     const countEmployeesForPackage = (pkg: {
       id: string;
@@ -894,38 +895,34 @@ export const vendorListHubPackages = async (req: Request, res: Response): Promis
       return n;
     };
 
-    const packages = vendorServices.flatMap((vs) =>
-      vs.service.packages.map((pkg) => {
-        const employeeCount = countEmployeesForPackage({
-          id: pkg.id,
-          categoryId: vs.service.categoryId,
-          subCategoryId: vs.service.subCategoryId || null,
-        });
-        return {
-          packageId: pkg.id,
-          packageName: pkg.name || pkg.title || 'Package',
-          serviceId: vs.service.id,
-          serviceName: vs.service.name,
-          vendorServiceId: vs.id,
-          categoryId: vs.service.categoryId,
-          categoryName: vs.service.category?.name || null,
-          subCategoryId: vs.service.subCategoryId || null,
-          subCategoryName: vs.service.subCategory?.name || null,
-          durationMinutes: pkg.durationMinutes,
-          duration: pkg.duration,
-          requiredProfessionals: cfgMap.get(pkg.id)?.requiredProfessionals ?? 1,
-          employeeCount,
-          /**
-           * Package hub-radius availability. Off by default until BOM enables it
-           * (missing HubPackageConfig or isActive=false → unavailable).
-           */
-          isActive: cfgMap.get(pkg.id)?.isActive === true,
-          availabilityMessage:
-            cfgMap.get(pkg.id)?.isActive === true ? null : 'Currently not available',
-        };
-      })
-    );
-    // Enabled packages first so the Assign tab can pin them to the top.
+    const packages = catalogPackages.map((pkg) => {
+      const service = pkg.service;
+      const vs = vsByServiceId.get(service.id);
+      const employeeCount = countEmployeesForPackage({
+        id: pkg.id,
+        categoryId: service.categoryId,
+        subCategoryId: service.subCategoryId || null,
+      });
+      const enabled = cfgMap.get(pkg.id)?.isActive === true;
+      return {
+        packageId: pkg.id,
+        packageName: pkg.name || pkg.title || 'Package',
+        serviceId: service.id,
+        serviceName: service.name,
+        vendorServiceId: vs?.id || '',
+        categoryId: service.categoryId,
+        categoryName: service.category?.name || null,
+        subCategoryId: service.subCategoryId || null,
+        subCategoryName: service.subCategory?.name || null,
+        durationMinutes: pkg.durationMinutes,
+        duration: pkg.duration,
+        requiredProfessionals: cfgMap.get(pkg.id)?.requiredProfessionals ?? 1,
+        employeeCount,
+        /** Off until BOM enables this package for the hub. */
+        isActive: enabled,
+        availabilityMessage: enabled ? null : 'Currently not available',
+      };
+    });
     packages.sort((a, b) => {
       if (a.isActive !== b.isActive) return a.isActive ? -1 : 1;
       return String(a.packageName).localeCompare(String(b.packageName));
@@ -943,15 +940,12 @@ export const vendorSetHubPackageCrew = async (req: Request, res: Response): Prom
     const vendorId = (req as any).hubVendorId as string;
     const { packageId, requiredProfessionals } = req.body as z.infer<typeof setHubPackageCrewSchema>;
 
-    const assigned = await prisma.vendorService.findFirst({
-      where: {
-        vendorId,
-        service: { packages: { some: { id: packageId } } },
-      },
+    const pkg = await prisma.servicePackage.findFirst({
+      where: { id: packageId, isActive: true, service: { isActive: true, deletedAt: null } },
       select: { id: true, serviceId: true },
     });
-    if (!assigned) {
-      sendError(res, 'BAD_REQUEST', 'Package is not assigned to this hub', 400);
+    if (!pkg) {
+      sendError(res, 'BAD_REQUEST', 'Package not found in catalog', 400);
       return;
     }
 
@@ -973,7 +967,7 @@ export const vendorSetHubPackageCrew = async (req: Request, res: Response): Prom
 
     emitHubCatalogUpdated(vendorId, {
       hubId: vendorId,
-      serviceId: assigned.serviceId,
+      serviceId: pkg.serviceId,
       packageId,
       requiredProfessionals: cfg.requiredProfessionals,
       reason: 'crew_size',
@@ -990,28 +984,44 @@ export const vendorSetHubPackageCrew = async (req: Request, res: Response): Prom
   }
 };
 
-/** Enable / pause a package for this hub's service radius (HubPackageConfig.isActive). */
+/**
+ * BOM assigns a catalog package to this hub (creates VendorService link) or pauses it.
+ * Super Admin cannot assign hub catalog — only the hub's BOM.
+ */
 export const vendorSetHubPackageAvailability = async (req: Request, res: Response): Promise<void> => {
   try {
     assertBomWriter(req);
     const vendorId = (req as any).hubVendorId as string;
     const { packageId, isActive } = req.body as z.infer<typeof setHubPackageAvailabilitySchema>;
 
-    const assigned = await prisma.vendorService.findFirst({
-      where: {
-        vendorId,
-        service: { packages: { some: { id: packageId } } },
-      },
+    const pkg = await prisma.servicePackage.findFirst({
+      where: { id: packageId, isActive: true, service: { isActive: true, deletedAt: null } },
       select: { id: true, serviceId: true },
     });
-    if (!assigned) {
-      sendError(res, 'BAD_REQUEST', 'Package is not assigned to this hub', 400);
+    if (!pkg) {
+      sendError(res, 'BAD_REQUEST', 'Package not found in catalog', 400);
       return;
     }
 
     const existing = await prisma.hubPackageConfig.findUnique({
       where: { vendorId_packageId: { vendorId, packageId } },
       select: { requiredProfessionals: true },
+    });
+
+    // Enabling a package is how BOM assigns the parent service to the hub.
+    const vendorService = await prisma.vendorService.upsert({
+      where: { vendorId_serviceId: { vendorId, serviceId: pkg.serviceId } },
+      create: {
+        vendorId,
+        serviceId: pkg.serviceId,
+        isActive: isActive,
+        availability: 'Mon-Sat: 09:00 - 18:00',
+      },
+      update: {
+        // Keep service link active while any package may still be on; force on when enabling.
+        ...(isActive ? { isActive: true } : {}),
+      },
+      select: { id: true, serviceId: true },
     });
 
     const updated = await prisma.hubPackageConfig.upsert({
@@ -1034,19 +1044,27 @@ export const vendorSetHubPackageAvailability = async (req: Request, res: Respons
       },
     });
 
-    // Keep parent VendorService active so hub still owns the catalog link;
-    // customer visibility is gated by HubPackageConfig.isActive per package.
-    if (isActive) {
-      await prisma.vendorService.update({
-        where: { id: assigned.id },
-        data: { isActive: true },
+    if (!isActive) {
+      // If no packages remain enabled for this service on the hub, mark VendorService inactive.
+      const stillOn = await prisma.hubPackageConfig.count({
+        where: {
+          vendorId,
+          isActive: true,
+          package: { serviceId: pkg.serviceId },
+        },
       });
+      if (stillOn === 0) {
+        await prisma.vendorService.update({
+          where: { id: vendorService.id },
+          data: { isActive: false },
+        });
+      }
     }
 
     invalidateCatalogCache();
     emitHubCatalogUpdated(vendorId, {
       hubId: vendorId,
-      serviceId: assigned.serviceId,
+      serviceId: pkg.serviceId,
       packageId: updated.packageId,
       isActive: updated.isActive,
       reason: 'availability',
@@ -1054,7 +1072,7 @@ export const vendorSetHubPackageAvailability = async (req: Request, res: Respons
 
     sendSuccess(res, {
       packageId: updated.packageId,
-      serviceId: assigned.serviceId,
+      serviceId: pkg.serviceId,
       isActive: updated.isActive,
       availabilityMessage: updated.isActive ? null : 'Currently not available',
     });
