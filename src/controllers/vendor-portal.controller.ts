@@ -12,9 +12,15 @@ import {
   acceptAssignment,
   advanceTravelStatus,
   assignExpertManually,
+  autoReassignAfterStaleHubReschedule,
   DispatchError,
   rejectAssignment,
 } from '../services/dispatch.service';
+import {
+  isBookingScheduleDayExpired,
+  isJobPastGrace,
+  JOB_OVERRUN_GRACE_MINUTES,
+} from '../services/booking-sla.service';
 import {
   canSeeExactLocation,
   approximateCoordinate,
@@ -50,7 +56,7 @@ import {
   uniqueHostedImageUrls,
 } from '../config/testing-workflow';
 import { generateAvailableSlots } from '../services/slot.engine';
-import { resolveBookingDurationMinutes } from '../config/scheduling';
+import { resolveBookingDurationMinutes, ymdInBookingTz } from '../config/scheduling';
 
 const HUB_RESCHEDULE_STATUSES: BookingStatus[] = [
   'PENDING',
@@ -1546,8 +1552,35 @@ function sanitizeOrderForViewer(order: any, viewer: { isVendor: boolean; employe
       }
     : order.customer;
 
+  const openFieldStatuses = [
+    'ON_THE_WAY',
+    'ARRIVED',
+    'IN_PROGRESS',
+    'AWAITING_CUSTOMER_CONFIRMATION',
+    'AWAITING_PAYMENT',
+  ];
+  const pastJobGrace =
+    openFieldStatuses.includes(String(order.status || '')) &&
+    order.scheduledDate &&
+    isJobPastGrace({
+      scheduledDate: String(order.scheduledDate),
+      scheduledTimeSlot: order.scheduledTimeSlot,
+      scheduledStartAt: order.scheduledStartAt ? new Date(order.scheduledStartAt) : null,
+      scheduledEndAt: order.scheduledEndAt ? new Date(order.scheduledEndAt) : null,
+    });
+  const scheduleFlags = {
+    missedStartNotifiedAt: order.missedStartNotifiedAt ?? null,
+    scheduleExpiredNotifiedAt: order.scheduleExpiredNotifiedAt ?? null,
+    jobOverrunNotifiedAt: order.jobOverrunNotifiedAt ?? null,
+    scheduleDayExpired: order.scheduledDate
+      ? isBookingScheduleDayExpired(String(order.scheduledDate))
+      : false,
+    pastJobGrace: Boolean(pastJobGrace),
+    graceMinutes: JOB_OVERRUN_GRACE_MINUTES,
+  };
+
   if (exactAllowed) {
-    return stripStartOtp({ ...withoutOtp, customer: sanitizedCustomer, hubManagerPhone });
+    return stripStartOtp({ ...withoutOtp, customer: sanitizedCustomer, hubManagerPhone, ...scheduleFlags });
   }
 
   const sanitizedAddress = order.address
@@ -1568,6 +1601,7 @@ function sanitizeOrderForViewer(order: any, viewer: { isVendor: boolean; employe
     serviceLatitude: approximateCoordinate(order.serviceLatitude),
     serviceLongitude: approximateCoordinate(order.serviceLongitude),
     hubManagerPhone,
+    ...scheduleFlags,
   });
 }
 
@@ -2866,12 +2900,15 @@ export const getEmployeeDayBoard = async (req: Request, res: Response): Promise<
       return;
     }
 
-    const startOfToday = new Date();
-    startOfToday.setHours(0, 0, 0, 0);
-    const todayKey = startOfToday.toISOString().slice(0, 10);
-    const tomorrowDate = new Date(startOfToday);
-    tomorrowDate.setDate(tomorrowDate.getDate() + 1);
-    const tomorrowKey = tomorrowDate.toISOString().slice(0, 10);
+    const now = new Date();
+    const todayKey = ymdInBookingTz(now);
+    // Tomorrow in IST: add 1 calendar day to today's YMD.
+    const [ty, tm, td] = todayKey.split('-').map(Number);
+    const tomorrowUtc = new Date(Date.UTC(ty, tm - 1, td + 1));
+    const tomorrowKey = tomorrowUtc.toISOString().slice(0, 10);
+    const startOfToday = new Date(
+      Date.UTC(ty, tm - 1, td, 0, 0, 0, 0) - (5 * 60 + 30) * 60 * 1000
+    );
 
     const dayStatuses = [
       'PENDING',
@@ -2931,7 +2968,7 @@ export const getEmployeeDayBoard = async (req: Request, res: Response): Promise<
       }),
     ]);
 
-    const mapOrder = (b: (typeof bookings)[number]) => {
+    const mapOrder = (b: (typeof bookings)[number] | NonNullable<typeof activeLive>) => {
       const destLat =
         (typeof b.serviceLatitude === 'number' && b.serviceLatitude !== 0
           ? b.serviceLatitude
@@ -2946,12 +2983,29 @@ export const getEmployeeDayBoard = async (req: Request, res: Response): Promise<
         (typeof b.address?.longitude === 'number' && b.address.longitude !== 0
           ? b.address.longitude
           : null);
+      const pastJobGrace = isJobPastGrace(
+        {
+          scheduledDate: b.scheduledDate,
+          scheduledTimeSlot: b.scheduledTimeSlot,
+          scheduledStartAt: b.scheduledStartAt,
+          scheduledEndAt: b.scheduledEndAt,
+        },
+        now
+      );
+      const openField = [
+        'ON_THE_WAY',
+        'ARRIVED',
+        'IN_PROGRESS',
+        'AWAITING_CUSTOMER_CONFIRMATION',
+        'AWAITING_PAYMENT',
+      ].includes(b.status);
       return {
         id: b.id,
         bookingNumber: b.bookingNumber,
         status: b.status,
         scheduledDate: b.scheduledDate,
         scheduledTimeSlot: b.scheduledTimeSlot,
+        scheduledEndAt: b.scheduledEndAt?.toISOString() ?? null,
         serviceName: b.package?.name || b.service?.name || 'Service',
         addressLine1: b.address?.addressLine1 || '',
         city: b.address?.city || '',
@@ -2960,19 +3014,27 @@ export const getEmployeeDayBoard = async (req: Request, res: Response): Promise<
         totalAmount: b.totalAmount,
         customerLatitude: destLat,
         customerLongitude: destLng,
+        pastJobGrace: openField && pastJobGrace,
+        jobOverrunNotifiedAt: b.jobOverrunNotifiedAt?.toISOString() ?? null,
+        graceMinutes: JOB_OVERRUN_GRACE_MINUTES,
       };
     };
 
     const today = bookings.filter((b) => b.scheduledDate === todayKey).map(mapOrder);
     const tomorrow = bookings.filter((b) => b.scheduledDate === tomorrowKey).map(mapOrder);
     const recentOrders = recentBookings.map(mapOrder);
-    const activeRaw =
-      activeLive ||
-      bookings.find((b) =>
-        ['ON_THE_WAY', 'ARRIVED', 'IN_PROGRESS', 'AWAITING_CUSTOMER_CONFIRMATION'].includes(b.status)
-      );
+    // Never treat a past-grace job as the live "active" Ongoing job (map/route + label).
+    const isLiveActive = (b: { status: string; scheduledDate: string; scheduledTimeSlot: string; scheduledStartAt: Date | null; scheduledEndAt: Date | null }) =>
+      ['ON_THE_WAY', 'ARRIVED', 'IN_PROGRESS', 'AWAITING_CUSTOMER_CONFIRMATION'].includes(b.status) &&
+      !isJobPastGrace(b, now);
 
-    const timing = computeShiftTiming(emp.hubCheckedInAt, new Date(), emp.postShiftReturnDeadlineAt);
+    const activeRaw =
+      (activeLive && isLiveActive(activeLive) ? activeLive : null) ||
+      bookings.find((b) => isLiveActive(b)) ||
+      recentBookings.find((b) => isLiveActive(b)) ||
+      null;
+
+    const timing = computeShiftTiming(emp.hubCheckedInAt, now, emp.postShiftReturnDeadlineAt);
     const checkedIn = Boolean(emp.hubCheckedInAt);
     const checkedOutToday =
       !checkedIn && Boolean(emp.lastHubCheckOutAt && new Date(emp.lastHubCheckOutAt) >= startOfToday);
@@ -4151,7 +4213,15 @@ export const rescheduleHubOrder = async (req: Request, res: Response): Promise<v
       }
     }
 
-    if (booking.employeeId || booking.helperEmployeeId) {
+    const todayYmd = ymdInBookingTz();
+    const wasStale =
+      isBookingScheduleDayExpired(booking.scheduledDate) ||
+      Boolean((booking as { missedStartNotifiedAt?: Date | null }).missedStartNotifiedAt) ||
+      Boolean((booking as { scheduleExpiredNotifiedAt?: Date | null }).scheduleExpiredNotifiedAt) ||
+      booking.scheduledDate < todayYmd;
+
+    // Keep-assignment path only: when we will auto-reassign (stale/missed), skip this check.
+    if (!wasStale && (booking.employeeId || booking.helperEmployeeId)) {
       const conflict = await prisma.booking.findFirst({
         where: {
           id: { not: id },
@@ -4192,6 +4262,7 @@ export const rescheduleHubOrder = async (req: Request, res: Response): Promise<v
     }
 
     const previousSlot = `${booking.scheduledDate} (${booking.scheduledTimeSlot})`;
+
     const updated = await prisma.$transaction(async (tx) => {
       // Drop any leftover ACTIVE hold — capacity now comes from the booking row itself.
       if (booking.slotHoldId) {
@@ -4212,13 +4283,19 @@ export const rescheduleHubOrder = async (req: Request, res: Response): Promise<v
           scheduledStartAt: startAt,
           scheduledEndAt: endAt,
           slotHoldId: null,
+          // Fresh window — clear SLA flags so the sweeper can fire again if needed.
+          missedStartNotifiedAt: null,
+          scheduleExpiredNotifiedAt: null,
+          jobOverrunNotifiedAt: null,
           statusHistory: {
             create: {
               oldStatus: booking.status,
               newStatus: booking.status,
               changedBy: userId,
               changedByRole: (scoped.actor?.user?.role as any) || 'OPERATIONS_MANAGER',
-              reason: `Rescheduled from ${previousSlot} to ${scheduledDate} (${scheduledTimeSlot})`,
+              reason: wasStale
+                ? `Rescheduled missed/expired job from ${previousSlot} to ${scheduledDate} (${scheduledTimeSlot})`
+                : `Rescheduled from ${previousSlot} to ${scheduledDate} (${scheduledTimeSlot})`,
             },
           },
         },
@@ -4227,29 +4304,61 @@ export const rescheduleHubOrder = async (req: Request, res: Response): Promise<v
       return b;
     });
 
+    let autoAssignNote: string | null = null;
+    if (wasStale && ['PENDING', 'ACCEPTED', 'ASSIGNED'].includes(booking.status)) {
+      const result = await autoReassignAfterStaleHubReschedule(id, userId);
+      autoAssignNote = result.assigned
+        ? 'Previous assignment cleared; a free professional was auto-assigned to the new slot.'
+        : 'Previous assignment cleared; no free professional — assign manually.';
+      if (result.employeeUserId) {
+        void sendPushToUserIds([result.employeeUserId], {
+          title: 'New job assigned',
+          body: `${updated.bookingNumber || 'Job'} rescheduled to ${scheduledDate} · ${scheduledTimeSlot} and assigned to you`,
+          data: {
+            type: 'BOOKING_ASSIGNED',
+            bookingId: id,
+            bookingNumber: updated.bookingNumber || '',
+            scheduledDate,
+            scheduledTimeSlot,
+            reason: 'RESCHEDULED_AUTO_ASSIGN',
+          },
+        });
+      }
+    }
+
     // Fan-out so BOM desks, assigned pro/helper/crew, partner, and customer all refresh.
-    void emitBookingRefresh(id, { reason: 'RESCHEDULED' });
+    void emitBookingRefresh(id, { reason: wasStale ? 'RESCHEDULED_AUTO_ASSIGN' : 'RESCHEDULED' });
+
+    const fresh = await prisma.booking.findUnique({
+      where: { id },
+      include: ORDER_LIST_INCLUDE,
+    });
+    const orderOut = fresh || updated;
 
     const pushTargets = Array.from(
       new Set(
         [
-          booking.employee?.userId,
-          booking.helperEmployee?.userId,
+          orderOut.employee?.userId,
+          orderOut.helperEmployee?.userId,
           ...(booking.crewMembers?.map((c) => c.employee?.userId) ?? []),
+          // Also nudge the previous pro when they were unassigned after a stale reschedule.
+          ...(wasStale ? [booking.employee?.userId, booking.helperEmployee?.userId] : []),
         ].filter(Boolean) as string[]
       )
     );
     if (pushTargets.length > 0) {
       void sendPushToUserIds(pushTargets, {
         title: 'Booking rescheduled',
-        body: `${updated.bookingNumber || 'Job'} moved to ${scheduledDate} · ${scheduledTimeSlot}`,
+        body: `${orderOut.bookingNumber || 'Job'} moved to ${scheduledDate} · ${scheduledTimeSlot}${
+          autoAssignNote ? ` — ${autoAssignNote}` : ''
+        }`,
         data: {
           type: 'BOOKING_RESCHEDULED',
           bookingId: id,
-          bookingNumber: updated.bookingNumber || '',
+          bookingNumber: orderOut.bookingNumber || '',
           scheduledDate,
           scheduledTimeSlot,
-          reason: 'RESCHEDULED',
+          reason: wasStale ? 'RESCHEDULED_AUTO_ASSIGN' : 'RESCHEDULED',
         },
       });
     }
@@ -4257,10 +4366,11 @@ export const rescheduleHubOrder = async (req: Request, res: Response): Promise<v
     sendSuccess(
       res,
       {
-        order: sanitizeOrderForViewer(updated, {
+        order: sanitizeOrderForViewer(orderOut, {
           isVendor: !!scoped.actor?.isVendor,
           isManager: !!scoped.actor?.isManager,
         }),
+        autoAssignNote,
       },
       200
     );

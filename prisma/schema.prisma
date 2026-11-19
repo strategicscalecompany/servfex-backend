@@ -649,6 +649,12 @@ model Booking {
   acceptedAt             DateTime?
   onTheWayAt             DateTime?
   arrivedAt              DateTime?
+  /** Set when scheduled start passed without ON_THE_WAY — pro + BOM were notified once. */
+  missedStartNotifiedAt  DateTime?
+  /** Set when scheduledDate is before today IST and job still not started — BOM must reschedule. */
+  scheduleExpiredNotifiedAt DateTime?
+  /** Set when job is still open after scheduledEnd + 30m grace — pro nudged to complete, BOM warned. */
+  jobOverrunNotifiedAt   DateTime?
 
   assignmentStrategy     AssignmentStrategy?
   etaMinutes             Int?

@@ -26,6 +26,7 @@ import { asDecimal, toMoney } from '../utils/money';
 import { notifyUsers } from './notify.service';
 import { DispatchError } from './dispatch.errors';
 import { isValidUpiId, normalizeUpiId } from '../utils/upi';
+import { isBookingScheduleDayExpired } from './booking-sla.service';
 
 export { DispatchError };
 
@@ -1336,6 +1337,15 @@ export async function advanceTravelStatus(
       );
     }
 
+    // Past the scheduled IST calendar day: pro cannot start — BOM must reschedule first.
+    if (target === 'ON_THE_WAY' && isBookingScheduleDayExpired(booking.scheduledDate, now)) {
+      throw new DispatchError(
+        'SCHEDULE_EXPIRED',
+        `This job was scheduled for ${booking.scheduledDate} and can no longer be started. Ask Operations to reschedule it to a new slot.`,
+        409
+      );
+    }
+
     // Hub / partner UPI is required before starting the journey (professionals do not own settlement UPI).
     if (target === 'ON_THE_WAY' && !isValidUpiId(normalizeUpiId(expert.vendor?.upiId))) {
       throw new DispatchError(
@@ -1485,5 +1495,96 @@ export async function releaseDispatchOnCancel(bookingId: string): Promise<void> 
       },
     });
   }, TX_OPTIONS);
+}
+
+/**
+ * After BOM reschedules a missed/expired job: clear the previous assignment and auto-pick
+ * an eligible checked-in professional for the new slot (hub pool first).
+ */
+export async function autoReassignAfterStaleHubReschedule(
+  bookingId: string,
+  actorUserId: string
+): Promise<{ assigned: boolean; employeeUserId: string | null }> {
+  const effects: Effects = { refreshBookingId: bookingId, reason: 'EXPERT_AUTO_ASSIGNED' };
+  let assigned = false;
+  let employeeUserId: string | null = null;
+
+  await prisma.$transaction(async (tx) => {
+    await lockBooking(tx, bookingId);
+    const booking = await readBookingForDispatch(tx, bookingId);
+    if (!booking) return;
+    if (!['PENDING', 'ACCEPTED', 'ASSIGNED'].includes(booking.status)) return;
+
+    const now = new Date();
+    const previousEmployeeId = booking.employeeId;
+
+    await tx.bookingAssignment.updateMany({
+      where: { bookingId, status: { in: ['OFFERED', 'ACCEPTED'] } },
+      data: { status: 'CANCELLED', respondedAt: now },
+    });
+
+    await tx.booking.update({
+      where: { id: bookingId },
+      data: {
+        status: 'PENDING',
+        employeeId: null,
+        helperEmployeeId: null,
+        assignmentMethod: null,
+        assignedAt: null,
+        acceptedAt: null,
+        onTheWayAt: null,
+        arrivedAt: null,
+        etaMinutes: null,
+        etaConfirmedAt: null,
+        dispatchAttempts: 0,
+        dispatchDueAt: null,
+        locationSharingEnabled: false,
+        professionalLastLatitude: null,
+        professionalLastLongitude: null,
+        professionalLastLocationAt: null,
+      },
+    });
+
+    if (booking.status !== 'PENDING' || previousEmployeeId) {
+      await recordHistory(
+        tx,
+        bookingId,
+        booking.status,
+        'PENDING',
+        actorUserId,
+        'VENDOR',
+        'Cleared assignment after BOM reschedule of missed/expired job; auto-assigning'
+      );
+    }
+
+    const working = await readBookingForDispatch(tx, bookingId);
+    if (!working) return;
+
+    const outcome = await autoAssignInTx(tx, working, now);
+    if (outcome === 'ASSIGNED') {
+      assigned = true;
+      const row = await tx.booking.findUnique({
+        where: { id: bookingId },
+        select: { employee: { select: { userId: true } } },
+      });
+      employeeUserId = row?.employee?.userId ?? null;
+      effects.offerToUserId = employeeUserId;
+      effects.reason = 'EXPERT_AUTO_ASSIGNED';
+    } else {
+      effects.reason = 'NO_EXPERT_AVAILABLE';
+      await recordHistory(
+        tx,
+        bookingId,
+        'PENDING',
+        'PENDING',
+        'SYSTEM',
+        'SUPER_ADMIN',
+        'No eligible professional after BOM reschedule — BOM must assign manually'
+      );
+    }
+  }, TX_OPTIONS);
+
+  await runEffects(effects);
+  return { assigned, employeeUserId };
 }
 

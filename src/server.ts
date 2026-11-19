@@ -31,6 +31,7 @@ import geoRoutes from './routes/geo.routes';
 import callRoutes from './routes/call.routes';
 import { startDispatchWorker, stopDispatchWorker } from './services/dispatch.worker';
 import { startAttendanceWorker, stopAttendanceWorker } from './services/attendance.worker';
+import { startBookingSlaWorker, stopBookingSlaWorker } from './services/booking-sla.worker';
 
 const app = express();
 const server = http.createServer(app);
@@ -403,12 +404,19 @@ server.listen(env.PORT, env.HOST, async () => {
   } catch (err: any) {
     logger.error({ err }, 'Failed to initialize attendance worker on startup');
   }
+
+  try {
+    startBookingSlaWorker();
+  } catch (err: any) {
+    logger.error({ err }, 'Failed to initialize booking SLA worker on startup');
+  }
 });
 
 const handleShutdown = async (signal: string) => {
   logger.info({ signal }, 'Received shutdown signal, shutting down gracefully...');
   stopDispatchWorker();
   stopAttendanceWorker();
+  stopBookingSlaWorker();
   server.close(async () => {
     try {
       await prisma.$disconnect();
