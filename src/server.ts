@@ -18,7 +18,7 @@ import { corsMiddleware } from './middleware/cors';
 import { timingMiddleware } from './middleware/timing.middleware';
 import { verifyAccessToken } from './utils/token';
 import { getFirebaseAuth, isFirebaseConfigured } from './config/firebase';
-import { bookingRoom, setRealtimeServer } from './utils/realtime';
+import { bookingRoom, hubRoom, setRealtimeServer } from './utils/realtime';
 
 // Route Handlers
 import authRoutes from './routes/auth.routes';
@@ -165,6 +165,57 @@ io.on('connection', (socket) => {
 
   socket.on('booking:leave', (payload: { bookingId?: string }) => {
     if (payload?.bookingId) socket.leave(bookingRoom(payload.bookingId));
+  });
+
+  /** Join hub catalog room for low-latency availability / crew updates (payload is non-PII). */
+  socket.on('hub:join', async (payload: { hubId?: string }, ack?: (result: { ok: boolean }) => void) => {
+    try {
+      const hubId = typeof payload?.hubId === 'string' ? payload.hubId.trim() : '';
+      if (!hubId) {
+        ack?.({ ok: false });
+        return;
+      }
+      const role = socket.data.role as string;
+      const userId = socket.data.userId as string;
+      if (role === 'SUPER_ADMIN' || role === 'CUSTOMER') {
+        socket.join(hubRoom(hubId));
+        ack?.({ ok: true });
+        return;
+      }
+      const hub = await prisma.vendorProfile.findFirst({
+        where: { id: hubId, isActive: true },
+        select: {
+          id: true,
+          userId: true,
+          employees: { where: { userId }, select: { id: true }, take: 1 },
+          managers: { where: { userId }, select: { id: true }, take: 1 },
+        },
+      });
+      if (!hub) {
+        ack?.({ ok: false });
+        return;
+      }
+      const allowed =
+        hub.userId === userId || hub.employees.length > 0 || hub.managers.length > 0;
+      if (!allowed && role === 'OPERATIONS_MANAGER') {
+        // Multi-hub BOMs may be linked via zone CSV — still allow join (events are non-PII).
+        socket.join(hubRoom(hubId));
+        ack?.({ ok: true });
+        return;
+      }
+      if (!allowed) {
+        ack?.({ ok: false });
+        return;
+      }
+      socket.join(hubRoom(hubId));
+      ack?.({ ok: true });
+    } catch {
+      ack?.({ ok: false });
+    }
+  });
+
+  socket.on('hub:leave', (payload: { hubId?: string }) => {
+    if (payload?.hubId) socket.leave(hubRoom(payload.hubId));
   });
 
   socket.on('disconnect', (reason) => {

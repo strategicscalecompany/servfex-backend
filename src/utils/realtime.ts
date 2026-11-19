@@ -26,6 +26,40 @@ export function bookingRoom(bookingId: string): string {
   return `booking:${bookingId}`;
 }
 
+export function hubRoom(hubId: string): string {
+  return `hub:${hubId}`;
+}
+
+/** Light-weight hub catalog / availability fan-out (no PII). */
+export const emitHubCatalogUpdated = (
+  hubId: string,
+  payload: {
+    hubId: string;
+    serviceId?: string | null;
+    packageId?: string | null;
+    isActive?: boolean;
+    requiredProfessionals?: number;
+    reason?: string;
+  }
+): void => {
+  if (!ioInstance || !hubId) return;
+  try {
+    const safe = {
+      hubId,
+      serviceId: payload.serviceId ?? null,
+      packageId: payload.packageId ?? null,
+      isActive: payload.isActive,
+      requiredProfessionals: payload.requiredProfessionals,
+      reason: payload.reason || 'catalog_updated',
+      at: Date.now(),
+    };
+    ioInstance.to(hubRoom(hubId)).emit('hub:catalog', safe);
+    ioInstance.to('admins').emit('hub:catalog', safe);
+  } catch (err) {
+    logger.warn({ err, hubId }, 'Failed to emit hub catalog event');
+  }
+};
+
 export const emitToBookingRoom = (
   bookingId: string,
   event: string,

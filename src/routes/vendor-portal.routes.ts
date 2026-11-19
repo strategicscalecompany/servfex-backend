@@ -99,9 +99,11 @@ import {
   vendorSetCatalogAssignments,
   vendorListHubPackages,
   vendorSetHubPackageCrew,
+  vendorSetHubServiceAvailability,
   setEmployeeCatalogSchema,
   setCatalogAssignmentsSchema,
   setHubPackageCrewSchema,
+  setHubServiceAvailabilitySchema,
 } from '../controllers/tag.controller';
 import {
   listBookingSubstituteOptions,
@@ -221,6 +223,13 @@ router.put(
   requireHubContext,
   validate(setHubPackageCrewSchema),
   vendorSetHubPackageCrew
+);
+router.put(
+  '/hub-services/availability',
+  requireRole('OPERATIONS_MANAGER'),
+  requireHubContext,
+  validate(setHubServiceAvailabilitySchema),
+  vendorSetHubServiceAvailability
 );
 router.get('/orders/:id/substitute-options', requireHubContext, listBookingSubstituteOptions);
 router.post('/orders/:id/crew-absent', requireHubContext, validate(crewAbsentSchema), markBookingCrewAbsent);

@@ -3,6 +3,8 @@ import { z } from 'zod';
 import { CatalogAssignmentPriority } from '@prisma/client';
 import { prisma } from '../config/prisma';
 import { sendError, sendSuccess } from '../utils/response';
+import { invalidateCatalogCache } from './catalog.controller';
+import { emitHubCatalogUpdated } from '../utils/realtime';
 
 export const setEmployeeCatalogSchema = z.object({
   categoryIds: z.array(z.string().uuid()).default([]),
@@ -30,6 +32,11 @@ export const setCatalogAssignmentsSchema = z.object({
 export const setHubPackageCrewSchema = z.object({
   packageId: z.string().uuid(),
   requiredProfessionals: z.number().int().min(1).max(4),
+});
+
+export const setHubServiceAvailabilitySchema = z.object({
+  serviceId: z.string().uuid(),
+  isActive: z.boolean(),
 });
 
 function assertBomWriter(req: Request): void {
@@ -813,52 +820,99 @@ export const vendorSetCatalogAssignments = async (req: Request, res: Response): 
 export const vendorListHubPackages = async (req: Request, res: Response): Promise<void> => {
   try {
     const vendorId = (req as any).hubVendorId as string;
-    const vendorServices = await prisma.vendorService.findMany({
-      where: { vendorId, isActive: true },
-      include: {
-        service: {
-          select: {
-            id: true,
-            name: true,
-            categoryId: true,
-            subCategoryId: true,
-            category: { select: { id: true, name: true } },
-            subCategory: { select: { id: true, name: true } },
-            packages: {
-              where: { isActive: true },
-              select: {
-                id: true,
-                name: true,
-                title: true,
-                durationMinutes: true,
-                duration: true,
-                discountedPrice: true,
-                originalPrice: true,
+    const [vendorServices, configs, employees] = await Promise.all([
+      prisma.vendorService.findMany({
+        where: {
+          vendorId,
+          service: { isActive: true, deletedAt: null },
+        },
+        include: {
+          service: {
+            select: {
+              id: true,
+              name: true,
+              categoryId: true,
+              subCategoryId: true,
+              category: { select: { id: true, name: true } },
+              subCategory: { select: { id: true, name: true } },
+              packages: {
+                where: { isActive: true },
+                select: {
+                  id: true,
+                  name: true,
+                  title: true,
+                  durationMinutes: true,
+                  duration: true,
+                  discountedPrice: true,
+                  originalPrice: true,
+                },
+                orderBy: { displayOrder: 'asc' },
               },
-              orderBy: { displayOrder: 'asc' },
             },
           },
         },
-      },
-    });
+      }),
+      prisma.hubPackageConfig.findMany({ where: { vendorId } }),
+      prisma.employeeProfile.findMany({
+        where: {
+          vendorId,
+          expertKind: 'SERVICE_PROFESSIONAL',
+          user: { deletedAt: null, status: 'ACTIVE' },
+        },
+        select: {
+          id: true,
+          employeeCategories: { select: { categoryId: true } },
+          employeeSubCategories: { select: { subCategoryId: true } },
+          employeePackages: { select: { packageId: true } },
+        },
+      }),
+    ]);
 
-    const configs = await prisma.hubPackageConfig.findMany({ where: { vendorId } });
     const cfgMap = new Map(configs.map((c) => [c.packageId, c]));
 
+    const countEmployeesForPackage = (pkg: {
+      id: string;
+      categoryId: string;
+      subCategoryId: string | null;
+    }): number => {
+      let n = 0;
+      for (const emp of employees) {
+        const byPkg = emp.employeePackages.some((p) => p.packageId === pkg.id);
+        const bySub =
+          !!pkg.subCategoryId &&
+          emp.employeeSubCategories.some((s) => s.subCategoryId === pkg.subCategoryId);
+        const byCat = emp.employeeCategories.some((c) => c.categoryId === pkg.categoryId);
+        if (byPkg || bySub || byCat) n += 1;
+      }
+      return n;
+    };
+
     const packages = vendorServices.flatMap((vs) =>
-      vs.service.packages.map((pkg) => ({
-        packageId: pkg.id,
-        packageName: pkg.name || pkg.title || 'Package',
-        serviceId: vs.service.id,
-        serviceName: vs.service.name,
-        categoryId: vs.service.categoryId,
-        categoryName: vs.service.category?.name || null,
-        subCategoryId: vs.service.subCategoryId || null,
-        subCategoryName: vs.service.subCategory?.name || null,
-        durationMinutes: pkg.durationMinutes,
-        duration: pkg.duration,
-        requiredProfessionals: cfgMap.get(pkg.id)?.requiredProfessionals ?? 1,
-      }))
+      vs.service.packages.map((pkg) => {
+        const employeeCount = countEmployeesForPackage({
+          id: pkg.id,
+          categoryId: vs.service.categoryId,
+          subCategoryId: vs.service.subCategoryId || null,
+        });
+        return {
+          packageId: pkg.id,
+          packageName: pkg.name || pkg.title || 'Package',
+          serviceId: vs.service.id,
+          serviceName: vs.service.name,
+          vendorServiceId: vs.id,
+          categoryId: vs.service.categoryId,
+          categoryName: vs.service.category?.name || null,
+          subCategoryId: vs.service.subCategoryId || null,
+          subCategoryName: vs.service.subCategory?.name || null,
+          durationMinutes: pkg.durationMinutes,
+          duration: pkg.duration,
+          requiredProfessionals: cfgMap.get(pkg.id)?.requiredProfessionals ?? 1,
+          employeeCount,
+          /** Hub-radius availability — false means customers see "Currently not available". */
+          isActive: vs.isActive !== false,
+          availabilityMessage: vs.isActive === false ? 'Currently not available' : null,
+        };
+      })
     );
     sendSuccess(res, packages);
   } catch (err) {
@@ -869,15 +923,16 @@ export const vendorListHubPackages = async (req: Request, res: Response): Promis
 
 export const vendorSetHubPackageCrew = async (req: Request, res: Response): Promise<void> => {
   try {
+    assertBomWriter(req);
     const vendorId = (req as any).hubVendorId as string;
     const { packageId, requiredProfessionals } = req.body as z.infer<typeof setHubPackageCrewSchema>;
 
     const assigned = await prisma.vendorService.findFirst({
       where: {
         vendorId,
-        isActive: true,
         service: { packages: { some: { id: packageId } } },
       },
+      select: { id: true, serviceId: true },
     });
     if (!assigned) {
       sendError(res, 'BAD_REQUEST', 'Package is not assigned to this hub', 400);
@@ -898,9 +953,67 @@ export const vendorSetHubPackageCrew = async (req: Request, res: Response): Prom
         isActive: true,
       },
     });
+
+    emitHubCatalogUpdated(vendorId, {
+      hubId: vendorId,
+      serviceId: assigned.serviceId,
+      packageId,
+      requiredProfessionals: cfg.requiredProfessionals,
+      reason: 'crew_size',
+    });
+
     sendSuccess(res, cfg);
-  } catch (err) {
+  } catch (err: any) {
+    if (err?.status === 403) {
+      sendError(res, err.code || 'FORBIDDEN', err.message, 403);
+      return;
+    }
     console.error(err);
     sendError(res, 'INTERNAL_ERROR', 'Failed to update crew size', 500);
+  }
+};
+
+/** Pause / resume a catalog service for this hub's service radius (VendorService.isActive). */
+export const vendorSetHubServiceAvailability = async (req: Request, res: Response): Promise<void> => {
+  try {
+    assertBomWriter(req);
+    const vendorId = (req as any).hubVendorId as string;
+    const { serviceId, isActive } = req.body as z.infer<typeof setHubServiceAvailabilitySchema>;
+
+    const existing = await prisma.vendorService.findFirst({
+      where: { vendorId, serviceId },
+      select: { id: true, isActive: true },
+    });
+    if (!existing) {
+      sendError(res, 'BAD_REQUEST', 'Service is not assigned to this hub', 400);
+      return;
+    }
+
+    const updated = await prisma.vendorService.update({
+      where: { id: existing.id },
+      data: { isActive },
+      select: { id: true, serviceId: true, isActive: true, vendorId: true },
+    });
+
+    invalidateCatalogCache();
+    emitHubCatalogUpdated(vendorId, {
+      hubId: vendorId,
+      serviceId: updated.serviceId,
+      isActive: updated.isActive,
+      reason: 'availability',
+    });
+
+    sendSuccess(res, {
+      serviceId: updated.serviceId,
+      isActive: updated.isActive,
+      availabilityMessage: updated.isActive ? null : 'Currently not available',
+    });
+  } catch (err: any) {
+    if (err?.status === 403) {
+      sendError(res, err.code || 'FORBIDDEN', err.message, 403);
+      return;
+    }
+    console.error(err);
+    sendError(res, 'INTERNAL_ERROR', 'Failed to update service availability', 500);
   }
 };

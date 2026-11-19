@@ -676,9 +676,13 @@ export const getCatalogServiceById = async (req: Request, res: Response): Promis
       return;
     }
 
+    const availableAtHub =
+      reachability.inServiceArea && reachability.serviceIds.has(service.id);
     const resultData = {
       service: withHubPricing(service, reachability),
       coverage: coveragePayload(reachability),
+      availableAtHub,
+      availabilityMessage: availableAtHub ? null : 'Currently not available',
     };
     catalogMemoryCache.set(cacheKey, { data: resultData, expiresAt: Date.now() + CACHE_TTL_MS });
 
