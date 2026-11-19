@@ -36,6 +36,8 @@ export const POST_SHIFT_RETURN_MINUTES = 30;
 export const GRACE_HOURS = POST_SHIFT_RETURN_MINUTES / 60;
 export const CHECK_IN_START_HOUR = 9;
 export const CHECK_IN_GRACE_MINUTES = 30;
+/** Not checked in by this IST hour → Absent for BOM roster (force check-in still allowed). */
+export const ABSENT_CUTOFF_HOUR = 12;
 export const ACTIVE_FIELD_JOB_STATUSES = ['ON_THE_WAY', 'ARRIVED', 'IN_PROGRESS'] as const;
 
 export type CheckInWindowPhase = 'too_early' | 'open' | 'late';
@@ -52,6 +54,28 @@ export function classifyCheckInWindow(now: Date = new Date()): CheckInWindowPhas
   if (now < windowStart) return 'too_early';
   if (now <= windowEnd) return 'open';
   return 'late';
+}
+
+/** True when the pro never checked in and local IST time is past noon. */
+export function isAbsentAfterNoon(
+  checkedIn: boolean,
+  now: Date = new Date()
+): boolean {
+  if (checkedIn) return false;
+  const ymd = ymdInBookingTz(now);
+  const noon = atLocalTime(ymd, ABSENT_CUTOFF_HOUR, 0);
+  return now.getTime() >= noon.getTime();
+}
+
+/**
+ * Red profile for BOM: late/absent force check-in flag, or missed post-shift return (suspended).
+ * Late force check-in keeps the card red even while the pro is checked in.
+ */
+export function hasAttendanceRedFlag(opts: {
+  lateWorkerFlaggedAt?: Date | string | null;
+  isSuspended?: boolean;
+}): boolean {
+  return Boolean(opts.lateWorkerFlaggedAt) || Boolean(opts.isSuspended);
 }
 
 export function computeShiftTiming(
@@ -938,6 +962,11 @@ export async function getHubAttendanceStatus(userId: string) {
     lateCheckInRequestedAt: profile.lateCheckInRequestedAt,
     checkInWindowLabel: '09:00 – 09:30 IST',
     isSuspended: suspended,
+    isAbsent: isAbsentAfterNoon(checkedIn),
+    hasAttendanceRedFlag: hasAttendanceRedFlag({
+      lateWorkerFlaggedAt: profile.lateWorkerFlaggedAt,
+      isSuspended: suspended,
+    }),
   };
 }
 
@@ -1268,10 +1297,10 @@ export async function pingHubLocation(userId: string, latitude: number, longitud
   };
 }
 
-const FORCE_CHECKIN_LOCATION_MAX_AGE_MS = 15 * 60 * 1000;
-
 /**
- * BOM force check-in after 09:30 — only when the professional's recent GPS is inside the hub radius.
+ * BOM force check-in after 09:30 IST.
+ * Discretionary: BOM may check in late/absent pros without requiring fresh GPS at the hub.
+ * Still marks lateWorkerFlaggedAt so the profile stays red for the day.
  * Also clears attendance suspension from a prior missed checkout.
  */
 export async function homForceHubCheckIn(actorUserId: string, employeeProfileId: string) {
@@ -1302,12 +1331,10 @@ export async function homForceHubCheckIn(actorUserId: string, employeeProfileId:
       id: true,
       userId: true,
       vendorId: true,
-      workRadiusMeters: true,
       hubCheckedInAt: true,
       lastLatitude: true,
       lastLongitude: true,
       lastLocationAt: true,
-      vendor: { select: { latitude: true, longitude: true, companyName: true } },
       user: { select: { name: true, status: true } },
     },
   });
@@ -1319,41 +1346,7 @@ export async function homForceHubCheckIn(actorUserId: string, employeeProfileId:
 
   await assertHomOwnsEmployeeHub(actor.managerProfile, profile.vendorId);
 
-  const hubLat = profile.vendor.latitude;
-  const hubLng = profile.vendor.longitude;
-  if (!isValidCoordinate(hubLat, hubLng)) {
-    throw new DispatchError('HUB_LOCATION_MISSING', 'Hub GPS is not set. Ask Super Admin / Development Manager to pin the hub.', 409);
-  }
-  if (!isValidCoordinate(profile.lastLatitude, profile.lastLongitude) || !profile.lastLocationAt) {
-    throw new DispatchError(
-      'PROFESSIONAL_LOCATION_MISSING',
-      `${profile.user.name} must open the Partner app near the hub so GPS updates, then retry force check-in.`,
-      409
-    );
-  }
-  const ageMs = now.getTime() - new Date(profile.lastLocationAt).getTime();
-  if (ageMs > FORCE_CHECKIN_LOCATION_MAX_AGE_MS) {
-    throw new DispatchError(
-      'PROFESSIONAL_LOCATION_STALE',
-      `${profile.user.name}'s GPS is older than 15 minutes. Ask them to open the Partner app at the hub, then retry.`,
-      409
-    );
-  }
-
-  const radiusM = profile.workRadiusMeters > 0 ? profile.workRadiusMeters : DEFAULT_WORK_RADIUS_METERS;
-  const distanceM = metersBetween(
-    profile.lastLatitude as number,
-    profile.lastLongitude as number,
-    hubLat as number,
-    hubLng as number
-  );
-  if (distanceM > radiusM) {
-    throw new DispatchError(
-      'OUTSIDE_HUB_RADIUS',
-      `Force check-in blocked: ${profile.user.name} is about ${Math.round(distanceM)} m from ${profile.vendor.companyName} (need within ${Math.round(radiusM)} m).`,
-      409
-    );
-  }
+  const hasGps = isValidCoordinate(profile.lastLatitude, profile.lastLongitude);
 
   await prisma.$transaction([
     prisma.employeeProfile.update({
@@ -1363,12 +1356,17 @@ export async function homForceHubCheckIn(actorUserId: string, employeeProfileId:
         hubCheckedOutAt: null,
         lastHubCheckInAt: now,
         shiftOverdueNotifiedAt: null,
-        lateWorkerFlaggedAt: now, // arrived after 09:30 via BOM
+        // Keep red profile for the rest of the shift — late / absent force check-in.
+        lateWorkerFlaggedAt: now,
         lateCheckInRequestedAt: null,
         postShiftReturnDeadlineAt: null,
-        lastLatitude: profile.lastLatitude,
-        lastLongitude: profile.lastLongitude,
-        lastLocationAt: now,
+        ...(hasGps
+          ? {
+              lastLatitude: profile.lastLatitude,
+              lastLongitude: profile.lastLongitude,
+              lastLocationAt: now,
+            }
+          : {}),
         isAvailable: true,
         acceptingRequests: true,
       },
