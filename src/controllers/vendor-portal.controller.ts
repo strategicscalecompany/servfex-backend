@@ -3015,6 +3015,7 @@ export const getEmployeeDayBoard = async (req: Request, res: Response): Promise<
         customerLatitude: destLat,
         customerLongitude: destLng,
         pastJobGrace: openField && pastJobGrace,
+        scheduleDayExpired: isBookingScheduleDayExpired(b.scheduledDate, now),
         jobOverrunNotifiedAt: b.jobOverrunNotifiedAt?.toISOString() ?? null,
         graceMinutes: JOB_OVERRUN_GRACE_MINUTES,
       };
