@@ -256,6 +256,63 @@ export async function listCustomerSupportEligibleBookings(userId: string) {
     }));
 }
 
+/** Open CUSTOMER_SUPPORT tickets for this customer (any booking still open). */
+export async function listCustomerOpenSupportTickets(userId: string) {
+  const customer = await prisma.customerProfile.findUnique({
+    where: { userId },
+    select: { id: true },
+  });
+  if (!customer) throw new DispatchError('NOT_FOUND', 'Customer profile not found', 404);
+
+  const tickets = await prisma.escalationTicket.findMany({
+    where: {
+      reason: 'CUSTOMER_SUPPORT',
+      status: { in: ['OPEN', 'ACKNOWLEDGED', 'IN_PROGRESS'] },
+      booking: { customerId: customer.id },
+    },
+    orderBy: [{ updatedAt: 'desc' }],
+    take: 40,
+    select: {
+      id: true,
+      status: true,
+      updatedAt: true,
+      createdAt: true,
+      booking: {
+        select: {
+          id: true,
+          bookingNumber: true,
+          status: true,
+          scheduledDate: true,
+          lastChatAt: true,
+          service: { select: { name: true } },
+          package: { select: { name: true } },
+          messages: {
+            orderBy: { createdAt: 'desc' },
+            take: 1,
+            select: { body: true, createdAt: true, senderRole: true },
+          },
+        },
+      },
+    },
+  });
+
+  return tickets.map((t) => {
+    const last = t.booking.messages[0];
+    return {
+      ticketId: t.id,
+      ticketStatus: t.status,
+      bookingId: t.booking.id,
+      bookingNumber: t.booking.bookingNumber,
+      bookingStatus: t.booking.status,
+      scheduledDate: t.booking.scheduledDate,
+      serviceName: t.booking.package?.name || t.booking.service?.name || 'Service',
+      lastMessage: last?.body || null,
+      lastMessageAt: (last?.createdAt || t.booking.lastChatAt || t.updatedAt).toISOString(),
+      updatedAt: t.updatedAt.toISOString(),
+    };
+  });
+}
+
 export async function createCustomerSupportTicket(
   userId: string,
   bookingId: string,
@@ -395,10 +452,14 @@ export async function createCustomerSupportTicket(
 }
 
 export async function getCustomerSupportBootstrap(userId: string, latitude?: number | null, longitude?: number | null) {
-  const [eligible, contact] = await Promise.all([
+  const [eligible, openTickets, contact] = await Promise.all([
     listCustomerSupportEligibleBookings(userId),
+    listCustomerOpenSupportTickets(userId),
     resolveBomSupportContact({ latitude, longitude }),
   ]);
+  const openBookingIds = new Set(openTickets.map((t) => t.bookingId));
+  // Create-ticket picker only shows orders that do not already have an open ticket.
+  const eligibleForNew = eligible.filter((b) => !openBookingIds.has(b.id));
   return {
     contact: contact
       ? {
@@ -408,7 +469,8 @@ export async function getCustomerSupportBootstrap(userId: string, latitude?: num
           phone: contact.phone,
         }
       : null,
-    eligibleBookings: eligible,
+    eligibleBookings: eligibleForNew,
+    openTickets,
     presets: {
       bom: [...BOM_MISSED_CALL_PRESETS],
       customer: [...CUSTOMER_SUPPORT_REPLY_PRESETS],
