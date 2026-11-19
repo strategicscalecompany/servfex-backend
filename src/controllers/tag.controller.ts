@@ -133,41 +133,48 @@ export async function listHubAssignedCategories(vendorId: string) {
  * categories → subcategories → packages (only services assigned to this hub).
  */
 export async function listHubCatalogTree(vendorId: string) {
-  const vendorServices = await prisma.vendorService.findMany({
-    where: {
-      vendorId,
-      isActive: true,
-      service: {
+  const [vendorServices, enabledConfigs] = await Promise.all([
+    prisma.vendorService.findMany({
+      where: {
+        vendorId,
         isActive: true,
-        OR: [{ deletedAt: null }, { deletedAt: { isSet: false } }],
+        service: {
+          isActive: true,
+          OR: [{ deletedAt: null }, { deletedAt: { isSet: false } }],
+        },
       },
-    },
-    include: {
-      service: {
-        select: {
-          id: true,
-          name: true,
-          categoryId: true,
-          subCategoryId: true,
-          category: { select: { id: true, name: true, displayOrder: true } },
-          subCategory: { select: { id: true, name: true, displayOrder: true, categoryId: true } },
-          packages: {
-            where: { isActive: true },
-            select: {
-              id: true,
-              name: true,
-              title: true,
-              displayOrder: true,
-              discountedPrice: true,
-              originalPrice: true,
-              duration: true,
+      include: {
+        service: {
+          select: {
+            id: true,
+            name: true,
+            categoryId: true,
+            subCategoryId: true,
+            category: { select: { id: true, name: true, displayOrder: true } },
+            subCategory: { select: { id: true, name: true, displayOrder: true, categoryId: true } },
+            packages: {
+              where: { isActive: true },
+              select: {
+                id: true,
+                name: true,
+                title: true,
+                displayOrder: true,
+                discountedPrice: true,
+                originalPrice: true,
+                duration: true,
+              },
+              orderBy: { displayOrder: 'asc' },
             },
-            orderBy: { displayOrder: 'asc' },
           },
         },
       },
-    },
-  });
+    }),
+    prisma.hubPackageConfig.findMany({
+      where: { vendorId, isActive: true },
+      select: { packageId: true },
+    }),
+  ]);
+  const enabledPackageIds = new Set(enabledConfigs.map((c) => c.packageId));
 
   type PackageNode = {
     id: string;
@@ -221,19 +228,23 @@ export async function listHubCatalogTree(vendorId: string) {
     }
     const cat = categories.get(svc.category.id)!;
 
-    const packages: PackageNode[] = (svc.packages || []).map((pkg) => {
-      const price = pkg.discountedPrice || pkg.originalPrice || null;
-      return {
-        id: pkg.id,
-        name: pkg.name || pkg.title || 'Package',
-        serviceId: svc.id,
-        serviceName: svc.name,
-        discountedPrice: pkg.discountedPrice ?? null,
-        originalPrice: pkg.originalPrice ?? null,
-        price,
-        duration: pkg.duration ?? null,
-      };
-    });
+    // Services page only shows packages BOM has toggled on for this hub.
+    const packages: PackageNode[] = (svc.packages || [])
+      .filter((pkg) => enabledPackageIds.has(pkg.id))
+      .map((pkg) => {
+        const price = pkg.discountedPrice || pkg.originalPrice || null;
+        return {
+          id: pkg.id,
+          name: pkg.name || pkg.title || 'Package',
+          serviceId: svc.id,
+          serviceName: svc.name,
+          discountedPrice: pkg.discountedPrice ?? null,
+          originalPrice: pkg.originalPrice ?? null,
+          price,
+          duration: pkg.duration ?? null,
+        };
+      });
+    if (packages.length === 0) continue;
 
     if (svc.subCategory) {
       let sub = cat.subCategories.find((s) => s.id === svc.subCategory!.id);
@@ -832,7 +843,10 @@ export const vendorListHubPackages = async (req: Request, res: Response): Promis
       prisma.servicePackage.findMany({
         where: {
           isActive: true,
-          service: { isActive: true, deletedAt: null },
+          service: {
+            isActive: true,
+            OR: [{ deletedAt: null }, { deletedAt: { isSet: false } }],
+          },
         },
         select: {
           id: true,
@@ -941,7 +955,14 @@ export const vendorSetHubPackageCrew = async (req: Request, res: Response): Prom
     const { packageId, requiredProfessionals } = req.body as z.infer<typeof setHubPackageCrewSchema>;
 
     const pkg = await prisma.servicePackage.findFirst({
-      where: { id: packageId, isActive: true, service: { isActive: true, deletedAt: null } },
+      where: {
+        id: packageId,
+        isActive: true,
+        service: {
+          isActive: true,
+          OR: [{ deletedAt: null }, { deletedAt: { isSet: false } }],
+        },
+      },
       select: { id: true, serviceId: true },
     });
     if (!pkg) {
@@ -995,7 +1016,14 @@ export const vendorSetHubPackageAvailability = async (req: Request, res: Respons
     const { packageId, isActive } = req.body as z.infer<typeof setHubPackageAvailabilitySchema>;
 
     const pkg = await prisma.servicePackage.findFirst({
-      where: { id: packageId, isActive: true, service: { isActive: true, deletedAt: null } },
+      where: {
+        id: packageId,
+        isActive: true,
+        service: {
+          isActive: true,
+          OR: [{ deletedAt: null }, { deletedAt: { isSet: false } }],
+        },
+      },
       select: { id: true, serviceId: true },
     });
     if (!pkg) {

@@ -43,21 +43,53 @@ export const emitHubCatalogUpdated = (
   }
 ): void => {
   if (!ioInstance || !hubId) return;
+  const safe = {
+    hubId,
+    serviceId: payload.serviceId ?? null,
+    packageId: payload.packageId ?? null,
+    isActive: payload.isActive,
+    requiredProfessionals: payload.requiredProfessionals,
+    reason: payload.reason || 'catalog_updated',
+    at: Date.now(),
+  };
   try {
-    const safe = {
-      hubId,
-      serviceId: payload.serviceId ?? null,
-      packageId: payload.packageId ?? null,
-      isActive: payload.isActive,
-      requiredProfessionals: payload.requiredProfessionals,
-      reason: payload.reason || 'catalog_updated',
-      at: Date.now(),
-    };
+    // Room is hub-scoped: only sockets that joined this hub (customers in radius + hub staff).
     ioInstance.to(hubRoom(hubId)).emit('hub:catalog', safe);
+    // Super Admin desk only — never a global customer/provider broadcast.
     ioInstance.to('admins').emit('hub:catalog', safe);
   } catch (err) {
     logger.warn({ err, hubId }, 'Failed to emit hub catalog event');
   }
+
+  // Staff of THIS hub only (owner, onboarded pros, assigned BOMs) — not other hubs.
+  void (async () => {
+    try {
+      const hub = await prisma.vendorProfile.findUnique({
+        where: { id: hubId },
+        select: {
+          userId: true,
+          employees: {
+            where: { user: { deletedAt: null, status: 'ACTIVE' } },
+            select: { userId: true },
+          },
+          managers: {
+            where: { user: { deletedAt: null, status: 'ACTIVE' } },
+            select: { userId: true },
+          },
+        },
+      });
+      if (!hub || !ioInstance) return;
+      const userIds = new Set<string>();
+      if (hub.userId) userIds.add(hub.userId);
+      for (const e of hub.employees) if (e.userId) userIds.add(e.userId);
+      for (const m of hub.managers) if (m.userId) userIds.add(m.userId);
+      for (const id of userIds) {
+        ioInstance.to(`user:${id}`).emit('hub:catalog', safe);
+      }
+    } catch (err) {
+      logger.warn({ err, hubId }, 'Failed to fan-out hub catalog to staff rooms');
+    }
+  })();
 };
 
 export const emitToBookingRoom = (

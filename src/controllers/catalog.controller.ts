@@ -124,7 +124,10 @@ const resolveReachableServiceIds = async (
     prisma.vendorService.findMany({
       where: {
         vendorId: nearest.id,
-        service: { isActive: true, deletedAt: null },
+        service: {
+          isActive: true,
+          ...notDeletedClause,
+        },
       },
       select: { serviceId: true, customPrice: true },
     }),
@@ -132,7 +135,13 @@ const resolveReachableServiceIds = async (
       where: { vendorId: nearest.id, isActive: true },
       select: {
         packageId: true,
-        package: { select: { serviceId: true, isActive: true } },
+        package: {
+          select: {
+            serviceId: true,
+            isActive: true,
+            service: { select: { isActive: true, deletedAt: true } },
+          },
+        },
       },
     }),
   ]);
@@ -146,14 +155,19 @@ const resolveReachableServiceIds = async (
     priceByServiceId.set(row.serviceId, custom);
   }
 
-  // Only services that have at least one BOM-enabled package are bookable in this hub radius.
+  // BOM-enabled packages drive discoverability; VendorService only supplies optional hub price.
   const packageIds = new Set<string>();
   const serviceIds = new Set<string>();
   for (const row of enabledPackages) {
-    if (!row.package?.isActive) continue;
-    if (!priceByServiceId.has(row.package.serviceId)) continue;
+    const pkg = row.package;
+    if (!pkg?.isActive) continue;
+    if (pkg.service?.isActive === false) continue;
+    if (pkg.service?.deletedAt) continue;
     packageIds.add(row.packageId);
-    serviceIds.add(row.package.serviceId);
+    serviceIds.add(pkg.serviceId);
+    if (!priceByServiceId.has(pkg.serviceId)) {
+      priceByServiceId.set(pkg.serviceId, null);
+    }
   }
 
   return {

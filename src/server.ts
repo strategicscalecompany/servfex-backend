@@ -131,6 +131,48 @@ io.on('connection', (socket) => {
   }
   logger.info({ socketId: socket.id, userId: socket.data.userId, role: socket.data.role }, 'Realtime client connected');
 
+  // Auto-join hub catalog rooms for partner / BOM / field staff so package toggles fan out immediately.
+  void (async () => {
+    try {
+      const userId = socket.data.userId as string;
+      const role = socket.data.role as string;
+      const hubIds = new Set<string>();
+      if (role === 'VENDOR') {
+        const vendor = await prisma.vendorProfile.findFirst({
+          where: { userId, isActive: true },
+          select: { id: true },
+        });
+        if (vendor?.id) hubIds.add(vendor.id);
+      } else if (role === 'EMPLOYEE') {
+        const emp = await prisma.employeeProfile.findFirst({
+          where: { userId },
+          select: { vendorId: true },
+        });
+        if (emp?.vendorId) hubIds.add(emp.vendorId);
+      } else if (role === 'OPERATIONS_MANAGER' || role === 'BUSINESS_DEVELOPMENT') {
+        const mgr = await prisma.managerProfile.findFirst({
+          where: { userId },
+          select: { vendorId: true, zone: true },
+        });
+        if (mgr?.vendorId) hubIds.add(mgr.vendorId);
+        const parts = (mgr?.zone || '')
+          .split(',')
+          .map((p) => p.trim())
+          .filter(Boolean);
+        for (const part of parts) {
+          if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(part)) {
+            hubIds.add(part);
+          }
+        }
+      }
+      for (const id of hubIds) {
+        socket.join(hubRoom(id));
+      }
+    } catch (err) {
+      logger.warn({ err, socketId: socket.id }, 'Failed to auto-join hub rooms');
+    }
+  })();
+
   socket.on('booking:join', async (payload: { bookingId?: string }, ack?: (result: { ok: boolean }) => void) => {
     try {
       const bookingId = payload?.bookingId;
