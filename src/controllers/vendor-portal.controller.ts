@@ -24,6 +24,8 @@ import { generateStartOtp, stripStartOtp } from '../utils/start-otp';
 import {
   beginWorkAfterBeforePhotos,
   computeShiftTiming,
+  hasAttendanceRedFlag,
+  isAbsentAfterNoon,
   onEmployeeLeftActiveFieldJob,
   setLocationSharing,
   verifyStartOtpForExpert,
@@ -1381,7 +1383,11 @@ export const getManagerDashboard = async (req: Request, res: Response): Promise<
         isLateWorker: Boolean(emp.lateWorkerFlaggedAt),
         lateCheckInRequested: Boolean(emp.lateCheckInRequestedAt) && !checkedIn,
         isSuspended: suspended,
-        hasAttendanceRedFlag: Boolean(emp.lateWorkerFlaggedAt) && suspended,
+        isAbsent: isAbsentAfterNoon(checkedIn),
+        hasAttendanceRedFlag: hasAttendanceRedFlag({
+          lateWorkerFlaggedAt: emp.lateWorkerFlaggedAt,
+          isSuspended: suspended,
+        }),
       };
     });
 
@@ -2812,7 +2818,11 @@ export const getVendorEmployees = async (req: Request, res: Response): Promise<v
             isLateWorker: Boolean(emp.lateWorkerFlaggedAt),
             lateCheckInRequested: Boolean(emp.lateCheckInRequestedAt) && !checkedIn,
             isSuspended: suspended,
-            hasAttendanceRedFlag: Boolean(emp.lateWorkerFlaggedAt) && suspended,
+            isAbsent: isAbsentAfterNoon(checkedIn),
+            hasAttendanceRedFlag: hasAttendanceRedFlag({
+              lateWorkerFlaggedAt: emp.lateWorkerFlaggedAt,
+              isSuspended: suspended,
+            }),
             lastLatitude: emp.lastLatitude ?? null,
             lastLongitude: emp.lastLongitude ?? null,
             lastLocationAt: emp.lastLocationAt ?? null,
@@ -2873,41 +2883,94 @@ export const getEmployeeDayBoard = async (req: Request, res: Response): Promise<
       'AWAITING_CUSTOMER_CONFIRMATION',
       'AWAITING_PAYMENT',
       'COMPLETED',
+      'CANCELLED',
     ] as const;
 
-    const bookings = await prisma.booking.findMany({
-      where: {
-        OR: [{ employeeId: emp.id }, { helperEmployeeId: emp.id }],
-        scheduledDate: { in: [todayKey, tomorrowKey] },
-        status: { in: [...dayStatuses] },
+    const bookingInclude = {
+      service: { select: { name: true } },
+      package: { select: { name: true } },
+      address: {
+        select: {
+          addressLine1: true,
+          city: true,
+          latitude: true,
+          longitude: true,
+        },
       },
-      include: {
-        service: { select: { name: true } },
-        address: { select: { addressLine1: true, city: true } },
-        customer: { include: { user: { select: { name: true, phone: true } } } },
-      },
-      orderBy: [{ scheduledDate: 'asc' }, { createdAt: 'asc' }],
-    });
+      customer: { include: { user: { select: { name: true, phone: true } } } },
+    } as const;
 
-    const mapOrder = (b: (typeof bookings)[number]) => ({
-      id: b.id,
-      bookingNumber: b.bookingNumber,
-      status: b.status,
-      scheduledDate: b.scheduledDate,
-      scheduledTimeSlot: b.scheduledTimeSlot,
-      serviceName: b.service?.name || 'Service',
-      addressLine1: b.address?.addressLine1 || '',
-      city: b.address?.city || '',
-      customerName: b.customer?.user?.name || '',
-      customerPhone: b.customer?.user?.phone || '',
-      totalAmount: b.totalAmount,
-    });
+    const [bookings, recentBookings, activeLive] = await Promise.all([
+      prisma.booking.findMany({
+        where: {
+          OR: [{ employeeId: emp.id }, { helperEmployeeId: emp.id }],
+          scheduledDate: { in: [todayKey, tomorrowKey] },
+          status: { in: [...dayStatuses] },
+        },
+        include: bookingInclude,
+        orderBy: [{ scheduledDate: 'asc' }, { createdAt: 'asc' }],
+      }),
+      prisma.booking.findMany({
+        where: {
+          OR: [{ employeeId: emp.id }, { helperEmployeeId: emp.id }],
+          status: { in: [...dayStatuses] },
+        },
+        include: bookingInclude,
+        orderBy: [{ scheduledDate: 'desc' }, { updatedAt: 'desc' }],
+        take: 40,
+      }),
+      prisma.booking.findFirst({
+        where: {
+          OR: [{ employeeId: emp.id }, { helperEmployeeId: emp.id }],
+          status: {
+            in: ['ON_THE_WAY', 'ARRIVED', 'IN_PROGRESS', 'AWAITING_CUSTOMER_CONFIRMATION'],
+          },
+        },
+        include: bookingInclude,
+        orderBy: { updatedAt: 'desc' },
+      }),
+    ]);
+
+    const mapOrder = (b: (typeof bookings)[number]) => {
+      const destLat =
+        (typeof b.serviceLatitude === 'number' && b.serviceLatitude !== 0
+          ? b.serviceLatitude
+          : null) ??
+        (typeof b.address?.latitude === 'number' && b.address.latitude !== 0
+          ? b.address.latitude
+          : null);
+      const destLng =
+        (typeof b.serviceLongitude === 'number' && b.serviceLongitude !== 0
+          ? b.serviceLongitude
+          : null) ??
+        (typeof b.address?.longitude === 'number' && b.address.longitude !== 0
+          ? b.address.longitude
+          : null);
+      return {
+        id: b.id,
+        bookingNumber: b.bookingNumber,
+        status: b.status,
+        scheduledDate: b.scheduledDate,
+        scheduledTimeSlot: b.scheduledTimeSlot,
+        serviceName: b.package?.name || b.service?.name || 'Service',
+        addressLine1: b.address?.addressLine1 || '',
+        city: b.address?.city || '',
+        customerName: b.customer?.user?.name || '',
+        customerPhone: b.customer?.user?.phone || '',
+        totalAmount: b.totalAmount,
+        customerLatitude: destLat,
+        customerLongitude: destLng,
+      };
+    };
 
     const today = bookings.filter((b) => b.scheduledDate === todayKey).map(mapOrder);
     const tomorrow = bookings.filter((b) => b.scheduledDate === tomorrowKey).map(mapOrder);
-    const activeRaw = bookings.find((b) =>
-      ['ON_THE_WAY', 'ARRIVED', 'IN_PROGRESS', 'AWAITING_CUSTOMER_CONFIRMATION'].includes(b.status)
-    );
+    const recentOrders = recentBookings.map(mapOrder);
+    const activeRaw =
+      activeLive ||
+      bookings.find((b) =>
+        ['ON_THE_WAY', 'ARRIVED', 'IN_PROGRESS', 'AWAITING_CUSTOMER_CONFIRMATION'].includes(b.status)
+      );
 
     const timing = computeShiftTiming(emp.hubCheckedInAt, new Date(), emp.postShiftReturnDeadlineAt);
     const checkedIn = Boolean(emp.hubCheckedInAt);
@@ -2929,7 +2992,11 @@ export const getEmployeeDayBoard = async (req: Request, res: Response): Promise<
         isLateWorker: Boolean(emp.lateWorkerFlaggedAt),
         lateCheckInRequested: Boolean(emp.lateCheckInRequestedAt) && !checkedIn,
         isSuspended: suspended,
-        hasAttendanceRedFlag: Boolean(emp.lateWorkerFlaggedAt) && suspended,
+        isAbsent: isAbsentAfterNoon(checkedIn),
+        hasAttendanceRedFlag: hasAttendanceRedFlag({
+          lateWorkerFlaggedAt: emp.lateWorkerFlaggedAt,
+          isSuspended: suspended,
+        }),
         workedHours: timing.workedHours,
         lastLatitude: emp.lastLatitude,
         lastLongitude: emp.lastLongitude,
@@ -2941,6 +3008,7 @@ export const getEmployeeDayBoard = async (req: Request, res: Response): Promise<
       activeOrder: activeRaw ? mapOrder(activeRaw) : null,
       todayOrders: today,
       tomorrowOrders: tomorrow,
+      recentOrders,
     });
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
@@ -2954,8 +3022,9 @@ export const createVendorEmployee = async (req: Request, res: Response): Promise
     const resolvedExpertKind = normalizeExpertKind(expertKind);
 
     const actor = await resolvePortalActor(userId);
-    if (!actor.vendorId || (!actor.isVendor && !actor.isManager)) {
-      sendError(res, 'FORBIDDEN', 'Only hub partner or operations manager can onboard professionals', 403);
+    // BOM monitors employees but does not onboard; only hub partner (VENDOR) can create pros.
+    if (!actor.vendorId || !actor.isVendor) {
+      sendError(res, 'FORBIDDEN', 'Only the hub partner can onboard professionals', 403);
       return;
     }
 
