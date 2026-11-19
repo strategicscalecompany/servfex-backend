@@ -21,6 +21,7 @@ import {
   getDeskContext,
   getManagerDashboard,
   getManagerHubBoard,
+  getManagerChatInbox,
   searchDeskServices,
   completeOrder,
   uploadOrderBeforePhotos,
@@ -139,6 +140,7 @@ router.get('/desk/context', getDeskContext);
 router.get('/desk/services', searchDeskServices);
 router.get('/manager/dashboard', getManagerDashboard);
 router.get('/manager/hub-board', getManagerHubBoard);
+router.get('/manager/chat-inbox', getManagerChatInbox);
 
 // KYC Documents
 router.get('/documents', getVendorDocuments);

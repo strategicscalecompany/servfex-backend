@@ -1477,6 +1477,36 @@ function summarizeHubPeriod(
  * BOM hub board: searchable/filterable bookings + today/week/month earnings shares.
  * GET /vendor/manager/hub-board?q=&period=today|week|month|custom&from=&to=
  */
+/**
+ * BOM chat inbox — recent hub order conversations.
+ * GET /vendor/manager/chat-inbox
+ */
+export const getManagerChatInbox = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const actor = await resolvePortalActor(req.user!.userId);
+    if (!actor.isManager && !actor.isVendor) {
+      sendError(res, 'FORBIDDEN', 'Only hub managers can open the chat inbox', 403);
+      return;
+    }
+    let hubIds: string[];
+    try {
+      ({ hubIds } = await scopedHubIdsForActor(actor, readRequestedHubVendorId(req)));
+    } catch (scopeErr: any) {
+      sendError(res, scopeErr.code || 'FORBIDDEN', scopeErr.message, scopeErr.status || 403);
+      return;
+    }
+    if (hubIds.length === 0) {
+      sendError(res, 'HUB_NOT_ASSIGNED', 'This manager is not assigned to a local provider hub yet', 403);
+      return;
+    }
+    const { listHubChatInbox } = await import('../services/chat.service');
+    const conversations = await listHubChatInbox(req.user!.userId, hubIds);
+    sendSuccess(res, { conversations }, 200);
+  } catch (err: any) {
+    sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
+  }
+};
+
 export const getManagerHubBoard = async (req: Request, res: Response): Promise<void> => {
   try {
     const actor = await resolvePortalActor(req.user!.userId);
