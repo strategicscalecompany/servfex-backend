@@ -1445,8 +1445,12 @@ function periodBoundsIst(period: string, fromYmd?: string | null, toYmd?: string
   }
   if (p === 'week') return { from: addDaysYmd(today, -6), to: today };
   if (p === 'month') {
-    const [y, m] = today.split('-');
-    return { from: `${y}-${m}-01`, to: today };
+    const [y, m] = today.split('-').map(Number);
+    const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
+    const mm = String(m).padStart(2, '0');
+    const dd = String(lastDay).padStart(2, '0');
+    // Whole calendar month (not only month-to-date) so later scheduled jobs still appear.
+    return { from: `${y}-${mm}-01`, to: `${y}-${mm}-${dd}` };
   }
   return { from: today, to: today };
 }
@@ -1533,8 +1537,8 @@ export const getManagerHubBoard = async (req: Request, res: Response): Promise<v
     const toQ = typeof req.query.to === 'string' ? req.query.to.trim() : null;
     const { from, to } = periodBoundsIst(period, fromQ, toQ);
     const today = ymdInBookingTz();
-    const weekFrom = addDaysYmd(today, -6);
-    const monthFrom = `${today.slice(0, 7)}-01`;
+    const weekBounds = periodBoundsIst('week');
+    const monthBounds = periodBoundsIst('month');
 
     const hubBoardSelect = {
       id: true,
@@ -1570,8 +1574,8 @@ export const getManagerHubBoard = async (req: Request, res: Response): Promise<v
     const bookings = await prisma.booking.findMany({
       where: { vendorId: { in: hubIds } },
       select: hubBoardSelect,
-      orderBy: [{ updatedAt: 'desc' }],
-      take: 500,
+      orderBy: [{ updatedAt: 'desc' }, { createdAt: 'desc' }],
+      take: 1000,
     });
 
     const inRange = (ymd: string, a: string, b: string) => Boolean(ymd) && ymd >= a && ymd <= b;
@@ -1583,8 +1587,8 @@ export const getManagerHubBoard = async (req: Request, res: Response): Promise<v
     };
 
     const todayRows = bookings.filter((b) => dayKey(b) === today);
-    const weekRows = bookings.filter((b) => inRange(dayKey(b), weekFrom, today));
-    const monthRows = bookings.filter((b) => inRange(dayKey(b), monthFrom, today));
+    const weekRows = bookings.filter((b) => inRange(dayKey(b), weekBounds.from, weekBounds.to));
+    const monthRows = bookings.filter((b) => inRange(dayKey(b), monthBounds.from, monthBounds.to));
 
     const normalizeBookingKey = (value: string) =>
       value
