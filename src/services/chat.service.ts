@@ -16,7 +16,17 @@ export async function bookingHasOpenSupportTicket(bookingId: string): Promise<bo
     },
     select: { id: true },
   });
-  return Boolean(open);
+  if (open) return true;
+  // Fallback if reason enum write differed — match by support actions.
+  const byAction = await prisma.escalationTicket.findFirst({
+    where: {
+      bookingId,
+      status: { in: ['OPEN', 'ACKNOWLEDGED', 'IN_PROGRESS'] },
+      actions: { some: { action: { in: ['CUSTOMER_OPENED_SUPPORT', 'CUSTOMER_SUPPORT_UPDATE'] } } },
+    },
+    select: { id: true },
+  });
+  return Boolean(byAction);
 }
 
 async function hubIdsForOperationsManager(userId: string): Promise<string[]> {
@@ -27,8 +37,9 @@ async function hubIdsForOperationsManager(userId: string): Promise<string[]> {
       managerProfile: { select: { kind: true, vendorId: true, zone: true } },
     },
   });
-  if (user?.role !== 'OPERATIONS_MANAGER' || !user.managerProfile) return [];
-  if (user.managerProfile.kind && user.managerProfile.kind !== 'OPERATIONS') return [];
+  if (!user?.managerProfile) return [];
+  // BUSINESS_DEVELOPMENT managers share ManagerProfile but stay out of hub support chat.
+  if (user.managerProfile.kind !== 'OPERATIONS') return [];
 
   const ids = new Set<string>();
   if (user.managerProfile.vendorId) ids.add(user.managerProfile.vendorId);
@@ -37,7 +48,6 @@ async function hubIdsForOperationsManager(userId: string): Promise<string[]> {
     .split(',')
     .map((p) => p.trim())
     .filter(Boolean);
-  if (parts.length === 0) return [...ids];
 
   const vendors = await prisma.vendorProfile.findMany({
     select: { id: true, companyName: true, warehouseName: true },
@@ -54,6 +64,31 @@ async function hubIdsForOperationsManager(userId: string): Promise<string[]> {
       const named = byName.get(part.toLowerCase());
       if (named) ids.add(named);
     }
+  }
+  return [...ids];
+}
+
+async function hubManagerUserIds(vendorId: string | null | undefined): Promise<string[]> {
+  if (!vendorId) return [];
+  const managers = await prisma.managerProfile.findMany({
+    where: {
+      kind: 'OPERATIONS',
+      user: { status: 'ACTIVE', deletedAt: null },
+      OR: [{ vendorId }, { zone: { contains: vendorId } }],
+    },
+    select: { userId: true, zone: true, vendorId: true },
+  });
+  const ids = new Set<string>();
+  for (const m of managers) {
+    if (m.vendorId === vendorId) {
+      ids.add(m.userId);
+      continue;
+    }
+    const parts = (m.zone || '')
+      .split(',')
+      .map((p) => p.trim())
+      .filter(Boolean);
+    if (parts.includes(vendorId)) ids.add(m.userId);
   }
   return [...ids];
 }
@@ -86,6 +121,18 @@ async function resolveChatAccess(userId: string, bookingId: string) {
   if (booking.vendorId) {
     const hubs = await hubIdsForOperationsManager(userId);
     if (hubs.includes(booking.vendorId)) {
+      return { booking, role: 'OPERATIONS_MANAGER' as const, isManager: true };
+    }
+    // Last resort: manager profile directly assigned / zone-listed for this hub.
+    const direct = await prisma.managerProfile.findFirst({
+      where: {
+        userId,
+        kind: 'OPERATIONS',
+        OR: [{ vendorId: booking.vendorId }, { zone: { contains: booking.vendorId } }],
+      },
+      select: { id: true },
+    });
+    if (direct) {
       return { booking, role: 'OPERATIONS_MANAGER' as const, isManager: true };
     }
   }
@@ -159,9 +206,13 @@ export async function sendBookingMessage(
     data: { lastChatAt: message.createdAt },
   });
 
-  const peers = [booking.customer.userId, booking.employee?.userId, booking.vendor?.userId].filter(
-    (id): id is string => Boolean(id) && id !== userId
-  );
+  const managerIds = await hubManagerUserIds(booking.vendorId);
+  const peers = [
+    booking.customer.userId,
+    booking.employee?.userId,
+    booking.vendor?.userId,
+    ...managerIds,
+  ].filter((id): id is string => Boolean(id) && id !== userId);
   const uniquePeers = [...new Set(peers)];
   const payload = {
     bookingId,
@@ -173,12 +224,11 @@ export async function sendBookingMessage(
   emitToBookingRoom(bookingId, 'booking:chat', payload);
 
   if (uniquePeers.length) {
-    void notifyUsers(
-      uniquePeers,
-      `New message #${booking.bookingNumber}`,
-      body.slice(0, 80),
-      { bookingId, type: 'booking:chat' }
-    );
+    const title =
+      message.senderRole === 'OPERATIONS_MANAGER'
+        ? `Support reply #${booking.bookingNumber}`
+        : `New message #${booking.bookingNumber}`;
+    void notifyUsers(uniquePeers, title, body.slice(0, 80), { bookingId, type: 'booking:chat' });
   }
 
   return message;
