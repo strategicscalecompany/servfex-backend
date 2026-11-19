@@ -751,6 +751,23 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
       selectedPackage = service.packages[0];
     }
 
+    // Hub-radius package gate: BOM must explicitly enable the package for this hub.
+    if (assignedVendorId && selectedPackage) {
+      const hubPkg = await prisma.hubPackageConfig.findUnique({
+        where: {
+          vendorId_packageId: {
+            vendorId: assignedVendorId,
+            packageId: selectedPackage.id,
+          },
+        },
+        select: { isActive: true },
+      });
+      if (!hubPkg?.isActive) {
+        sendError(res, 'SERVICE_UNAVAILABLE', 'Currently not available', 409);
+        return;
+      }
+    }
+
     let basePrice = asDecimal(service.startingPrice);
     let actualPackageId: string | null = null;
     if (selectedPackage) {

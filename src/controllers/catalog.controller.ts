@@ -37,6 +37,8 @@ const parseCoord = (raw: unknown): number | null => {
 
 type CatalogReachability = {
   serviceIds: Set<string>;
+  /** Packages BOM explicitly enabled for the matched hub (HubPackageConfig.isActive). */
+  packageIds: Set<string>;
   /** False when no hub covers the customer point (or location is missing). */
   inServiceArea: boolean;
   matchedHubId?: string | null;
@@ -68,6 +70,7 @@ const resolveReachableServiceIds = async (
 ): Promise<CatalogReachability> => {
   const emptyReachability = (): CatalogReachability => ({
     serviceIds: new Set(),
+    packageIds: new Set(),
     inServiceArea: false,
     priceByServiceId: new Map(),
   });
@@ -117,13 +120,22 @@ const resolveReachableServiceIds = async (
   covering.sort((a, b) => a.distanceKm - b.distanceKm);
   const nearest = covering[0];
 
-  const assignments = await prisma.vendorService.findMany({
-    where: {
-      isActive: true,
-      vendorId: nearest.id,
-    },
-    select: { serviceId: true, customPrice: true },
-  });
+  const [assignments, enabledPackages] = await Promise.all([
+    prisma.vendorService.findMany({
+      where: {
+        vendorId: nearest.id,
+        service: { isActive: true, deletedAt: null },
+      },
+      select: { serviceId: true, customPrice: true },
+    }),
+    prisma.hubPackageConfig.findMany({
+      where: { vendorId: nearest.id, isActive: true },
+      select: {
+        packageId: true,
+        package: { select: { serviceId: true, isActive: true } },
+      },
+    }),
+  ]);
 
   const priceByServiceId = new Map<string, string | null>();
   for (const row of assignments) {
@@ -134,8 +146,19 @@ const resolveReachableServiceIds = async (
     priceByServiceId.set(row.serviceId, custom);
   }
 
+  // Only services that have at least one BOM-enabled package are bookable in this hub radius.
+  const packageIds = new Set<string>();
+  const serviceIds = new Set<string>();
+  for (const row of enabledPackages) {
+    if (!row.package?.isActive) continue;
+    if (!priceByServiceId.has(row.package.serviceId)) continue;
+    packageIds.add(row.packageId);
+    serviceIds.add(row.package.serviceId);
+  }
+
   return {
-    serviceIds: new Set(assignments.map((row) => row.serviceId)),
+    serviceIds,
+    packageIds,
     inServiceArea: true,
     matchedHubId: nearest.id,
     matchedHubName: nearest.name,
@@ -288,8 +311,16 @@ const applyHubSellPrice = (service: any, sellPrice: string | null | undefined) =
   };
 };
 
-const withHubPricing = (service: any, reachability: CatalogReachability) =>
-  applyHubSellPrice(service, reachability.priceByServiceId.get(service.id));
+const withHubPricing = (service: any, reachability: CatalogReachability) => {
+  const priced = applyHubSellPrice(service, reachability.priceByServiceId.get(service.id));
+  if (!Array.isArray(priced.packages) || reachability.packageIds.size === 0) {
+    return { ...priced, packages: [] };
+  }
+  return {
+    ...priced,
+    packages: priced.packages.filter((pkg: any) => reachability.packageIds.has(pkg.id)),
+  };
+};
 
 const parseRequestedIds = (raw: unknown): string[] => {
   const values = Array.isArray(raw) ? raw : typeof raw === 'string' ? raw.split(',') : [];
@@ -676,10 +707,14 @@ export const getCatalogServiceById = async (req: Request, res: Response): Promis
       return;
     }
 
+    const priced = withHubPricing(service, reachability);
     const availableAtHub =
-      reachability.inServiceArea && reachability.serviceIds.has(service.id);
+      reachability.inServiceArea &&
+      reachability.serviceIds.has(service.id) &&
+      Array.isArray(priced.packages) &&
+      priced.packages.length > 0;
     const resultData = {
-      service: withHubPricing(service, reachability),
+      service: priced,
       coverage: coveragePayload(reachability),
       availableAtHub,
       availabilityMessage: availableAtHub ? null : 'Currently not available',

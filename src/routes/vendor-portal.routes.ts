@@ -99,10 +99,12 @@ import {
   vendorSetCatalogAssignments,
   vendorListHubPackages,
   vendorSetHubPackageCrew,
+  vendorSetHubPackageAvailability,
   vendorSetHubServiceAvailability,
   setEmployeeCatalogSchema,
   setCatalogAssignmentsSchema,
   setHubPackageCrewSchema,
+  setHubPackageAvailabilitySchema,
   setHubServiceAvailabilitySchema,
 } from '../controllers/tag.controller';
 import {
@@ -223,6 +225,13 @@ router.put(
   requireHubContext,
   validate(setHubPackageCrewSchema),
   vendorSetHubPackageCrew
+);
+router.put(
+  '/hub-packages/availability',
+  requireRole('OPERATIONS_MANAGER'),
+  requireHubContext,
+  validate(setHubPackageAvailabilitySchema),
+  vendorSetHubPackageAvailability
 );
 router.put(
   '/hub-services/availability',

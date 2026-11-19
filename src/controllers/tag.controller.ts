@@ -34,6 +34,13 @@ export const setHubPackageCrewSchema = z.object({
   requiredProfessionals: z.number().int().min(1).max(4),
 });
 
+/** Package-level hub-radius availability (BOM Assign tab). Off until explicitly enabled. */
+export const setHubPackageAvailabilitySchema = z.object({
+  packageId: z.string().uuid(),
+  isActive: z.boolean(),
+});
+
+/** @deprecated Prefer setHubPackageAvailabilitySchema — kept for older app builds. */
 export const setHubServiceAvailabilitySchema = z.object({
   serviceId: z.string().uuid(),
   isActive: z.boolean(),
@@ -908,12 +915,21 @@ export const vendorListHubPackages = async (req: Request, res: Response): Promis
           duration: pkg.duration,
           requiredProfessionals: cfgMap.get(pkg.id)?.requiredProfessionals ?? 1,
           employeeCount,
-          /** Hub-radius availability — false means customers see "Currently not available". */
-          isActive: vs.isActive !== false,
-          availabilityMessage: vs.isActive === false ? 'Currently not available' : null,
+          /**
+           * Package hub-radius availability. Off by default until BOM enables it
+           * (missing HubPackageConfig or isActive=false → unavailable).
+           */
+          isActive: cfgMap.get(pkg.id)?.isActive === true,
+          availabilityMessage:
+            cfgMap.get(pkg.id)?.isActive === true ? null : 'Currently not available',
         };
       })
     );
+    // Enabled packages first so the Assign tab can pin them to the top.
+    packages.sort((a, b) => {
+      if (a.isActive !== b.isActive) return a.isActive ? -1 : 1;
+      return String(a.packageName).localeCompare(String(b.packageName));
+    });
     sendSuccess(res, packages);
   } catch (err) {
     console.error(err);
@@ -945,12 +961,13 @@ export const vendorSetHubPackageCrew = async (req: Request, res: Response): Prom
         vendorId,
         packageId,
         requiredProfessionals,
+        // Crew size alone must not enable the package for customers.
+        isActive: false,
         updatedBy: req.user!.userId,
       },
       update: {
         requiredProfessionals,
         updatedBy: req.user!.userId,
-        isActive: true,
       },
     });
 
@@ -973,7 +990,85 @@ export const vendorSetHubPackageCrew = async (req: Request, res: Response): Prom
   }
 };
 
-/** Pause / resume a catalog service for this hub's service radius (VendorService.isActive). */
+/** Enable / pause a package for this hub's service radius (HubPackageConfig.isActive). */
+export const vendorSetHubPackageAvailability = async (req: Request, res: Response): Promise<void> => {
+  try {
+    assertBomWriter(req);
+    const vendorId = (req as any).hubVendorId as string;
+    const { packageId, isActive } = req.body as z.infer<typeof setHubPackageAvailabilitySchema>;
+
+    const assigned = await prisma.vendorService.findFirst({
+      where: {
+        vendorId,
+        service: { packages: { some: { id: packageId } } },
+      },
+      select: { id: true, serviceId: true },
+    });
+    if (!assigned) {
+      sendError(res, 'BAD_REQUEST', 'Package is not assigned to this hub', 400);
+      return;
+    }
+
+    const existing = await prisma.hubPackageConfig.findUnique({
+      where: { vendorId_packageId: { vendorId, packageId } },
+      select: { requiredProfessionals: true },
+    });
+
+    const updated = await prisma.hubPackageConfig.upsert({
+      where: { vendorId_packageId: { vendorId, packageId } },
+      create: {
+        vendorId,
+        packageId,
+        requiredProfessionals: existing?.requiredProfessionals ?? 1,
+        isActive,
+        updatedBy: req.user!.userId,
+      },
+      update: {
+        isActive,
+        updatedBy: req.user!.userId,
+      },
+      select: {
+        packageId: true,
+        isActive: true,
+        requiredProfessionals: true,
+      },
+    });
+
+    // Keep parent VendorService active so hub still owns the catalog link;
+    // customer visibility is gated by HubPackageConfig.isActive per package.
+    if (isActive) {
+      await prisma.vendorService.update({
+        where: { id: assigned.id },
+        data: { isActive: true },
+      });
+    }
+
+    invalidateCatalogCache();
+    emitHubCatalogUpdated(vendorId, {
+      hubId: vendorId,
+      serviceId: assigned.serviceId,
+      packageId: updated.packageId,
+      isActive: updated.isActive,
+      reason: 'availability',
+    });
+
+    sendSuccess(res, {
+      packageId: updated.packageId,
+      serviceId: assigned.serviceId,
+      isActive: updated.isActive,
+      availabilityMessage: updated.isActive ? null : 'Currently not available',
+    });
+  } catch (err: any) {
+    if (err?.status === 403) {
+      sendError(res, err.code || 'FORBIDDEN', err.message, 403);
+      return;
+    }
+    console.error(err);
+    sendError(res, 'INTERNAL_ERROR', 'Failed to update package availability', 500);
+  }
+};
+
+/** @deprecated Older app builds — maps service toggle to enabling/disabling all packages under that service. */
 export const vendorSetHubServiceAvailability = async (req: Request, res: Response): Promise<void> => {
   try {
     assertBomWriter(req);
@@ -982,31 +1077,47 @@ export const vendorSetHubServiceAvailability = async (req: Request, res: Respons
 
     const existing = await prisma.vendorService.findFirst({
       where: { vendorId, serviceId },
-      select: { id: true, isActive: true },
+      select: {
+        id: true,
+        service: { select: { packages: { where: { isActive: true }, select: { id: true } } } },
+      },
     });
     if (!existing) {
       sendError(res, 'BAD_REQUEST', 'Service is not assigned to this hub', 400);
       return;
     }
 
-    const updated = await prisma.vendorService.update({
+    await prisma.vendorService.update({
       where: { id: existing.id },
       data: { isActive },
-      select: { id: true, serviceId: true, isActive: true, vendorId: true },
     });
+
+    for (const pkg of existing.service.packages) {
+      await prisma.hubPackageConfig.upsert({
+        where: { vendorId_packageId: { vendorId, packageId: pkg.id } },
+        create: {
+          vendorId,
+          packageId: pkg.id,
+          requiredProfessionals: 1,
+          isActive,
+          updatedBy: req.user!.userId,
+        },
+        update: { isActive, updatedBy: req.user!.userId },
+      });
+    }
 
     invalidateCatalogCache();
     emitHubCatalogUpdated(vendorId, {
       hubId: vendorId,
-      serviceId: updated.serviceId,
-      isActive: updated.isActive,
+      serviceId,
+      isActive,
       reason: 'availability',
     });
 
     sendSuccess(res, {
-      serviceId: updated.serviceId,
-      isActive: updated.isActive,
-      availabilityMessage: updated.isActive ? null : 'Currently not available',
+      serviceId,
+      isActive,
+      availabilityMessage: isActive ? null : 'Currently not available',
     });
   } catch (err: any) {
     if (err?.status === 403) {
