@@ -36,6 +36,8 @@ import {
   getVendorReviews,
   submitVendorFeedback,
   getVendorFeedback,
+  getHubOrderAvailableSlots,
+  rescheduleHubOrder,
   registerVendorSchema,
   updateVendorProfileSchema,
   uploadDocumentSchema,
@@ -44,6 +46,7 @@ import {
   updateOrderStatusSchema,
   verifyOrderQrSchema,
   createHubBookingSchema,
+  hubRescheduleBookingSchema,
   uploadBeforePhotosSchema,
   uploadCompletionPhotosSchema,
   recordCashSchema,
@@ -150,6 +153,8 @@ router.get('/orders', getVendorOrders);
 router.post('/orders', validate(vendorInquirySchema), createVendorInquiry);
 router.post('/hub-bookings', validate(createHubBookingSchema), createHubBooking);
 router.get('/orders/:id', getVendorOrderById);
+router.get('/orders/:id/available-slots', getHubOrderAvailableSlots);
+router.post('/orders/:id/reschedule', validate(hubRescheduleBookingSchema), rescheduleHubOrder);
 router.patch('/orders/:id/status', validate(updateOrderStatusSchema), updateOrderStatus);
 router.post('/orders/:id/status', validate(updateOrderStatusSchema), updateOrderStatus);
 router.post('/orders/:id/verify-otp', validate(verifyOrderQrSchema), verifyOrderOtp);

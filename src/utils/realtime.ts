@@ -112,6 +112,10 @@ export interface BookingRealtimeEvent {
   vendorId?: string | null;
   /** Machine-readable cause, e.g. EXPERT_ASSIGNED, EXPERT_ACCEPTED, NO_EXPERT_AVAILABLE. */
   reason?: string;
+  scheduledDate?: string | null;
+  scheduledTimeSlot?: string | null;
+  scheduledStartAt?: string | null;
+  scheduledEndAt?: string | null;
   booking?: any;
 }
 
@@ -141,6 +145,10 @@ const sanitizeBookingPayload = (payload: BookingRealtimeEvent): BookingRealtimeE
   status: payload.status,
   vendorId: payload.vendorId,
   reason: payload.reason,
+  scheduledDate: payload.scheduledDate ?? null,
+  scheduledTimeSlot: payload.scheduledTimeSlot ?? null,
+  scheduledStartAt: payload.scheduledStartAt ?? null,
+  scheduledEndAt: payload.scheduledEndAt ?? null,
 });
 
 export const emitBookingEvent = (
@@ -156,11 +164,19 @@ export const emitBookingEvent = (
     // 1. Super Admin dashboard room only (never a global broadcast).
     ioInstance.to('admins').emit(event, payload);
 
-    // 2. Party rooms (vendor owner, employee, customer) receive identifiers + status only.
+    // 2. Party rooms (vendor owner, employee, customer, hub staff) receive identifiers + status only.
     const safe = sanitizeBookingPayload(payload);
     const validUserIds = new Set(userIds.filter(Boolean) as string[]);
     for (const id of validUserIds) {
       ioInstance.to(`user:${id}`).emit(event, safe);
+    }
+
+    // 3. Hub room + booking room so BOM desks and open job screens refresh together.
+    if (payload.vendorId) {
+      ioInstance.to(hubRoom(payload.vendorId)).emit(event, safe);
+    }
+    if (payload.bookingId) {
+      ioInstance.to(bookingRoom(payload.bookingId)).emit(event, safe);
     }
 
     logger.info(
@@ -205,16 +221,53 @@ export async function emitBookingRefresh(
         bookingNumber: true,
         status: true,
         vendorId: true,
-        vendor: { select: { userId: true } },
+        scheduledDate: true,
+        scheduledTimeSlot: true,
+        scheduledStartAt: true,
+        scheduledEndAt: true,
+        vendor: {
+          select: {
+            userId: true,
+            managers: {
+              where: { user: { deletedAt: null, status: 'ACTIVE' } },
+              select: { userId: true },
+            },
+          },
+        },
         employee: { select: { userId: true } },
+        helperEmployee: { select: { userId: true } },
         customer: { select: { userId: true } },
+        crewMembers: {
+          where: { status: 'ASSIGNED' },
+          select: { employee: { select: { userId: true } } },
+        },
       },
     });
     if (!b) return;
+    const crewUserIds = b.crewMembers.map((row) => row.employee?.userId);
+    const managerUserIds = b.vendor?.managers.map((m) => m.userId) ?? [];
     emitBookingEvent(
       'booking:updated',
-      { bookingId: b.id, bookingNumber: b.bookingNumber, status: b.status, vendorId: b.vendorId, reason: options.reason },
-      [b.vendor?.userId, b.employee?.userId, b.customer.userId, ...(options.extraUserIds ?? [])]
+      {
+        bookingId: b.id,
+        bookingNumber: b.bookingNumber,
+        status: b.status,
+        vendorId: b.vendorId,
+        reason: options.reason,
+        scheduledDate: b.scheduledDate,
+        scheduledTimeSlot: b.scheduledTimeSlot,
+        scheduledStartAt: b.scheduledStartAt?.toISOString() ?? null,
+        scheduledEndAt: b.scheduledEndAt?.toISOString() ?? null,
+      },
+      [
+        b.vendor?.userId,
+        b.employee?.userId,
+        b.helperEmployee?.userId,
+        b.customer.userId,
+        ...managerUserIds,
+        ...crewUserIds,
+        ...(options.extraUserIds ?? []),
+      ]
     );
   } catch (err) {
     logger.warn({ err }, 'Failed to refresh booking realtime event');

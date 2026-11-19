@@ -37,7 +37,8 @@ const BUSY_STATUSES: BookingStatus[] = [
 async function loadBusyIntervals(
   employeeIds: string[],
   dayStart: Date,
-  dayEnd: Date
+  dayEnd: Date,
+  excludeBookingId?: string | null
 ): Promise<Map<string, Array<{ start: Date; end: Date }>>> {
   const map = new Map<string, Array<{ start: Date; end: Date }>>();
   if (employeeIds.length === 0) return map;
@@ -54,12 +55,14 @@ async function loadBusyIntervals(
       scheduledDate: dayYmd,
     },
   ] as const;
+  const excludeId = excludeBookingId?.trim() || null;
 
   // Split primary-role vs crew queries — nested crewMembers.some is slow on Mongo.
   const [bookings, crewRows] = await Promise.all([
     prisma.booking.findMany({
       where: {
         status: { in: BUSY_STATUSES },
+        ...(excludeId ? { id: { not: excludeId } } : {}),
         OR: [{ employeeId: { in: employeeIds } }, { helperEmployeeId: { in: employeeIds } }],
         AND: [{ OR: [...overlapOr] }],
       },
@@ -76,6 +79,7 @@ async function loadBusyIntervals(
         status: 'ASSIGNED',
         booking: {
           status: { in: BUSY_STATUSES },
+          ...(excludeId ? { id: { not: excludeId } } : {}),
           OR: [...overlapOr],
         },
       },
@@ -246,6 +250,8 @@ export async function generateAvailableSlots(params: {
   durationMinutes: number;
   dateYmd: string;
   now?: Date;
+  /** When rescheduling, ignore this booking so its current slot does not block capacity. */
+  excludeBookingId?: string | null;
 }): Promise<SlotCandidate[]> {
   const now = params.now ?? new Date();
   const dayStart = atLocalTime(params.dateYmd, DAY_START_HOUR);
@@ -284,7 +290,7 @@ export async function generateAvailableSlots(params: {
   const emptyCheckIns = new Map<string, CheckInWindow>();
   const [checkInWindows, busy, activeHolds, completedEarly] = await Promise.all([
     isToday ? loadCheckInWindows(eligibleIds) : Promise.resolve(emptyCheckIns),
-    loadBusyIntervals(eligibleIds, dayStart, busyHorizon),
+    loadBusyIntervals(eligibleIds, dayStart, busyHorizon, params.excludeBookingId),
     prisma.slotHold.findMany({
       where: {
         vendorId: params.vendorId,

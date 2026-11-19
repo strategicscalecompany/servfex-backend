@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { prisma } from '../config/prisma';
 import { sendSuccess, sendError } from '../utils/response';
 import { emitBookingRefresh, emitBookingEvent, emitUserEvent } from '../utils/realtime';
-import { Prisma, BookingStatus, DocumentType } from '@prisma/client';
+import { Prisma, BookingStatus, DocumentType, SlotHoldStatus } from '@prisma/client';
 import { hashPassword } from '../utils/password';
 import { generateAccessToken, generateRefreshToken } from '../utils/token';
 import { sendProviderWelcomeEmail, sendExpertWelcomeEmail } from '../services/email.service';
@@ -47,6 +47,15 @@ import {
   MIN_COMPLETION_PHOTOS,
   uniqueHostedImageUrls,
 } from '../config/testing-workflow';
+import { generateAvailableSlots } from '../services/slot.engine';
+import { resolveBookingDurationMinutes } from '../config/scheduling';
+
+const HUB_RESCHEDULE_STATUSES: BookingStatus[] = [
+  'PENDING',
+  'ACCEPTED',
+  'ASSIGNED',
+  'ON_THE_WAY',
+];
 
 // -------------------------------------------------------------
 // Validation Schemas
@@ -185,6 +194,13 @@ export const createHubBookingSchema = z
     path: ['serviceName'],
   });
 
+export const hubRescheduleBookingSchema = z.object({
+  scheduledDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Scheduled date must be YYYY-MM-DD'),
+  scheduledTimeSlot: z.string().min(3, 'Scheduled time slot is required'),
+  scheduledStartAt: z.string().min(1, 'scheduledStartAt is required'),
+  scheduledEndAt: z.string().min(1, 'scheduledEndAt is required'),
+});
+
 export const uploadCompletionPhotosSchema = z.object({
   image: z.string().min(8).optional(),
   images: z.array(z.string().min(8)).max(12).optional(),
@@ -250,8 +266,27 @@ const ORDER_LIST_INCLUDE = {
       user: { select: { name: true, phone: true, profilePhotoUrl: true } },
     },
   },
-  service: { select: { id: true, name: true, startingPrice: true, durationText: true, imageUrl: true } },
-  package: { select: { id: true, name: true, discountedPrice: true, originalPrice: true, duration: true } },
+  service: {
+    select: {
+      id: true,
+      name: true,
+      startingPrice: true,
+      durationText: true,
+      imageUrl: true,
+      categoryId: true,
+      subCategoryId: true,
+    },
+  },
+  package: {
+    select: {
+      id: true,
+      name: true,
+      discountedPrice: true,
+      originalPrice: true,
+      duration: true,
+      durationMinutes: true,
+    },
+  },
   address: {
     select: {
       id: true,
@@ -3833,6 +3868,323 @@ export const sendCustomerOffer = async (req: Request, res: Response): Promise<vo
         delivered,
       },
       201
+    );
+  } catch (err: any) {
+    sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
+  }
+};
+
+async function findHubScopedBookingForManager(params: {
+  bookingId: string;
+  userId: string;
+  req: Request;
+}) {
+  const actor = await resolvePortalActor(params.userId);
+  if (!actor.isVendor && !actor.isManager) {
+    return { error: { code: 'FORBIDDEN', message: 'Only hub managers can manage booking slots', status: 403 } as const };
+  }
+
+  let hubIds: string[];
+  try {
+    ({ hubIds } = await scopedHubIdsForActor(actor, readRequestedHubVendorId(params.req)));
+  } catch (scopeErr: any) {
+    return {
+      error: {
+        code: scopeErr.code || 'FORBIDDEN',
+        message: scopeErr.message,
+        status: scopeErr.status || 403,
+      } as const,
+    };
+  }
+  if (hubIds.length === 0) {
+    return {
+      error: {
+        code: 'HUB_NOT_ASSIGNED',
+        message: 'This manager is not assigned to a local provider hub yet',
+        status: 403,
+      } as const,
+    };
+  }
+
+  const booking = await prisma.booking.findFirst({
+    where: {
+      id: params.bookingId,
+      vendorId: hubIds.length === 1 ? hubIds[0] : { in: hubIds },
+    },
+    include: {
+      service: {
+        select: {
+          id: true,
+          name: true,
+          durationText: true,
+          categoryId: true,
+          subCategoryId: true,
+        },
+      },
+      package: {
+        select: {
+          id: true,
+          name: true,
+          duration: true,
+          durationMinutes: true,
+        },
+      },
+      employee: { select: { id: true, userId: true } },
+      helperEmployee: { select: { id: true, userId: true } },
+      crewMembers: {
+        where: { status: 'ASSIGNED' },
+        select: { employee: { select: { userId: true } } },
+      },
+    },
+  });
+
+  if (!booking) {
+    return { error: { code: 'NOT_FOUND', message: 'Order not found', status: 404 } as const };
+  }
+
+  return { booking, actor };
+}
+
+export const getHubOrderAvailableSlots = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = req.user!.userId;
+    const id = req.params.id as string;
+    const date = String(req.query.date || '').trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      sendError(res, 'BAD_REQUEST', 'date must be YYYY-MM-DD', 400);
+      return;
+    }
+
+    const scoped = await findHubScopedBookingForManager({ bookingId: id, userId, req });
+    if ('error' in scoped && scoped.error) {
+      sendError(res, scoped.error.code, scoped.error.message, scoped.error.status);
+      return;
+    }
+    const booking = scoped.booking!;
+    if (!booking.service?.categoryId) {
+      sendError(res, 'BAD_REQUEST', 'Booking service is missing category metadata for slots', 400);
+      return;
+    }
+
+    const durationMinutes = resolveBookingDurationMinutes({
+      packageDurationMinutes: booking.package?.durationMinutes,
+      packageDurationText: booking.package?.duration,
+      serviceDurationText: booking.service.durationText,
+    });
+
+    const slots = await generateAvailableSlots({
+      vendorId: booking.vendorId,
+      categoryId: booking.service.categoryId,
+      subCategoryId: booking.service.subCategoryId,
+      packageId: booking.packageId,
+      durationMinutes,
+      dateYmd: date,
+      excludeBookingId: booking.id,
+    });
+
+    sendSuccess(res, {
+      slots: slots.map((s) => ({
+        scheduledDate: s.scheduledDate,
+        scheduledStartAt: s.startAt.toISOString(),
+        scheduledEndAt: s.endAt.toISOString(),
+        scheduledTimeSlot: s.label,
+        slotType: s.slotType,
+        requiredProfessionals: s.requiredProfessionals,
+        availablePros: s.availablePros,
+      })),
+      vendorId: booking.vendorId,
+      durationMinutes,
+      bookingId: booking.id,
+    });
+  } catch (err: any) {
+    sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
+  }
+};
+
+export const rescheduleHubOrder = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = req.user!.userId;
+    const id = req.params.id as string;
+    const { scheduledDate, scheduledTimeSlot, scheduledStartAt, scheduledEndAt } = req.body as z.infer<
+      typeof hubRescheduleBookingSchema
+    >;
+
+    const scoped = await findHubScopedBookingForManager({ bookingId: id, userId, req });
+    if ('error' in scoped && scoped.error) {
+      sendError(res, scoped.error.code, scoped.error.message, scoped.error.status);
+      return;
+    }
+    const booking = scoped.booking!;
+
+    if (!HUB_RESCHEDULE_STATUSES.includes(booking.status)) {
+      sendError(
+        res,
+        'CANNOT_RESCHEDULE',
+        `Cannot reschedule a ${booking.status.toLowerCase()} booking`,
+        400
+      );
+      return;
+    }
+
+    const startAt = new Date(scheduledStartAt);
+    const endAt = new Date(scheduledEndAt);
+    if (Number.isNaN(startAt.getTime())) {
+      sendError(res, 'BAD_REQUEST', 'scheduledStartAt must be a valid ISO datetime', 400);
+      return;
+    }
+    if (Number.isNaN(endAt.getTime())) {
+      sendError(res, 'BAD_REQUEST', 'scheduledEndAt must be a valid ISO datetime', 400);
+      return;
+    }
+    if (!(endAt > startAt)) {
+      sendError(res, 'BAD_REQUEST', 'scheduledEndAt must be after scheduledStartAt', 400);
+      return;
+    }
+
+    // Re-check the chosen window is still free in the slot engine (excluding this booking).
+    if (booking.service?.categoryId) {
+      const durationMinutes = resolveBookingDurationMinutes({
+        packageDurationMinutes: booking.package?.durationMinutes,
+        packageDurationText: booking.package?.duration,
+        serviceDurationText: booking.service.durationText,
+      });
+      const freeSlots = await generateAvailableSlots({
+        vendorId: booking.vendorId,
+        categoryId: booking.service.categoryId,
+        subCategoryId: booking.service.subCategoryId,
+        packageId: booking.packageId,
+        durationMinutes,
+        dateYmd: scheduledDate,
+        excludeBookingId: booking.id,
+      });
+      const stillFree = freeSlots.some(
+        (s) =>
+          (s.startAt.getTime() === startAt.getTime() && s.endAt.getTime() === endAt.getTime()) ||
+          (s.scheduledDate === scheduledDate && s.label === scheduledTimeSlot)
+      );
+      if (!stillFree) {
+        sendError(
+          res,
+          'SLOT_UNAVAILABLE',
+          'That slot was just taken. Pick another free slot.',
+          409
+        );
+        return;
+      }
+    }
+
+    if (booking.employeeId || booking.helperEmployeeId) {
+      const conflict = await prisma.booking.findFirst({
+        where: {
+          id: { not: id },
+          OR: [
+            ...(booking.employeeId ? [{ employeeId: booking.employeeId }] : []),
+            ...(booking.helperEmployeeId ? [{ helperEmployeeId: booking.helperEmployeeId }] : []),
+            ...(booking.employeeId ? [{ helperEmployeeId: booking.employeeId }] : []),
+            ...(booking.helperEmployeeId ? [{ employeeId: booking.helperEmployeeId }] : []),
+          ],
+          status: { in: HUB_RESCHEDULE_STATUSES },
+          AND: [
+            {
+              OR: [
+                {
+                  scheduledStartAt: { lt: endAt },
+                  scheduledEndAt: { gt: startAt },
+                },
+                {
+                  scheduledStartAt: null,
+                  scheduledDate,
+                  scheduledTimeSlot,
+                },
+              ],
+            },
+          ],
+        },
+        select: { id: true, bookingNumber: true },
+      });
+      if (conflict) {
+        sendError(
+          res,
+          'CONCURRENT_BOOKING_CONFLICT',
+          `The assigned technician already has a booking overlapping ${scheduledDate} ${scheduledTimeSlot}`,
+          409
+        );
+        return;
+      }
+    }
+
+    const previousSlot = `${booking.scheduledDate} (${booking.scheduledTimeSlot})`;
+    const updated = await prisma.$transaction(async (tx) => {
+      // Drop any leftover ACTIVE hold — capacity now comes from the booking row itself.
+      if (booking.slotHoldId) {
+        await tx.slotHold.updateMany({
+          where: {
+            id: booking.slotHoldId,
+            status: SlotHoldStatus.ACTIVE,
+          },
+          data: { status: SlotHoldStatus.RELEASED },
+        });
+      }
+
+      const b = await tx.booking.update({
+        where: { id },
+        data: {
+          scheduledDate,
+          scheduledTimeSlot,
+          scheduledStartAt: startAt,
+          scheduledEndAt: endAt,
+          slotHoldId: null,
+          statusHistory: {
+            create: {
+              oldStatus: booking.status,
+              newStatus: booking.status,
+              changedBy: userId,
+              changedByRole: (scoped.actor?.user?.role as any) || 'OPERATIONS_MANAGER',
+              reason: `Rescheduled from ${previousSlot} to ${scheduledDate} (${scheduledTimeSlot})`,
+            },
+          },
+        },
+        include: ORDER_LIST_INCLUDE,
+      });
+      return b;
+    });
+
+    // Fan-out so BOM desks, assigned pro/helper/crew, partner, and customer all refresh.
+    void emitBookingRefresh(id, { reason: 'RESCHEDULED' });
+
+    const pushTargets = Array.from(
+      new Set(
+        [
+          booking.employee?.userId,
+          booking.helperEmployee?.userId,
+          ...(booking.crewMembers?.map((c) => c.employee?.userId) ?? []),
+        ].filter(Boolean) as string[]
+      )
+    );
+    if (pushTargets.length > 0) {
+      void sendPushToUserIds(pushTargets, {
+        title: 'Booking rescheduled',
+        body: `${updated.bookingNumber || 'Job'} moved to ${scheduledDate} · ${scheduledTimeSlot}`,
+        data: {
+          type: 'BOOKING_RESCHEDULED',
+          bookingId: id,
+          bookingNumber: updated.bookingNumber || '',
+          scheduledDate,
+          scheduledTimeSlot,
+          reason: 'RESCHEDULED',
+        },
+      });
+    }
+
+    sendSuccess(
+      res,
+      {
+        order: sanitizeOrderForViewer(updated, {
+          isVendor: !!scoped.actor?.isVendor,
+          isManager: !!scoped.actor?.isManager,
+        }),
+      },
+      200
     );
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
