@@ -24,6 +24,7 @@ import { generateStartOtp, stripStartOtp } from '../utils/start-otp';
 import {
   beginWorkAfterBeforePhotos,
   computeShiftTiming,
+  onEmployeeLeftActiveFieldJob,
   setLocationSharing,
   verifyStartOtpForExpert,
 } from '../services/execution.service';
@@ -1248,6 +1249,8 @@ export const getManagerDashboard = async (req: Request, res: Response): Promise<
               { hubCheckedInAt: { not: null } },
               { lastHubCheckInAt: { gte: startOfToday } },
               { lastHubCheckOutAt: { gte: startOfToday } },
+              { lateCheckInRequestedAt: { gte: startOfToday } },
+              { lateWorkerFlaggedAt: { gte: startOfToday } },
             ],
           },
           select: {
@@ -1256,8 +1259,11 @@ export const getManagerDashboard = async (req: Request, res: Response): Promise<
             hubCheckedOutAt: true,
             lastHubCheckInAt: true,
             lastHubCheckOutAt: true,
+            lateWorkerFlaggedAt: true,
+            lateCheckInRequestedAt: true,
+            postShiftReturnDeadlineAt: true,
             completedJobs: true,
-            user: { select: { name: true, phone: true } },
+            user: { select: { name: true, phone: true, status: true } },
           },
           orderBy: { hubCheckedInAt: 'desc' },
         }),
@@ -1313,7 +1319,11 @@ export const getManagerDashboard = async (req: Request, res: Response): Promise<
 
     const activeToday = crewToday.map((emp) => {
       const checkedIn = Boolean(emp.hubCheckedInAt);
-      const timing = computeShiftTiming(emp.hubCheckedInAt || emp.lastHubCheckInAt);
+      const timing = computeShiftTiming(
+        emp.hubCheckedInAt || emp.lastHubCheckInAt,
+        new Date(),
+        emp.postShiftReturnDeadlineAt
+      );
       let workedHours = timing.workedHours;
       if (!checkedIn && emp.lastHubCheckInAt && emp.lastHubCheckOutAt) {
         const inMs = new Date(emp.lastHubCheckInAt).getTime();
@@ -1322,6 +1332,7 @@ export const getManagerDashboard = async (req: Request, res: Response): Promise<
           workedHours = Math.round(((outMs - inMs) / (1000 * 60 * 60)) * 10) / 10;
         }
       }
+      const suspended = emp.user.status === 'SUSPENDED';
       return {
         employeeId: emp.id,
         name: emp.user.name,
@@ -1332,6 +1343,10 @@ export const getManagerDashboard = async (req: Request, res: Response): Promise<
         completedOrdersToday: completedTodayByEmployee.get(emp.id) || 0,
         hubCheckedInAt: emp.hubCheckedInAt,
         lastHubCheckOutAt: emp.lastHubCheckOutAt,
+        isLateWorker: Boolean(emp.lateWorkerFlaggedAt),
+        lateCheckInRequested: Boolean(emp.lateCheckInRequestedAt) && !checkedIn,
+        isSuspended: suspended,
+        hasAttendanceRedFlag: Boolean(emp.lateWorkerFlaggedAt) && suspended,
       };
     });
 
@@ -1874,6 +1889,10 @@ export const updateOrderStatus = async (req: Request, res: Response): Promise<vo
       return b;
     }, { maxWait: 10000, timeout: 20000 });
 
+    if (['AWAITING_CUSTOMER_CONFIRMATION', 'AWAITING_PAYMENT', 'COMPLETED', 'CANCELLED'].includes(status)) {
+      void onEmployeeLeftActiveFieldJob(updated.employeeId);
+      void onEmployeeLeftActiveFieldJob(updated.helperEmployeeId);
+    }
     void emitBookingRefresh(id);
     sendSuccess(res, { order: updated }, 200);
   } catch (err: any) {
@@ -2307,6 +2326,8 @@ export const completeOrder = async (req: Request, res: Response): Promise<void> 
     });
 
     await setLocationSharing(id, false);
+    void onEmployeeLeftActiveFieldJob(updated?.employeeId);
+    void onEmployeeLeftActiveFieldJob(updated?.helperEmployeeId);
     void emitBookingRefresh(id, { reason: 'SERVICE_COMPLETED' });
     sendSuccess(
       res,
@@ -2737,15 +2758,26 @@ export const getVendorEmployees = async (req: Request, res: Response): Promise<v
           const checkedOutToday =
             !checkedIn &&
             Boolean(emp.lastHubCheckOutAt && new Date(emp.lastHubCheckOutAt) >= startOfToday);
-          const timing = computeShiftTiming(emp.hubCheckedInAt || emp.lastHubCheckInAt);
+          const timing = computeShiftTiming(
+            emp.hubCheckedInAt || emp.lastHubCheckInAt,
+            new Date(),
+            emp.postShiftReturnDeadlineAt
+          );
+          const suspended = emp.user?.status === 'SUSPENDED';
           return {
             ...emp,
             checkedIn,
             checkedOutToday,
             workedHours: timing.workedHours,
             assignable:
-              checkedIn && emp.isAvailable !== false && emp.acceptingRequests !== false,
-            isLateWorker: checkedIn && Boolean(emp.lateWorkerFlaggedAt),
+              checkedIn &&
+              !suspended &&
+              emp.isAvailable !== false &&
+              emp.acceptingRequests !== false,
+            isLateWorker: Boolean(emp.lateWorkerFlaggedAt),
+            lateCheckInRequested: Boolean(emp.lateCheckInRequestedAt) && !checkedIn,
+            isSuspended: suspended,
+            hasAttendanceRedFlag: Boolean(emp.lateWorkerFlaggedAt) && suspended,
             lastLatitude: emp.lastLatitude ?? null,
             lastLongitude: emp.lastLongitude ?? null,
             lastLocationAt: emp.lastLocationAt ?? null,
@@ -2780,7 +2812,7 @@ export const getEmployeeDayBoard = async (req: Request, res: Response): Promise<
     const emp = await prisma.employeeProfile.findFirst({
       where: { id: employeeId, vendorId: { in: hubIds } },
       include: {
-        user: { select: { id: true, name: true, phone: true, email: true } },
+        user: { select: { id: true, name: true, phone: true, email: true, status: true } },
         vendor: { select: { id: true, companyName: true, warehouseName: true } },
       },
     });
@@ -2842,10 +2874,11 @@ export const getEmployeeDayBoard = async (req: Request, res: Response): Promise<
       ['ON_THE_WAY', 'ARRIVED', 'IN_PROGRESS', 'AWAITING_CUSTOMER_CONFIRMATION'].includes(b.status)
     );
 
-    const timing = computeShiftTiming(emp.hubCheckedInAt);
+    const timing = computeShiftTiming(emp.hubCheckedInAt, new Date(), emp.postShiftReturnDeadlineAt);
     const checkedIn = Boolean(emp.hubCheckedInAt);
     const checkedOutToday =
       !checkedIn && Boolean(emp.lastHubCheckOutAt && new Date(emp.lastHubCheckOutAt) >= startOfToday);
+    const suspended = emp.user.status === 'SUSPENDED';
 
     sendSuccess(res, {
       employee: {
@@ -2858,13 +2891,17 @@ export const getEmployeeDayBoard = async (req: Request, res: Response): Promise<
         hubName: emp.vendor.warehouseName || emp.vendor.companyName,
         checkedIn,
         checkedOutToday,
-        isLateWorker: checkedIn && Boolean(emp.lateWorkerFlaggedAt),
+        isLateWorker: Boolean(emp.lateWorkerFlaggedAt),
+        lateCheckInRequested: Boolean(emp.lateCheckInRequestedAt) && !checkedIn,
+        isSuspended: suspended,
+        hasAttendanceRedFlag: Boolean(emp.lateWorkerFlaggedAt) && suspended,
         workedHours: timing.workedHours,
         lastLatitude: emp.lastLatitude,
         lastLongitude: emp.lastLongitude,
         lastLocationAt: emp.lastLocationAt,
         hubCheckedInAt: emp.hubCheckedInAt,
         lastHubCheckOutAt: emp.lastHubCheckOutAt,
+        postShiftReturnDeadlineAt: emp.postShiftReturnDeadlineAt,
       },
       activeOrder: activeRaw ? mapOrder(activeRaw) : null,
       todayOrders: today,

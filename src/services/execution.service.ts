@@ -1,6 +1,7 @@
 import { BookingStatus } from '@prisma/client';
 import { prisma } from '../config/prisma';
 import { env } from '../config/env';
+import { atLocalTime, ymdInBookingTz } from '../config/scheduling';
 import { DispatchError } from './dispatch.errors';
 import {
   CHATTABLE_STATUSES,
@@ -11,18 +12,53 @@ import {
   haversineKm,
   isValidCoordinate,
 } from './dispatch.rules';
+import {
+  generateCompletionOtp,
+  generateStartOtp,
+  isValidCompletionOtp,
+  isValidStartOtp,
+  normalizeCompletionOtp,
+  normalizeStartOtp,
+} from '../utils/start-otp';
+import { buildUpiPaymentUri, formatRupeeAmount, isValidUpiId, isValidUtr, normalizeUpiId, normalizeUtr } from '../utils/upi';
+import { getDrivingDirections } from './directions.service';
+import { emitBookingRefresh, emitToBookingRoom, emitUserEvent } from '../utils/realtime';
+import { notifyUsers } from './notify.service';
 
 const DEFAULT_WORK_RADIUS_METERS = 200;
-/** Planned 10-hour day (09:00–19:00). Checkout allowed after last job even if before 10h when ops ends early. */
+/** Checkout allowed anytime after check-in once jobs are done (ops may end early). */
 const MIN_SHIFT_HOURS = 0;
 /** Mandatory online cycle after check-in. */
 export const SHIFT_HOURS = 10;
-/** Kept for compatibility; late checkout is notified to HOM instead of a 2h grace flag. */
-export const GRACE_HOURS = 0;
+/** Minutes after shift end (or last job while overdue) to return and check out. */
+export const POST_SHIFT_RETURN_MINUTES = 30;
+/** @deprecated Use POST_SHIFT_RETURN_MINUTES; kept for older clients reading graceHours. */
+export const GRACE_HOURS = POST_SHIFT_RETURN_MINUTES / 60;
 export const CHECK_IN_START_HOUR = 9;
 export const CHECK_IN_GRACE_MINUTES = 30;
+export const ACTIVE_FIELD_JOB_STATUSES = ['ON_THE_WAY', 'ARRIVED', 'IN_PROGRESS'] as const;
 
-export function computeShiftTiming(hubCheckedInAt: Date | string | null | undefined, now: Date = new Date()) {
+export type CheckInWindowPhase = 'too_early' | 'open' | 'late';
+
+export function getCheckInWindowBounds(now: Date = new Date()) {
+  const ymd = ymdInBookingTz(now);
+  const windowStart = atLocalTime(ymd, CHECK_IN_START_HOUR, 0);
+  const windowEnd = atLocalTime(ymd, CHECK_IN_START_HOUR, CHECK_IN_GRACE_MINUTES);
+  return { ymd, windowStart, windowEnd };
+}
+
+export function classifyCheckInWindow(now: Date = new Date()): CheckInWindowPhase {
+  const { windowStart, windowEnd } = getCheckInWindowBounds(now);
+  if (now < windowStart) return 'too_early';
+  if (now <= windowEnd) return 'open';
+  return 'late';
+}
+
+export function computeShiftTiming(
+  hubCheckedInAt: Date | string | null | undefined,
+  now: Date = new Date(),
+  postShiftReturnDeadlineAt?: Date | string | null
+) {
   if (!hubCheckedInAt) {
     return {
       workedHours: 0,
@@ -37,13 +73,19 @@ export function computeShiftTiming(hubCheckedInAt: Date | string | null | undefi
   const checkInMs = new Date(hubCheckedInAt).getTime();
   const workedHours = (now.getTime() - checkInMs) / (1000 * 60 * 60);
   const shiftEndsAt = new Date(checkInMs + SHIFT_HOURS * 60 * 60 * 1000);
-  const graceEndsAt = new Date(checkInMs + (SHIFT_HOURS + GRACE_HOURS) * 60 * 60 * 1000);
   const isShiftOverdue = workedHours >= SHIFT_HOURS;
-  const isInGrace = isShiftOverdue && workedHours < SHIFT_HOURS + GRACE_HOURS;
+  const deadline = postShiftReturnDeadlineAt
+    ? new Date(postShiftReturnDeadlineAt)
+    : isShiftOverdue
+      ? new Date(shiftEndsAt.getTime() + POST_SHIFT_RETURN_MINUTES * 60 * 1000)
+      : null;
+  const isInGrace = Boolean(
+    isShiftOverdue && deadline && now.getTime() < deadline.getTime()
+  );
   return {
     workedHours: Math.round(workedHours * 10) / 10,
     shiftEndsAt,
-    graceEndsAt,
+    graceEndsAt: deadline,
     isShiftOverdue,
     isInGrace,
     needsReturnToHub: isShiftOverdue,
@@ -54,18 +96,52 @@ export function computeShiftTiming(hubCheckedInAt: Date | string | null | undefi
 export function isLateWorkerFlagged(lateWorkerFlaggedAt: Date | string | null | undefined): boolean {
   return Boolean(lateWorkerFlaggedAt);
 }
-import {
-  generateCompletionOtp,
-  generateStartOtp,
-  isValidCompletionOtp,
-  isValidStartOtp,
-  normalizeCompletionOtp,
-  normalizeStartOtp,
-} from '../utils/start-otp';
-import { buildUpiPaymentUri, formatRupeeAmount, isValidUpiId, isValidUtr, normalizeUpiId, normalizeUtr } from '../utils/upi';
-import { getDrivingDirections } from './directions.service';
-import { emitBookingRefresh, emitToBookingRoom, emitUserEvent } from '../utils/realtime';
-import { notifyUsers } from './notify.service';
+
+export async function findActiveFieldJob(employeeProfileId: string) {
+  return prisma.booking.findFirst({
+    where: {
+      OR: [{ employeeId: employeeProfileId }, { helperEmployeeId: employeeProfileId }],
+      status: { in: [...ACTIVE_FIELD_JOB_STATUSES] },
+    },
+    select: { id: true, bookingNumber: true, status: true },
+  });
+}
+
+/** Start (or keep) the 30m return-to-hub window once the pro is overdue and idle. */
+export async function maybeStartPostShiftReturnGrace(employeeProfileId: string, now: Date = new Date()) {
+  const profile = await prisma.employeeProfile.findUnique({
+    where: { id: employeeProfileId },
+    select: {
+      id: true,
+      hubCheckedInAt: true,
+      postShiftReturnDeadlineAt: true,
+    },
+  });
+  if (!profile?.hubCheckedInAt) return null;
+  if (profile.postShiftReturnDeadlineAt) return profile.postShiftReturnDeadlineAt;
+
+  const timing = computeShiftTiming(profile.hubCheckedInAt, now);
+  if (!timing.isShiftOverdue) return null;
+
+  const activeJob = await findActiveFieldJob(employeeProfileId);
+  if (activeJob) return null;
+
+  const deadline = new Date(now.getTime() + POST_SHIFT_RETURN_MINUTES * 60 * 1000);
+  await prisma.employeeProfile.update({
+    where: { id: employeeProfileId },
+    data: { postShiftReturnDeadlineAt: deadline },
+  });
+  return deadline;
+}
+
+/**
+ * Call when a booking leaves active field statuses for an assigned pro.
+ * If they are already past 10h, start the 30m return window.
+ */
+export async function onEmployeeLeftActiveFieldJob(employeeProfileId: string | null | undefined) {
+  if (!employeeProfileId) return;
+  await maybeStartPostShiftReturnGrace(employeeProfileId);
+}
 
 const LOCATION_STATUSES: BookingStatus[] = TRACKABLE_STATUSES;
 
@@ -800,8 +876,11 @@ export async function getHubAttendanceStatus(userId: string) {
       lastHubCheckOutAt: true,
       shiftOverdueNotifiedAt: true,
       lateWorkerFlaggedAt: true,
+      lateCheckInRequestedAt: true,
+      postShiftReturnDeadlineAt: true,
       isAvailable: true,
       acceptingRequests: true,
+      user: { select: { status: true } },
       vendor: {
         select: {
           id: true,
@@ -817,11 +896,13 @@ export async function getHubAttendanceStatus(userId: string) {
   if (!profile) throw new DispatchError('FORBIDDEN', 'Only Working Professionals and Sales Managers can use hub attendance', 403);
   const workRadiusMeters = profile.workRadiusMeters > 0 ? profile.workRadiusMeters : DEFAULT_WORK_RADIUS_METERS;
   const checkedIn = Boolean(profile.hubCheckedInAt);
-  const timing = computeShiftTiming(profile.hubCheckedInAt);
+  const timing = computeShiftTiming(profile.hubCheckedInAt, new Date(), profile.postShiftReturnDeadlineAt);
   const isLateWorker = isLateWorkerFlagged(profile.lateWorkerFlaggedAt);
+  const phase = classifyCheckInWindow();
+  const suspended = profile.user.status === 'SUSPENDED';
   return {
     checkedIn,
-    canGoOnline: checkedIn,
+    canGoOnline: checkedIn && !suspended,
     workRadiusMeters,
     hubServiceRadiusKm: profile.vendor.serviceRadiusKm ?? 15,
     hub: {
@@ -839,16 +920,51 @@ export async function getHubAttendanceStatus(userId: string) {
     minShiftHours: MIN_SHIFT_HOURS,
     shiftHours: SHIFT_HOURS,
     graceHours: GRACE_HOURS,
+    postShiftReturnMinutes: POST_SHIFT_RETURN_MINUTES,
     shiftEndsAt: timing.shiftEndsAt,
     graceEndsAt: timing.graceEndsAt,
+    postShiftReturnDeadlineAt: profile.postShiftReturnDeadlineAt,
     isShiftOverdue: checkedIn && timing.isShiftOverdue,
     isInGrace: checkedIn && timing.isInGrace,
     needsReturnToHub: checkedIn && timing.needsReturnToHub,
-    isLateWorker: checkedIn && isLateWorker,
+    isLateWorker: (checkedIn && isLateWorker) || Boolean(profile.lateWorkerFlaggedAt && suspended),
     canCheckOut: checkedIn && timing.canCheckOut,
     isAvailable: profile.isAvailable,
     acceptingRequests: profile.acceptingRequests,
+    checkInWindowPhase: phase,
+    canSelfCheckIn: !checkedIn && !suspended && phase === 'open',
+    canRequestLateCheckIn: !checkedIn && !suspended && phase === 'late' && !profile.lateCheckInRequestedAt,
+    lateCheckInRequested: Boolean(profile.lateCheckInRequestedAt) && !checkedIn,
+    lateCheckInRequestedAt: profile.lateCheckInRequestedAt,
+    checkInWindowLabel: '09:00 – 09:30 IST',
+    isSuspended: suspended,
   };
+}
+
+async function assertInsideHubRadius(
+  profile: {
+    workRadiusMeters: number;
+    vendor: { latitude: number | null; longitude: number | null; companyName: string };
+  },
+  latitude: number,
+  longitude: number,
+  action: 'check in' | 'check out' | 'request late check-in'
+) {
+  const hubLat = profile.vendor.latitude;
+  const hubLng = profile.vendor.longitude;
+  if (!isValidCoordinate(hubLat, hubLng)) {
+    throw new DispatchError('HUB_LOCATION_MISSING', 'Hub GPS is not set. Ask Super Admin / Development Manager to pin the hub.', 409);
+  }
+  const radiusM = profile.workRadiusMeters > 0 ? profile.workRadiusMeters : DEFAULT_WORK_RADIUS_METERS;
+  const distanceM = metersBetween(latitude, longitude, hubLat as number, hubLng as number);
+  if (distanceM > radiusM) {
+    throw new DispatchError(
+      'OUTSIDE_HUB_RADIUS',
+      `You must be within ${Math.round(radiusM)} m of ${profile.vendor.companyName} to ${action}. You are about ${Math.round(distanceM)} m away.`,
+      409
+    );
+  }
+  return { radiusM, distanceM };
 }
 
 export async function hubCheckIn(userId: string, latitude: number, longitude: number) {
@@ -861,33 +977,38 @@ export async function hubCheckIn(userId: string, latitude: number, longitude: nu
       id: true,
       workRadiusMeters: true,
       hubCheckedInAt: true,
+      user: { select: { status: true } },
       vendor: { select: { latitude: true, longitude: true, companyName: true } },
     },
   });
   if (!profile) throw new DispatchError('FORBIDDEN', 'Only Working Professionals and Sales Managers can check in', 403);
+  if (profile.user.status === 'SUSPENDED') {
+    throw new DispatchError('ACCOUNT_SUSPENDED', 'Your account is suspended. Contact your Business Operation Manager.', 403);
+  }
   if (profile.hubCheckedInAt) {
     return getHubAttendanceStatus(userId);
   }
-  const hubLat = profile.vendor.latitude;
-  const hubLng = profile.vendor.longitude;
-  if (!isValidCoordinate(hubLat, hubLng)) {
-    throw new DispatchError('HUB_LOCATION_MISSING', 'Hub GPS is not set. Ask Super Admin / Development Manager to pin the hub.', 409);
-  }
-  const radiusM = profile.workRadiusMeters > 0 ? profile.workRadiusMeters : DEFAULT_WORK_RADIUS_METERS;
-  const distanceM = metersBetween(latitude, longitude, hubLat as number, hubLng as number);
-  if (distanceM > radiusM) {
+
+  const phase = classifyCheckInWindow();
+  if (phase === 'too_early') {
     throw new DispatchError(
-      'OUTSIDE_HUB_RADIUS',
-      `You must be within ${Math.round(radiusM)} m of ${profile.vendor.companyName} to check in. You are about ${Math.round(distanceM)} m away.`,
+      'TOO_EARLY',
+      'Hub check-in opens at 09:00 IST. Please wait until the window starts.',
       409
     );
   }
-  const now = new Date();
-  const checkInDeadline = new Date(now);
-  checkInDeadline.setHours(CHECK_IN_START_HOUR, CHECK_IN_GRACE_MINUTES, 0, 0);
-  const lateCheckIn = now > checkInDeadline;
+  if (phase === 'late') {
+    throw new DispatchError(
+      'LATE_CHECK_IN_REQUIRED',
+      'Self check-in closed after 09:30 IST. Request a late check-in for BOM approval.',
+      409
+    );
+  }
 
-  const full = await prisma.employeeProfile.update({
+  await assertInsideHubRadius(profile, latitude, longitude, 'check in');
+
+  const now = new Date();
+  await prisma.employeeProfile.update({
     where: { id: profile.id },
     data: {
       hubCheckedInAt: now,
@@ -895,26 +1016,101 @@ export async function hubCheckIn(userId: string, latitude: number, longitude: nu
       lastHubCheckInAt: now,
       shiftOverdueNotifiedAt: null,
       lateWorkerFlaggedAt: null,
+      lateCheckInRequestedAt: null,
+      postShiftReturnDeadlineAt: null,
       lastLatitude: latitude,
       lastLongitude: longitude,
       lastLocationAt: now,
       isAvailable: true,
       acceptingRequests: true,
     },
-    include: {
-      user: { select: { name: true } },
-      vendor: { select: { userId: true, companyName: true } },
-    },
   });
 
-  if (lateCheckIn && full.vendor?.userId) {
-    const { notifyUsers } = await import('./notify.service');
-    void notifyUsers(
-      [full.vendor.userId],
-      'Late hub check-in',
-      `${full.user.name} checked in after 09:30 at ${full.vendor.companyName}.`,
-      { type: 'attendance:late_check_in', employeeUserId: userId }
+  return getHubAttendanceStatus(userId);
+}
+
+/** After 09:30 IST: pro requests BOM force check-in (cannot self check-in). */
+export async function requestLateHubCheckIn(userId: string, latitude: number, longitude: number) {
+  if (!isValidCoordinate(latitude, longitude)) {
+    throw new DispatchError('BAD_REQUEST', 'Valid GPS coordinates are required for late check-in request', 400);
+  }
+  const profile = await prisma.employeeProfile.findUnique({
+    where: { userId },
+    select: {
+      id: true,
+      workRadiusMeters: true,
+      hubCheckedInAt: true,
+      lateCheckInRequestedAt: true,
+      user: { select: { name: true, status: true } },
+      vendor: {
+        select: {
+          latitude: true,
+          longitude: true,
+          companyName: true,
+          userId: true,
+          managers: {
+            where: { kind: 'OPERATIONS' },
+            select: { userId: true },
+          },
+        },
+      },
+    },
+  });
+  if (!profile) throw new DispatchError('FORBIDDEN', 'Only Working Professionals and Sales Managers can request late check-in', 403);
+  if (profile.user.status === 'SUSPENDED') {
+    throw new DispatchError('ACCOUNT_SUSPENDED', 'Your account is suspended. Contact your Business Operation Manager.', 403);
+  }
+  if (profile.hubCheckedInAt) {
+    return getHubAttendanceStatus(userId);
+  }
+
+  const phase = classifyCheckInWindow();
+  if (phase === 'too_early') {
+    throw new DispatchError('TOO_EARLY', 'Late check-in requests open after 09:30 IST.', 409);
+  }
+  if (phase === 'open') {
+    throw new DispatchError(
+      'CHECK_IN_WINDOW_OPEN',
+      'Check-in window is still open until 09:30 IST. Use Check in at hub.',
+      409
     );
+  }
+
+  await assertInsideHubRadius(profile, latitude, longitude, 'request late check-in');
+
+  const now = new Date();
+  if (!profile.lateCheckInRequestedAt) {
+    await prisma.employeeProfile.update({
+      where: { id: profile.id },
+      data: {
+        lateCheckInRequestedAt: now,
+        lastLatitude: latitude,
+        lastLongitude: longitude,
+        lastLocationAt: now,
+      },
+    });
+
+    const bomIds = [
+      profile.vendor.userId,
+      ...profile.vendor.managers.map((m) => m.userId),
+    ].filter(Boolean) as string[];
+    if (bomIds.length) {
+      void notifyUsers(
+        bomIds,
+        'Late check-in request',
+        `${profile.user.name} missed the 09:00–09:30 window at ${profile.vendor.companyName} and requested late check-in.`,
+        { type: 'attendance:late_check_in_request', employeeUserId: userId, employeeProfileId: profile.id }
+      );
+    }
+  } else {
+    await prisma.employeeProfile.update({
+      where: { id: profile.id },
+      data: {
+        lastLatitude: latitude,
+        lastLongitude: longitude,
+        lastLocationAt: now,
+      },
+    });
   }
 
   return getHubAttendanceStatus(userId);
@@ -937,14 +1133,7 @@ export async function hubCheckOut(userId: string, latitude: number, longitude: n
   if (!profile.hubCheckedInAt) {
     throw new DispatchError('NOT_CHECKED_IN', 'You are not checked in at the hub', 409);
   }
-  // Block checkout while an active field job is still in progress.
-  const activeJob = await prisma.booking.findFirst({
-    where: {
-      OR: [{ employeeId: profile.id }, { helperEmployeeId: profile.id }],
-      status: { in: ['ON_THE_WAY', 'ARRIVED', 'IN_PROGRESS'] },
-    },
-    select: { id: true, bookingNumber: true },
-  });
+  const activeJob = await findActiveFieldJob(profile.id);
   if (activeJob) {
     throw new DispatchError(
       'ACTIVE_JOB',
@@ -953,20 +1142,7 @@ export async function hubCheckOut(userId: string, latitude: number, longitude: n
     );
   }
   void MIN_SHIFT_HOURS;
-  const hubLat = profile.vendor.latitude;
-  const hubLng = profile.vendor.longitude;
-  if (!isValidCoordinate(hubLat, hubLng)) {
-    throw new DispatchError('HUB_LOCATION_MISSING', 'Hub GPS is not set', 409);
-  }
-  const radiusM = profile.workRadiusMeters > 0 ? profile.workRadiusMeters : DEFAULT_WORK_RADIUS_METERS;
-  const distanceM = metersBetween(latitude, longitude, hubLat as number, hubLng as number);
-  if (distanceM > radiusM) {
-    throw new DispatchError(
-      'OUTSIDE_HUB_RADIUS',
-      `Return to within ${Math.round(radiusM)} m of ${profile.vendor.companyName} to check out. You are about ${Math.round(distanceM)} m away.`,
-      409
-    );
-  }
+  await assertInsideHubRadius(profile, latitude, longitude, 'check out');
   const now = new Date();
   await prisma.employeeProfile.update({
     where: { id: profile.id },
@@ -976,6 +1152,8 @@ export async function hubCheckOut(userId: string, latitude: number, longitude: n
       lastHubCheckOutAt: now,
       shiftOverdueNotifiedAt: null,
       lateWorkerFlaggedAt: null,
+      lateCheckInRequestedAt: null,
+      postShiftReturnDeadlineAt: null,
       lastLatitude: latitude,
       lastLongitude: longitude,
       lastLocationAt: now,
@@ -984,6 +1162,80 @@ export async function hubCheckOut(userId: string, latitude: number, longitude: n
     },
   });
   return getHubAttendanceStatus(userId);
+}
+
+/**
+ * Force checkout + suspend for missed post-shift return. Used by attendance sweeper.
+ */
+export async function forceCheckoutAndSuspend(employeeProfileId: string, reason: string) {
+  const profile = await prisma.employeeProfile.findUnique({
+    where: { id: employeeProfileId },
+    select: {
+      id: true,
+      userId: true,
+      hubCheckedInAt: true,
+      user: { select: { name: true } },
+      vendor: {
+        select: {
+          userId: true,
+          companyName: true,
+          managers: {
+            where: { kind: 'OPERATIONS' },
+            select: { userId: true },
+          },
+        },
+      },
+    },
+  });
+  if (!profile?.hubCheckedInAt) return false;
+
+  const now = new Date();
+  await prisma.$transaction([
+    prisma.employeeProfile.update({
+      where: { id: profile.id },
+      data: {
+        hubCheckedInAt: null,
+        hubCheckedOutAt: now,
+        lastHubCheckOutAt: now,
+        shiftOverdueNotifiedAt: now,
+        lateWorkerFlaggedAt: now,
+        lateCheckInRequestedAt: null,
+        postShiftReturnDeadlineAt: null,
+        isAvailable: false,
+        acceptingRequests: false,
+      },
+    }),
+    prisma.user.update({
+      where: { id: profile.userId },
+      data: { status: 'SUSPENDED' },
+    }),
+  ]);
+
+  const name = profile.user?.name?.trim() || 'Working Professional';
+  const bomIds = [
+    profile.vendor.userId,
+    ...profile.vendor.managers.map((m) => m.userId),
+  ].filter(Boolean) as string[];
+
+  void notifyUsers(
+    [profile.userId],
+    'Account suspended — missed hub checkout',
+    `${reason} Contact your Business Operation Manager to clear the red flag.`,
+    { type: 'attendance:force_checkout_suspended' }
+  );
+  if (bomIds.length) {
+    void notifyUsers(
+      bomIds,
+      'Red flag · missed hub checkout',
+      `${name} was force checked out and suspended at ${profile.vendor.companyName}. ${reason} Please call them.`,
+      {
+        type: 'attendance:red_flag_missed_checkout',
+        employeeUserId: profile.userId,
+        employeeProfileId: profile.id,
+      }
+    );
+  }
+  return true;
 }
 
 /** Periodic GPS ping — allowed before check-in so HOM can force check-in when the pro is at the hub. */
@@ -1019,7 +1271,8 @@ export async function pingHubLocation(userId: string, latitude: number, longitud
 const FORCE_CHECKIN_LOCATION_MAX_AGE_MS = 15 * 60 * 1000;
 
 /**
- * HOM force check-in after 09:30 — only when the professional's recent GPS is inside the hub radius.
+ * BOM force check-in after 09:30 — only when the professional's recent GPS is inside the hub radius.
+ * Also clears attendance suspension from a prior missed checkout.
  */
 export async function homForceHubCheckIn(actorUserId: string, employeeProfileId: string) {
   const actor = await prisma.user.findUnique({
@@ -1034,12 +1287,11 @@ export async function homForceHubCheckIn(actorUserId: string, employeeProfileId:
   }
 
   const now = new Date();
-  const gate = new Date(now);
-  gate.setHours(CHECK_IN_START_HOUR, CHECK_IN_GRACE_MINUTES, 0, 0);
-  if (now < gate) {
+  const phase = classifyCheckInWindow(now);
+  if (phase !== 'late') {
     throw new DispatchError(
       'TOO_EARLY',
-      'Force check-in is only available after 09:30. Ask the professional to check in themselves before then.',
+      'Force check-in is only available after 09:30 IST. Ask the professional to check in themselves before then.',
       409
     );
   }
@@ -1056,7 +1308,7 @@ export async function homForceHubCheckIn(actorUserId: string, employeeProfileId:
       lastLongitude: true,
       lastLocationAt: true,
       vendor: { select: { latitude: true, longitude: true, companyName: true } },
-      user: { select: { name: true } },
+      user: { select: { name: true, status: true } },
     },
   });
   if (!profile) throw new DispatchError('NOT_FOUND', 'Professional not found', 404);
@@ -1103,21 +1355,29 @@ export async function homForceHubCheckIn(actorUserId: string, employeeProfileId:
     );
   }
 
-  await prisma.employeeProfile.update({
-    where: { id: profile.id },
-    data: {
-      hubCheckedInAt: now,
-      hubCheckedOutAt: null,
-      lastHubCheckInAt: now,
-      shiftOverdueNotifiedAt: null,
-      lateWorkerFlaggedAt: now, // arrived after 09:30 via HOM
-      lastLatitude: profile.lastLatitude,
-      lastLongitude: profile.lastLongitude,
-      lastLocationAt: now,
-      isAvailable: true,
-      acceptingRequests: true,
-    },
-  });
+  await prisma.$transaction([
+    prisma.employeeProfile.update({
+      where: { id: profile.id },
+      data: {
+        hubCheckedInAt: now,
+        hubCheckedOutAt: null,
+        lastHubCheckInAt: now,
+        shiftOverdueNotifiedAt: null,
+        lateWorkerFlaggedAt: now, // arrived after 09:30 via BOM
+        lateCheckInRequestedAt: null,
+        postShiftReturnDeadlineAt: null,
+        lastLatitude: profile.lastLatitude,
+        lastLongitude: profile.lastLongitude,
+        lastLocationAt: now,
+        isAvailable: true,
+        acceptingRequests: true,
+      },
+    }),
+    prisma.user.update({
+      where: { id: profile.userId },
+      data: { status: 'ACTIVE' },
+    }),
+  ]);
 
   return getHubAttendanceStatus(profile.userId);
 }
@@ -1153,13 +1413,7 @@ export async function homForceHubCheckOut(actorUserId: string, employeeProfileId
 
   await assertHomOwnsEmployeeHub(actor.managerProfile, profile.vendorId);
 
-  const activeJob = await prisma.booking.findFirst({
-    where: {
-      OR: [{ employeeId: profile.id }, { helperEmployeeId: profile.id }],
-      status: { in: ['ON_THE_WAY', 'ARRIVED', 'IN_PROGRESS'] },
-    },
-    select: { id: true, bookingNumber: true },
-  });
+  const activeJob = await findActiveFieldJob(profile.id);
   if (activeJob) {
     throw new DispatchError(
       'ACTIVE_JOB',
@@ -1177,6 +1431,8 @@ export async function homForceHubCheckOut(actorUserId: string, employeeProfileId
       lastHubCheckOutAt: now,
       shiftOverdueNotifiedAt: null,
       lateWorkerFlaggedAt: null,
+      lateCheckInRequestedAt: null,
+      postShiftReturnDeadlineAt: null,
       lastLocationAt: now,
       isAvailable: false,
       acceptingRequests: false,

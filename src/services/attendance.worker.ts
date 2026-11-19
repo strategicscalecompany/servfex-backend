@@ -1,7 +1,17 @@
 import { prisma } from '../config/prisma';
 import { logger } from '../config/logger';
 import { notifyUsers } from './notify.service';
-import { SHIFT_HOURS, CHECK_IN_START_HOUR, CHECK_IN_GRACE_MINUTES } from './execution.service';
+import {
+  SHIFT_HOURS,
+  CHECK_IN_START_HOUR,
+  CHECK_IN_GRACE_MINUTES,
+  POST_SHIFT_RETURN_MINUTES,
+  ACTIVE_FIELD_JOB_STATUSES,
+  computeShiftTiming,
+  forceCheckoutAndSuspend,
+  maybeStartPostShiftReturnGrace,
+} from './execution.service';
+import { ymdInBookingTz, atLocalTime } from '../config/scheduling';
 import { CrewMemberStatus } from '@prisma/client';
 
 const ATTENDANCE_SWEEP_INTERVAL_MS = 60_000;
@@ -11,15 +21,15 @@ let isSweeping = false;
 
 /**
  * Sweep:
- * - After check-in + 10h without checkout: notify pro + HOM once.
- * - After 09:30: flag multi-pro bookings where an assigned crew member never checked in.
+ * - After check-in + 10h with no active job: start 30m return window, then force checkout + suspend.
+ * - Active field jobs skip punish until complete.
+ * - After 09:30 IST: flag multi-pro bookings where an assigned crew member never checked in.
  */
 export async function sweepHubAttendance(clock: () => Date = () => new Date()): Promise<number> {
   if (isSweeping) return 0;
   isSweeping = true;
   try {
     const now = clock();
-    const overdueBefore = new Date(now.getTime() - SHIFT_HOURS * 60 * 60 * 1000);
 
     const checkedIn = await prisma.employeeProfile.findMany({
       where: { hubCheckedInAt: { not: null } },
@@ -28,6 +38,7 @@ export async function sweepHubAttendance(clock: () => Date = () => new Date()): 
         userId: true,
         hubCheckedInAt: true,
         shiftOverdueNotifiedAt: true,
+        postShiftReturnDeadlineAt: true,
         user: { select: { name: true } },
         vendor: {
           select: {
@@ -40,53 +51,109 @@ export async function sweepHubAttendance(clock: () => Date = () => new Date()): 
           },
         },
       },
-      take: 100,
+      take: 200,
       orderBy: { hubCheckedInAt: 'asc' },
     });
 
     let processed = 0;
     for (const emp of checkedIn) {
       if (!emp.hubCheckedInAt) continue;
-      const checkInAt = new Date(emp.hubCheckedInAt);
+      const timing = computeShiftTiming(emp.hubCheckedInAt, now, emp.postShiftReturnDeadlineAt);
+      if (!timing.isShiftOverdue) continue;
+
       const name = emp.user?.name?.trim() || 'Working Professional';
-      const homIds = [
+      const bomIds = [
         emp.vendor.userId,
         ...emp.vendor.managers.map((m) => m.userId),
-      ].filter(Boolean);
+      ].filter(Boolean) as string[];
 
       try {
-        if (!emp.shiftOverdueNotifiedAt && checkInAt <= overdueBefore) {
-          await prisma.employeeProfile.update({
-            where: { id: emp.id },
-            data: { shiftOverdueNotifiedAt: now },
-          });
+        const activeJob = await prisma.booking.findFirst({
+          where: {
+            OR: [{ employeeId: emp.id }, { helperEmployeeId: emp.id }],
+            status: { in: [...ACTIVE_FIELD_JOB_STATUSES] },
+          },
+          select: { id: true, bookingNumber: true },
+        });
 
-          await notifyUsers(
-            [emp.userId],
-            'Please check out at hub',
-            `Your ${SHIFT_HOURS}h day has ended. Return to the hub and check out after finishing your last job.`,
-            { type: 'attendance:shift_overdue' }
-          );
-          if (homIds.length) {
+        // Still on a field job — notify once, never punish yet.
+        if (activeJob) {
+          if (!emp.shiftOverdueNotifiedAt) {
+            await prisma.employeeProfile.update({
+              where: { id: emp.id },
+              data: { shiftOverdueNotifiedAt: now },
+            });
             await notifyUsers(
-              homIds,
-              'Professional has not checked out',
-              `${name} has not checked out after ${SHIFT_HOURS} hours at ${emp.vendor.companyName}.`,
-              { type: 'attendance:missing_checkout', employeeUserId: emp.userId }
+              [emp.userId],
+              'Shift ended — finish current job',
+              `Your ${SHIFT_HOURS}h day ended. Finish booking #${activeJob.bookingNumber}, then return to the hub within ${POST_SHIFT_RETURN_MINUTES} minutes to check out.`,
+              { type: 'attendance:shift_overdue_on_job' }
             );
+            if (bomIds.length) {
+              await notifyUsers(
+                bomIds,
+                'Professional past shift on active job',
+                `${name} is past ${SHIFT_HOURS}h but still on #${activeJob.bookingNumber} at ${emp.vendor.companyName}.`,
+                { type: 'attendance:shift_overdue_on_job', employeeUserId: emp.userId }
+              );
+            }
+            processed++;
           }
-          processed++;
+          continue;
+        }
+
+        // Idle overdue: ensure 30m return deadline exists.
+        // If already past shift+30m (e.g. overnight stuck session), punish immediately.
+        const alreadyPastReturnWindow =
+          timing.workedHours >= SHIFT_HOURS + POST_SHIFT_RETURN_MINUTES / 60;
+
+        let deadline = emp.postShiftReturnDeadlineAt
+          ? new Date(emp.postShiftReturnDeadlineAt)
+          : null;
+        if (!deadline && !alreadyPastReturnWindow) {
+          deadline = (await maybeStartPostShiftReturnGrace(emp.id, now)) || null;
+          if (!emp.shiftOverdueNotifiedAt) {
+            await prisma.employeeProfile.update({
+              where: { id: emp.id },
+              data: { shiftOverdueNotifiedAt: now },
+            });
+            await notifyUsers(
+              [emp.userId],
+              'Return to hub and check out',
+              `Your ${SHIFT_HOURS}h shift ended. You have ${POST_SHIFT_RETURN_MINUTES} minutes to return to the hub and check out.`,
+              { type: 'attendance:shift_overdue' }
+            );
+            if (bomIds.length) {
+              await notifyUsers(
+                bomIds,
+                'Professional has not checked out',
+                `${name} is past ${SHIFT_HOURS}h at ${emp.vendor.companyName} and has ${POST_SHIFT_RETURN_MINUTES}m to return.`,
+                { type: 'attendance:missing_checkout', employeeUserId: emp.userId }
+              );
+            }
+            processed++;
+          }
+        }
+
+        const deadlineElapsed = deadline != null && now.getTime() >= deadline.getTime();
+        if (alreadyPastReturnWindow || deadlineElapsed) {
+          const ok = await forceCheckoutAndSuspend(
+            emp.id,
+            alreadyPastReturnWindow
+              ? `Stayed checked in past ${SHIFT_HOURS}h + ${POST_SHIFT_RETURN_MINUTES}m return window.`
+              : `Missed ${POST_SHIFT_RETURN_MINUTES}-minute return window after a ${SHIFT_HOURS}h shift.`
+          );
+          if (ok) processed++;
         }
       } catch (err) {
         logger.error({ err, employeeId: emp.id }, 'Attendance sweep failed for employee');
       }
     }
 
-    // Missing crew after check-in window (09:30 local)
-    const deadline = new Date(now);
-    deadline.setHours(CHECK_IN_START_HOUR, CHECK_IN_GRACE_MINUTES, 0, 0);
+    // Missing crew after check-in window (09:30 IST)
+    const ymd = ymdInBookingTz(now);
+    const deadline = atLocalTime(ymd, CHECK_IN_START_HOUR, CHECK_IN_GRACE_MINUTES);
     if (now >= deadline) {
-      const ymd = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
       const todaysCrewJobs = await prisma.booking.findMany({
         where: {
           scheduledDate: ymd,
@@ -153,7 +220,7 @@ export function startAttendanceWorker() {
   attendanceTimer = setInterval(() => {
     void sweepHubAttendance();
   }, ATTENDANCE_SWEEP_INTERVAL_MS);
-  logger.info('Hub attendance sweeper started (10h cycle + crew shortfall)');
+  logger.info('Hub attendance sweeper started (10h + 30m return + force suspend)');
 }
 
 export function stopAttendanceWorker() {

@@ -73,6 +73,7 @@ import {
   postHubCheckIn,
   postHubCheckOut,
   postHubLocation,
+  postLateHubCheckInRequest,
   postOrderMessage,
   resolveEscalationSchema,
   resolveEscalationTicket,
@@ -168,6 +169,7 @@ router.post('/orders/:id/confirm-upi', validate(confirmUpiSchema), confirmUpiPay
 router.get('/me/professional', getMyProfessionalProfile);
 router.get('/me/hub-attendance', getMyHubAttendance);
 router.post('/me/hub-check-in', validate(locationPingSchema), postHubCheckIn);
+router.post('/me/hub-check-in/late-request', validate(locationPingSchema), postLateHubCheckInRequest);
 router.post('/me/hub-check-out', validate(locationPingSchema), postHubCheckOut);
 router.post('/me/hub-location', validate(locationPingSchema), postHubLocation);
 router.patch('/me/availability', validate(availabilitySchema), updateMyAvailability);

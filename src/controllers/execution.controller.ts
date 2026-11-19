@@ -14,6 +14,7 @@ import {
   hubCheckOut,
   pingHubLocation,
   pingProfessionalLocation,
+  requestLateHubCheckIn,
   saveProviderUpi,
   setProfessionalAvailability,
 } from '../services/execution.service';
@@ -214,6 +215,20 @@ export const getMyHubAttendance = async (req: Request, res: Response): Promise<v
 export const postHubCheckIn = async (req: Request, res: Response): Promise<void> => {
   try {
     const attendance = await hubCheckIn(
+      req.user!.userId,
+      Number(req.body.latitude),
+      Number(req.body.longitude)
+    );
+    sendSuccess(res, { attendance });
+  } catch (err: any) {
+    if (handleDispatchError(res, err)) return;
+    sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
+  }
+};
+
+export const postLateHubCheckInRequest = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const attendance = await requestLateHubCheckIn(
       req.user!.userId,
       Number(req.body.latitude),
       Number(req.body.longitude)

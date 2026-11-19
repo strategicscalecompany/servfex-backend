@@ -321,10 +321,14 @@ model EmployeeProfile {
   hubCheckedOutAt DateTime?
   lastHubCheckInAt DateTime?
   lastHubCheckOutAt DateTime?
-  /// Set once when the 8h shift overdue notification is sent.
+  /// Set once when the 10h shift overdue notification is sent.
   shiftOverdueNotifiedAt DateTime?
-  /// Set when the 2h grace ends without hub check-out; cleared on successful check-out.
+  /// Set when BOM force-checks in after 09:30, or when attendance punish path red-flags the pro.
   lateWorkerFlaggedAt DateTime?
+  /// Pro requested late check-in after 09:30 IST; cleared on force check-in / checkout.
+  lateCheckInRequestedAt DateTime?
+  /// After 10h shift with no active job (or after last job completes while overdue): must checkout by this time.
+  postShiftReturnDeadlineAt DateTime?
   lastAssignedAt DateTime?
   lastLatitude   Float?
   lastLongitude  Float?
