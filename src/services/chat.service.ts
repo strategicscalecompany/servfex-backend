@@ -7,6 +7,18 @@ import { notifyUsers } from './notify.service';
 const MAX_BODY = 2000;
 const HUB_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
+export async function bookingHasOpenSupportTicket(bookingId: string): Promise<boolean> {
+  const open = await prisma.escalationTicket.findFirst({
+    where: {
+      bookingId,
+      reason: 'CUSTOMER_SUPPORT',
+      status: { in: ['OPEN', 'ACKNOWLEDGED', 'IN_PROGRESS'] },
+    },
+    select: { id: true },
+  });
+  return Boolean(open);
+}
+
 async function hubIdsForOperationsManager(userId: string): Promise<string[]> {
   const user = await prisma.user.findUnique({
     where: { id: userId },
@@ -84,29 +96,45 @@ export async function listBookingMessages(userId: string, bookingId: string, lim
   const { booking } = await resolveChatAccess(userId, bookingId);
 
   const take = Math.min(Math.max(limit, 1), 100);
-  const messages = await prisma.bookingMessage.findMany({
-    where: { bookingId },
-    orderBy: { createdAt: 'asc' },
-    take,
-    select: {
-      id: true,
-      senderUserId: true,
-      senderRole: true,
-      body: true,
-      createdAt: true,
-      readAt: true,
-    },
-  });
-  return { bookingId, status: booking.status, chatAvailable: chatAllowed(booking.status), messages };
+  const [messages, supportOpen] = await Promise.all([
+    prisma.bookingMessage.findMany({
+      where: { bookingId },
+      orderBy: { createdAt: 'asc' },
+      take,
+      select: {
+        id: true,
+        senderUserId: true,
+        senderRole: true,
+        body: true,
+        createdAt: true,
+        readAt: true,
+      },
+    }),
+    bookingHasOpenSupportTicket(bookingId),
+  ]);
+  const available = chatAllowed(booking.status) || supportOpen;
+  return {
+    bookingId,
+    status: booking.status,
+    chatAvailable: available,
+    supportTicket: supportOpen,
+    messages,
+  };
 }
 
-export async function sendBookingMessage(userId: string, bookingId: string, rawBody: unknown) {
+export async function sendBookingMessage(
+  userId: string,
+  bookingId: string,
+  rawBody: unknown,
+  opts?: { forceSupport?: boolean }
+) {
   const body = typeof rawBody === 'string' ? rawBody.trim() : '';
   if (body.length < 1) throw new DispatchError('BAD_REQUEST', 'Message cannot be empty', 400);
   if (body.length > MAX_BODY) throw new DispatchError('BAD_REQUEST', 'Message is too long', 400);
 
   const { booking, role } = await resolveChatAccess(userId, bookingId);
-  if (!chatAllowed(booking.status)) {
+  const supportOpen = opts?.forceSupport || (await bookingHasOpenSupportTicket(bookingId));
+  if (!chatAllowed(booking.status) && !supportOpen) {
     throw new DispatchError('CHAT_NOT_AVAILABLE', `Chat is not available while the booking is ${booking.status}`, 409);
   }
 
@@ -165,6 +193,7 @@ export async function listHubChatInbox(userId: string, hubIds: string[], limit =
       vendorId: { in: hubIds },
       OR: [
         { lastChatAt: { not: null } },
+        { escalations: { some: { reason: 'CUSTOMER_SUPPORT', status: { in: ['OPEN', 'ACKNOWLEDGED', 'IN_PROGRESS'] } } } },
         {
           status: {
             in: [
@@ -201,8 +230,22 @@ export async function listHubChatInbox(userId: string, hubIds: string[], limit =
     },
   });
 
+  const supportOpenIds = new Set(
+    (
+      await prisma.escalationTicket.findMany({
+        where: {
+          bookingId: { in: bookings.map((b) => b.id) },
+          reason: 'CUSTOMER_SUPPORT',
+          status: { in: ['OPEN', 'ACKNOWLEDGED', 'IN_PROGRESS'] },
+        },
+        select: { bookingId: true },
+      })
+    ).map((t) => t.bookingId)
+  );
+
   return bookings.map((b) => {
     const last = b.messages[0] || null;
+    const supportTicket = supportOpenIds.has(b.id);
     return {
       bookingId: b.id,
       bookingNumber: b.bookingNumber,
@@ -216,7 +259,8 @@ export async function listHubChatInbox(userId: string, hubIds: string[], limit =
       lastChatAt: b.lastChatAt?.toISOString() || last?.createdAt?.toISOString() || null,
       lastMessage: last?.body || null,
       lastSenderRole: last?.senderRole || null,
-      chatAvailable: chatAllowed(b.status),
+      chatAvailable: chatAllowed(b.status) || supportTicket,
+      supportTicket,
     };
   });
 }

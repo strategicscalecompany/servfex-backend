@@ -31,6 +31,11 @@ import { consumeSlotHold, SlotHoldError } from '../services/slot.hold';
 import { assignCrewToBooking, pickCrewForSlot } from '../services/crew.assign';
 import { resolveRequiredProfessionals } from '../services/tag.eligibility';
 import { formatTimeSlotLabel } from '../config/scheduling';
+import { DispatchError } from '../services/dispatch.errors';
+import {
+  createCustomerSupportTicket,
+  getCustomerSupportBootstrap,
+} from '../services/support.service';
 
 // -------------------------------------------------------------
 // Validation Schemas
@@ -1551,6 +1556,42 @@ export const reportBookingIssue = async (req: Request, res: Response): Promise<v
     void emitBookingRefresh(id);
     sendSuccess(res, { booking: updated, status: 'DISPUTED' }, 200);
   } catch (err: any) {
+    sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
+  }
+};
+
+export const createSupportTicketSchema = z.object({
+  bookingId: z.string().min(1, 'bookingId is required'),
+  issue: z.string().min(5).max(2000),
+});
+
+export const getCustomerSupport = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const latRaw = typeof req.query.lat === 'string' ? Number(req.query.lat) : NaN;
+    const lngRaw = typeof req.query.lng === 'string' ? Number(req.query.lng) : NaN;
+    const latitude = Number.isFinite(latRaw) ? latRaw : null;
+    const longitude = Number.isFinite(lngRaw) ? lngRaw : null;
+    const data = await getCustomerSupportBootstrap(req.user!.userId, latitude, longitude);
+    sendSuccess(res, data, 200);
+  } catch (err: any) {
+    if (err instanceof DispatchError) {
+      sendError(res, err.code, err.message, err.httpStatus);
+      return;
+    }
+    sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
+  }
+};
+
+export const createCustomerSupport = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { bookingId, issue } = req.body as z.infer<typeof createSupportTicketSchema>;
+    const data = await createCustomerSupportTicket(req.user!.userId, bookingId, issue);
+    sendSuccess(res, data, 201);
+  } catch (err: any) {
+    if (err instanceof DispatchError) {
+      sendError(res, err.code, err.message, err.httpStatus);
+      return;
+    }
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
   }
 };

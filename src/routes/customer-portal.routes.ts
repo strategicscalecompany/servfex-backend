@@ -21,6 +21,8 @@ import {
   getBookingStartOtp,
   confirmBookingCompletion,
   reportBookingIssue,
+  getCustomerSupport,
+  createCustomerSupport,
   registerCustomerSchema,
   updateCustomerProfileSchema,
   addressSchema,
@@ -29,6 +31,7 @@ import {
   rescheduleBookingSchema,
   submitReviewSchema,
   reportIssueSchema,
+  createSupportTicketSchema,
 } from '../controllers/customer-portal.controller';
 import {
   chatMessageSchema,
@@ -94,6 +97,10 @@ router.post('/bookings/:id/confirm-completion', confirmBookingCompletion);
 router.post('/bookings/:id/report-issue', validate(reportIssueSchema), reportBookingIssue);
 router.post('/bookings/:id/cancel', validate(cancelBookingSchema), cancelBooking);
 router.post('/bookings/:id/reschedule', validate(rescheduleBookingSchema), rescheduleBooking);
+
+// Support (call BOM / create ticket linked to hub Tickets inbox)
+router.get('/support', getCustomerSupport);
+router.post('/support/tickets', validate(createSupportTicketSchema), createCustomerSupport);
 
 // Reviews
 router.post('/bookings/:id/review', validate(submitReviewSchema), submitCustomerReview);
