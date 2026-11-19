@@ -1461,26 +1461,15 @@ function summarizeHubPeriod(
     leadPayoutAmount: string | null;
   }>
 ) {
-  const counted = rows.filter((b) => b.status === 'COMPLETED' || b.paymentStatus === 'PAID');
-  const earnings = sumMoney(counted.map((b) => b.totalAmount));
-  const employeeShare = sumMoney(
-    counted.map((b) => {
-      const expert = asDecimal(b.expertPayout);
-      const helper = asDecimal(b.helperPayoutAmount);
-      const lead = asDecimal(b.leadPayoutAmount);
-      // Prefer explicit lead+helper split when present; else expertPayout.
-      if (lead.gt(0) || helper.gt(0)) return lead.plus(helper);
-      return expert;
-    })
-  );
-  let hubShare = earnings.minus(employeeShare);
-  if (hubShare.lt(0)) hubShare = asDecimal(0);
+  const completed = rows.filter((b) => b.status === 'COMPLETED').length;
+  const cancelled = rows.filter((b) => b.status === 'CANCELLED' || b.status === 'DECLINED').length;
+  const pending = Math.max(0, rows.length - completed - cancelled);
   return {
     orders: rows.length,
-    completedOrders: counted.length,
-    earnings: toMoney(earnings),
-    employeeShare: toMoney(employeeShare),
-    hubShare: toMoney(hubShare),
+    booked: rows.length,
+    completedOrders: completed,
+    pendingOrders: pending,
+    cancelledOrders: cancelled,
   };
 }
 
