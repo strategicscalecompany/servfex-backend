@@ -1535,8 +1535,6 @@ export const getManagerHubBoard = async (req: Request, res: Response): Promise<v
     const today = ymdInBookingTz();
     const weekFrom = addDaysYmd(today, -6);
     const monthFrom = `${today.slice(0, 7)}-01`;
-    // Stats need at least calendar-month history (look back 90d for custom/search).
-    const historyFrom = addDaysYmd(today, -90);
 
     const hubBoardSelect = {
       id: true,
@@ -1547,6 +1545,8 @@ export const getManagerHubBoard = async (req: Request, res: Response): Promise<v
       scheduledTimeSlot: true,
       scheduledStartAt: true,
       scheduledEndAt: true,
+      createdAt: true,
+      updatedAt: true,
       totalAmount: true,
       expertPayout: true,
       helperPayoutAmount: true,
@@ -1565,20 +1565,26 @@ export const getManagerHubBoard = async (req: Request, res: Response): Promise<v
       },
     } as const;
 
+    // Do NOT filter by scheduledDate in Mongo — some rows have blank/odd dates and vanish from week/month.
+    // Load recent hub jobs, then bucket in IST by scheduledDate with createdAt fallback.
     const bookings = await prisma.booking.findMany({
-      where: {
-        vendorId: { in: hubIds },
-        scheduledDate: { gte: historyFrom, lte: to >= today ? to : today },
-      },
+      where: { vendorId: { in: hubIds } },
       select: hubBoardSelect,
-      orderBy: [{ scheduledDate: 'desc' }, { scheduledStartAt: 'desc' }],
+      orderBy: [{ updatedAt: 'desc' }],
       take: 500,
     });
 
-    const inRange = (ymd: string, a: string, b: string) => ymd >= a && ymd <= b;
-    const todayRows = bookings.filter((b) => b.scheduledDate === today);
-    const weekRows = bookings.filter((b) => inRange(b.scheduledDate, weekFrom, today));
-    const monthRows = bookings.filter((b) => inRange(b.scheduledDate, monthFrom, today));
+    const inRange = (ymd: string, a: string, b: string) => Boolean(ymd) && ymd >= a && ymd <= b;
+    const dayKey = (b: { scheduledDate?: string | null; createdAt?: Date | null }) => {
+      const scheduled = (b.scheduledDate || '').trim();
+      if (/^\d{4}-\d{2}-\d{2}$/.test(scheduled)) return scheduled;
+      if (b.createdAt) return ymdInBookingTz(new Date(b.createdAt));
+      return '';
+    };
+
+    const todayRows = bookings.filter((b) => dayKey(b) === today);
+    const weekRows = bookings.filter((b) => inRange(dayKey(b), weekFrom, today));
+    const monthRows = bookings.filter((b) => inRange(dayKey(b), monthFrom, today));
 
     const normalizeBookingKey = (value: string) =>
       value
@@ -1617,31 +1623,22 @@ export const getManagerHubBoard = async (req: Request, res: Response): Promise<v
       return idHit || nameHit || emailHit || phoneHit;
     };
 
-    let filtered = bookings.filter((b) => inRange(b.scheduledDate, from, to));
+    // Period chips filter the result list; search ignores the chip and scans the hub.
+    let filtered = qRaw
+      ? bookings.filter((b) => matchesQuery(b, qRaw))
+      : bookings.filter((b) => inRange(dayKey(b), from, to));
 
-    // Search is global across the hub (not limited to Today/Week chip).
-    if (qRaw) {
-      const recent = await prisma.booking.findMany({
-        where: { vendorId: { in: hubIds } },
-        select: hubBoardSelect,
-        orderBy: [{ updatedAt: 'desc' }],
-        take: 300,
-      });
-      const byId = new Map<string, (typeof bookings)[number]>();
-      for (const b of [...bookings, ...recent]) byId.set(b.id, b);
-      filtered = [...byId.values()].filter((b) => matchesQuery(b, qRaw));
-      filtered.sort((a, b) => {
-        const da = `${a.scheduledDate}|${a.scheduledTimeSlot || ''}`;
-        const db = `${b.scheduledDate}|${b.scheduledTimeSlot || ''}`;
-        return db.localeCompare(da);
-      });
-    }
+    filtered.sort((a, b) => {
+      const da = `${dayKey(a)}|${a.scheduledTimeSlot || ''}`;
+      const db = `${dayKey(b)}|${b.scheduledTimeSlot || ''}`;
+      return db.localeCompare(da);
+    });
 
     const mapRow = (b: (typeof bookings)[number]) => ({
       id: b.id,
       bookingNumber: b.bookingNumber,
       status: b.status,
-      scheduledDate: b.scheduledDate,
+      scheduledDate: dayKey(b) || b.scheduledDate,
       scheduledTimeSlot: b.scheduledTimeSlot,
       serviceName: b.package?.name || b.service?.name || 'Service',
       customerName: b.customer?.user?.name || '',
@@ -1651,21 +1648,24 @@ export const getManagerHubBoard = async (req: Request, res: Response): Promise<v
       employeeName: b.employee?.user?.name || '',
       pastJobGrace: isJobPastGrace(
         {
-          scheduledDate: b.scheduledDate,
+          scheduledDate: dayKey(b) || b.scheduledDate,
           scheduledTimeSlot: b.scheduledTimeSlot,
           scheduledStartAt: b.scheduledStartAt,
           scheduledEndAt: b.scheduledEndAt,
         },
         new Date()
       ),
-      scheduleDayExpired: isBookingScheduleDayExpired(b.scheduledDate),
+      scheduleDayExpired: isBookingScheduleDayExpired(dayKey(b) || b.scheduledDate),
     });
 
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
     sendSuccess(res, {
       period,
       from,
       to,
       query: qRaw,
+      hubIds,
+      loaded: bookings.length,
       bookings: filtered.slice(0, 100).map(mapRow),
       bookingCount: filtered.length,
       stats: {
