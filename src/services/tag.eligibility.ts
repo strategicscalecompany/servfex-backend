@@ -6,6 +6,10 @@ import { prisma } from '../config/prisma';
  * A professional is eligible when BOM assigned them the booking's package,
  * subcategory, and/or parent category (Primary or Secondary).
  *
+ * Slot capacity = hub service pros with catalog match who are still accepting work.
+ * User.status (ACTIVE / SUSPENDED) does NOT gate slots — only BOM unavailable
+ * (isAvailable/acceptingRequests false) drops a pro until BOM restores or they check in.
+ *
  * Migration fallback: if no professional at the hub has any catalog assignments yet,
  * treat all hub service professionals as eligible (legacy behaviour).
  */
@@ -15,7 +19,6 @@ type EmployeeWhereBase = {
   isAvailable: true;
   acceptingRequests: true;
   expertKind: 'SERVICE_PROFESSIONAL';
-  user: { status: 'ACTIVE'; deletedAt: null };
   hubCheckedInAt?: { not: null };
 };
 
@@ -29,14 +32,14 @@ function buildEmployeeWhereBase(params: {
   vendorId: string;
   requireCheckedIn?: boolean;
 }): EmployeeWhereBase {
-  // BOM unavailable sets isAvailable/acceptingRequests to false (do not filter
-  // bomUnavailableAt:null — on Mongo that excludes docs where the field is unset).
+  // Capacity gate is BOM availability only (isAvailable + acceptingRequests).
+  // Do not filter user.status / deletedAt:null here — Mongo null filters drop unset fields,
+  // and attendance SUSPENDED must not zero customer slots.
   return {
     vendorId: params.vendorId,
     isAvailable: true,
     acceptingRequests: true,
     expertKind: 'SERVICE_PROFESSIONAL',
-    user: { status: 'ACTIVE', deletedAt: null },
     ...(params.requireCheckedIn ? { hubCheckedInAt: { not: null } } : {}),
   };
 }
@@ -215,20 +218,102 @@ export async function isEmployeeEligibleForCategory(params: {
   return isEmployeeEligibleForCatalog(params);
 }
 
+/**
+ * How many hub service pros are catalog-assigned to this package
+ * (direct package, its subcategory, or parent category). Not gated by
+ * availability / check-in / user.status — this is the hard crew-size ceiling.
+ */
+export async function countHubProsAssignedToPackage(params: {
+  vendorId: string;
+  packageId: string;
+}): Promise<number> {
+  const pkg = await prisma.servicePackage.findUnique({
+    where: { id: params.packageId },
+    select: {
+      id: true,
+      service: { select: { categoryId: true, subCategoryId: true } },
+    },
+  });
+  if (!pkg) return 0;
+
+  const categoryId = pkg.service.categoryId;
+  const subCategoryId = pkg.service.subCategoryId || null;
+
+  const employees = await prisma.employeeProfile.findMany({
+    where: {
+      vendorId: params.vendorId,
+      expertKind: 'SERVICE_PROFESSIONAL',
+    },
+    select: {
+      id: true,
+      employeePackages: { select: { packageId: true } },
+      employeeSubCategories: { select: { subCategoryId: true } },
+      employeeCategories: { select: { categoryId: true } },
+    },
+  });
+
+  let n = 0;
+  for (const emp of employees) {
+    const byPkg = emp.employeePackages.some((p) => p.packageId === params.packageId);
+    const bySub =
+      !!subCategoryId &&
+      emp.employeeSubCategories.some((s) => s.subCategoryId === subCategoryId);
+    const byCat = emp.employeeCategories.some((c) => c.categoryId === categoryId);
+    if (byPkg || bySub || byCat) n += 1;
+  }
+  return n;
+}
+
+/** Max crew size BOM may configure for a package (1..4, never above assigned pros). */
+export function maxCrewForAssignedCount(assignedCount: number): number {
+  if (assignedCount <= 0) return 1; // draft default until pros are tagged
+  return Math.min(4, assignedCount);
+}
+
+/** After catalog unassign, shrink hub crew sizes that now exceed assigned headcount. */
+export async function clampHubPackageCrewToAssigned(vendorId: string): Promise<void> {
+  const configs = await prisma.hubPackageConfig.findMany({
+    where: { vendorId, requiredProfessionals: { gt: 1 } },
+    select: { id: true, packageId: true, requiredProfessionals: true },
+  });
+  for (const cfg of configs) {
+    const assigned = await countHubProsAssignedToPackage({
+      vendorId,
+      packageId: cfg.packageId,
+    });
+    const maxCrew = maxCrewForAssignedCount(assigned);
+    if (cfg.requiredProfessionals > maxCrew) {
+      await prisma.hubPackageConfig.update({
+        where: { id: cfg.id },
+        data: { requiredProfessionals: maxCrew },
+      });
+    }
+  }
+}
+
 export async function resolveRequiredProfessionals(params: {
   vendorId: string;
   packageId: string | null | undefined;
 }): Promise<number> {
   if (!params.packageId) return 1;
-  const cfg = await prisma.hubPackageConfig.findUnique({
-    where: {
-      vendorId_packageId: {
-        vendorId: params.vendorId,
-        packageId: params.packageId,
+  const [cfg, assigned] = await Promise.all([
+    prisma.hubPackageConfig.findUnique({
+      where: {
+        vendorId_packageId: {
+          vendorId: params.vendorId,
+          packageId: params.packageId,
+        },
       },
-    },
-    select: { requiredProfessionals: true, isActive: true },
-  });
+      select: { requiredProfessionals: true, isActive: true },
+    }),
+    countHubProsAssignedToPackage({
+      vendorId: params.vendorId,
+      packageId: params.packageId,
+    }),
+  ]);
   if (!cfg?.isActive) return 1;
-  return Math.min(4, Math.max(1, cfg.requiredProfessionals || 1));
+  const wanted = Math.min(4, Math.max(1, cfg.requiredProfessionals || 1));
+  // Never demand more bodies than are catalog-assigned to this package.
+  if (assigned <= 0) return wanted;
+  return Math.min(wanted, assigned);
 }

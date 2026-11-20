@@ -216,7 +216,7 @@ export async function generateAvailableSlots(params: {
   // Earliest bookable start: now + lead time (never offer a slot that already started).
   const earliestStartMs = now.getTime() + SLOT_GAP_MINUTES * 60 * 1000;
 
-  // Capacity = available hub pros assigned to the catalog (not check-in gated).
+  // Capacity = hub pros assigned to the catalog (not check-in / not user.status gated).
   // BOM unavailable (isAvailable/acceptingRequests false) drops a pro until restore or check-in.
   const MIN_EXTRA_REMAINING_MS = 45 * 60 * 1000;
   const lateClose = atLocalTime(params.dateYmd, DAY_END_HOUR + 3); // 22:00 IST

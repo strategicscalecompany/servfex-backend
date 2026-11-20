@@ -17,6 +17,10 @@ import {
   listFreeCheckedInSubstitutes,
   markCrewAbsentAndMaybeSubstitute,
 } from '../services/crew.assign';
+import {
+  findEligibleEmployeeIds,
+  resolveRequiredProfessionals,
+} from '../services/tag.eligibility';
 import { SlotType } from '@prisma/client';
 
 export const availabilityQuerySchema = z.object({
@@ -175,6 +179,9 @@ export const getAvailableDates = async (req: Request, res: Response): Promise<vo
 
 export const getAvailableSlots = async (req: Request, res: Response): Promise<void> => {
   const t0 = Date.now();
+  // Never let OkHttp / proxies cache empty or stale capacity.
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.setHeader('Pragma', 'no-cache');
   try {
     const userId = req.user!.userId;
     const parsed = availabilityQuerySchema.safeParse(req.query);
@@ -186,7 +193,7 @@ export const getAvailableSlots = async (req: Request, res: Response): Promise<vo
     const resolved = await resolveHubForAddress(serviceId, addressId, userId);
     const tHub = Date.now();
     if (!resolved?.vendorId) {
-      sendSuccess(res, { slots: [] });
+      sendSuccess(res, { slots: [], emptyReason: 'NO_HUB' });
       return;
     }
     const pkg = packageId
@@ -197,17 +204,36 @@ export const getAvailableSlots = async (req: Request, res: Response): Promise<vo
       packageDurationText: pkg?.duration,
       serviceDurationText: resolved.service.durationText,
     });
-    const slots = await generateAvailableSlots({
-      vendorId: resolved.vendorId,
-      categoryId: resolved.service.categoryId,
-      subCategoryId: resolved.service.subCategoryId,
-      packageId: pkg?.id,
-      durationMinutes: duration,
-      dateYmd: date,
-    });
+    const [requiredProfessionals, eligiblePros, slots] = await Promise.all([
+      resolveRequiredProfessionals({
+        vendorId: resolved.vendorId,
+        packageId: pkg?.id,
+      }),
+      findEligibleEmployeeIds({
+        vendorId: resolved.vendorId,
+        categoryId: resolved.service.categoryId,
+        subCategoryId: resolved.service.subCategoryId,
+        packageId: pkg?.id,
+        requireCheckedIn: false,
+      }),
+      generateAvailableSlots({
+        vendorId: resolved.vendorId,
+        categoryId: resolved.service.categoryId,
+        subCategoryId: resolved.service.subCategoryId,
+        packageId: pkg?.id,
+        durationMinutes: duration,
+        dateYmd: date,
+      }),
+    ]);
     console.log(
-      `[slots] date=${date} hub=${tHub - t0}ms gen=${Date.now() - tHub}ms total=${Date.now() - t0}ms n=${slots.length}`
+      `[slots] date=${date} hub=${tHub - t0}ms gen=${Date.now() - tHub}ms total=${Date.now() - t0}ms n=${slots.length} eligible=${eligiblePros.length} required=${requiredProfessionals}`
     );
+    let emptyReason: string | undefined;
+    if (slots.length === 0) {
+      if (eligiblePros.length === 0) emptyReason = 'NO_ELIGIBLE_PROS';
+      else if (eligiblePros.length < requiredProfessionals) emptyReason = 'INSUFFICIENT_PROS';
+      else emptyReason = 'NO_CAPACITY';
+    }
     sendSuccess(res, {
       slots: slots.map((s) => ({
         scheduledDate: s.scheduledDate,
@@ -220,6 +246,9 @@ export const getAvailableSlots = async (req: Request, res: Response): Promise<vo
       })),
       vendorId: resolved.vendorId,
       durationMinutes: duration,
+      requiredProfessionals,
+      eligiblePros: eligiblePros.length,
+      ...(emptyReason ? { emptyReason } : {}),
     });
   } catch (err) {
     console.error(err);

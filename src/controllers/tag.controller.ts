@@ -5,6 +5,11 @@ import { prisma } from '../config/prisma';
 import { sendError, sendSuccess } from '../utils/response';
 import { invalidateCatalogCache } from './catalog.controller';
 import { emitHubCatalogUpdated } from '../utils/realtime';
+import {
+  clampHubPackageCrewToAssigned,
+  countHubProsAssignedToPackage,
+  maxCrewForAssignedCount,
+} from '../services/tag.eligibility';
 
 export const setEmployeeCatalogSchema = z.object({
   categoryIds: z.array(z.string().uuid()).default([]),
@@ -573,6 +578,7 @@ export const vendorSetEmployeeCatalog = async (req: Request, res: Response): Pro
         : []),
     ]);
 
+    await clampHubPackageCrewToAssigned(vendorId);
     sendSuccess(res, await serializeEmployeeCatalog(employeeId));
   } catch (err) {
     console.error(err);
@@ -831,6 +837,8 @@ export const vendorSetCatalogAssignments = async (req: Request, res: Response): 
       }
     });
 
+    await clampHubPackageCrewToAssigned(vendorId);
+
     // Re-use GET serializer shape.
     req.query = { targetType, targetId };
     await vendorGetCatalogAssignments(req, res);
@@ -885,7 +893,6 @@ export const vendorListHubPackages = async (req: Request, res: Response): Promis
         where: {
           vendorId,
           expertKind: 'SERVICE_PROFESSIONAL',
-          user: { deletedAt: null, status: 'ACTIVE' },
         },
         select: {
           id: true,
@@ -924,6 +931,8 @@ export const vendorListHubPackages = async (req: Request, res: Response): Promis
         categoryId: service.categoryId,
         subCategoryId: service.subCategoryId || null,
       });
+      const maxCrew = maxCrewForAssignedCount(employeeCount);
+      const rawRequired = cfgMap.get(pkg.id)?.requiredProfessionals ?? 1;
       const enabled = cfgMap.get(pkg.id)?.isActive === true;
       return {
         packageId: pkg.id,
@@ -937,8 +946,9 @@ export const vendorListHubPackages = async (req: Request, res: Response): Promis
         subCategoryName: service.subCategory?.name || null,
         durationMinutes: pkg.durationMinutes,
         duration: pkg.duration,
-        requiredProfessionals: cfgMap.get(pkg.id)?.requiredProfessionals ?? 1,
+        requiredProfessionals: Math.min(maxCrew, Math.max(1, rawRequired)),
         employeeCount,
+        maxCrew,
         /** Off until BOM enables this package for the hub. */
         isActive: enabled,
         availabilityMessage: enabled ? null : 'Currently not available',
@@ -974,6 +984,20 @@ export const vendorSetHubPackageCrew = async (req: Request, res: Response): Prom
     });
     if (!pkg) {
       sendError(res, 'BAD_REQUEST', 'Package not found in catalog', 400);
+      return;
+    }
+
+    const assigned = await countHubProsAssignedToPackage({ vendorId, packageId });
+    const maxCrew = maxCrewForAssignedCount(assigned);
+    if (requiredProfessionals > maxCrew) {
+      sendError(
+        res,
+        'CREW_EXCEEDS_ASSIGNED',
+        assigned <= 0
+          ? 'Assign professionals to this package on Services before setting crew size above 1.'
+          : `Only ${assigned} professional(s) are assigned to this package. Crew size cannot exceed ${maxCrew}.`,
+        400
+      );
       return;
     }
 

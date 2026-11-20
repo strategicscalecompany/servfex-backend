@@ -1449,28 +1449,49 @@ export async function setBomEmployeeAvailability(
   await assertHomOwnsEmployeeHub(actor.managerProfile, profile.vendorId);
 
   const now = new Date();
-  const updated = await prisma.employeeProfile.update({
-    where: { id: profile.id },
-    data: available
-      ? {
-          isAvailable: true,
-          acceptingRequests: true,
-          bomUnavailableAt: null,
-        }
-      : {
+  // Missed hub checkout auto-SUSPENDs the user. BOM restore must clear that too,
+  // otherwise isAvailable=true but slots still exclude them (status !== ACTIVE).
+  const updated = available
+    ? (
+        await prisma.$transaction([
+          prisma.employeeProfile.update({
+            where: { id: profile.id },
+            data: {
+              isAvailable: true,
+              acceptingRequests: true,
+              bomUnavailableAt: null,
+            },
+            select: {
+              id: true,
+              isAvailable: true,
+              acceptingRequests: true,
+              bomUnavailableAt: true,
+              hubCheckedInAt: true,
+              user: { select: { id: true, name: true } },
+            },
+          }),
+          prisma.user.update({
+            where: { id: profile.userId },
+            data: { status: 'ACTIVE' },
+          }),
+        ])
+      )[0]
+    : await prisma.employeeProfile.update({
+        where: { id: profile.id },
+        data: {
           isAvailable: false,
           acceptingRequests: false,
           bomUnavailableAt: now,
         },
-    select: {
-      id: true,
-      isAvailable: true,
-      acceptingRequests: true,
-      bomUnavailableAt: true,
-      hubCheckedInAt: true,
-      user: { select: { id: true, name: true } },
-    },
-  });
+        select: {
+          id: true,
+          isAvailable: true,
+          acceptingRequests: true,
+          bomUnavailableAt: true,
+          hubCheckedInAt: true,
+          user: { select: { id: true, name: true } },
+        },
+      });
 
   return {
     employeeId: updated.id,
