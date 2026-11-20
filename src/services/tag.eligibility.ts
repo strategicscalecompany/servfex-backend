@@ -14,6 +14,8 @@ type EmployeeWhereBase = {
   vendorId: string;
   isAvailable: true;
   acceptingRequests: true;
+  /** BOM-marked unavailable pros stay out of free-slot capacity until restore or check-in. */
+  bomUnavailableAt: null;
   expertKind: 'SERVICE_PROFESSIONAL';
   user: { status: 'ACTIVE'; deletedAt: null };
   hubCheckedInAt?: { not: null };
@@ -33,6 +35,7 @@ function buildEmployeeWhereBase(params: {
     vendorId: params.vendorId,
     isAvailable: true,
     acceptingRequests: true,
+    bomUnavailableAt: null,
     expertKind: 'SERVICE_PROFESSIONAL',
     user: { status: 'ACTIVE', deletedAt: null },
     ...(params.requireCheckedIn ? { hubCheckedInAt: { not: null } } : {}),
