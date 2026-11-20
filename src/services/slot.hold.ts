@@ -109,7 +109,7 @@ export async function createSlotHold(params: {
     packageId: params.packageId,
     startAt: params.startAt,
     endAt: params.endAt,
-    requireCheckedIn: true,
+    requireCheckedIn: false,
     excludeHoldCapacity: false,
   });
   if (freeWithHolds < required) {

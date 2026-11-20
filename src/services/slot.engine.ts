@@ -128,51 +128,15 @@ function isFree(
   );
 }
 
-type CheckInWindow = {
-  /** Earliest start after check-in + 15m. */
-  readyAt: Date;
-  /** Hub day end 18:00 IST (exclusive upper bound for job end). */
-  shiftEndAt: Date;
-};
-
-/** Today: check-in ready time + fixed 18:00 IST hub-day end per pro. */
-async function loadCheckInWindows(
-  employeeIds: string[]
-): Promise<Map<string, CheckInWindow>> {
-  const map = new Map<string, CheckInWindow>();
-  if (employeeIds.length === 0) return map;
-  const rows = await prisma.employeeProfile.findMany({
-    where: { id: { in: employeeIds }, hubCheckedInAt: { not: null } },
-    select: { id: true, hubCheckedInAt: true },
-  });
-  const gapMs = SLOT_GAP_MINUTES * 60 * 1000;
-  for (const row of rows) {
-    if (!row.hubCheckedInAt) continue;
-    const checkInMs = row.hubCheckedInAt.getTime();
-    map.set(row.id, {
-      readyAt: new Date(checkInMs + gapMs),
-      shiftEndAt: atLocalTime(ymdInBookingTz(row.hubCheckedInAt), DAY_END_HOUR, 0),
-    });
-  }
-  return map;
-}
-
 /**
- * Pro can cover [start,end] when not busy and — for today — the slot is inside
- * their check-in window: start ≥ check-in+15m and end ≤ 18:00 IST hub day.
- * Does not mutate bookings; only affects newly offered availability.
+ * Pro can cover [start,end] when not busy on overlapping bookings.
+ * Slot capacity is hub available pros — not gated by hub check-in.
  */
 function canCoverSlot(params: {
   intervals: Array<{ start: Date; end: Date }>;
   startAt: Date;
   endAt: Date;
-  isToday: boolean;
-  checkInWindow?: CheckInWindow | null;
 }): boolean {
-  if (params.isToday && params.checkInWindow) {
-    if (params.startAt.getTime() < params.checkInWindow.readyAt.getTime()) return false;
-    if (params.endAt.getTime() > params.checkInWindow.shiftEndAt.getTime()) return false;
-  }
   return isFree(params.intervals, params.startAt, params.endAt);
 }
 
@@ -183,6 +147,7 @@ export async function countFreeEligiblePros(params: {
   packageId?: string | null;
   startAt: Date;
   endAt: Date;
+  /** Ignored for customer slots — capacity uses available hub pros only. */
   requireCheckedIn?: boolean;
   excludeHoldCapacity?: boolean;
 }): Promise<number> {
@@ -191,23 +156,14 @@ export async function countFreeEligiblePros(params: {
     categoryId: params.categoryId,
     subCategoryId: params.subCategoryId,
     packageId: params.packageId,
-    requireCheckedIn: params.requireCheckedIn,
+    requireCheckedIn: false,
   });
   if (eligibleIds.length === 0) return 0;
 
   const dateYmd = ymdInBookingTz(params.startAt);
-  const isToday = ymdInBookingTz(new Date()) === dateYmd;
   const windowStart = atLocalTime(dateYmd, DAY_START_HOUR);
-  const windowEnd = atLocalTime(dateYmd, DAY_END_HOUR);
-
-  const checkInWindows = isToday
-    ? await loadCheckInWindows(eligibleIds)
-    : new Map<string, CheckInWindow>();
-  let horizonEnd = windowEnd;
-  for (const w of checkInWindows.values()) {
-    if (w.shiftEndAt.getTime() > horizonEnd.getTime()) horizonEnd = w.shiftEndAt;
-  }
-  const busy = await loadBusyIntervals(eligibleIds, windowStart, horizonEnd);
+  const windowEnd = atLocalTime(dateYmd, DAY_END_HOUR + 3);
+  const busy = await loadBusyIntervals(eligibleIds, windowStart, windowEnd);
   let free = 0;
   for (const id of eligibleIds) {
     if (
@@ -215,8 +171,6 @@ export async function countFreeEligiblePros(params: {
         intervals: busy.get(id) || [],
         startAt: params.startAt,
         endAt: params.endAt,
-        isToday,
-        checkInWindow: checkInWindows.get(id) || null,
       })
     ) {
       free++;
@@ -262,10 +216,8 @@ export async function generateAvailableSlots(params: {
   // Earliest bookable start: now + lead time (never offer a slot that already started).
   const earliestStartMs = now.getTime() + SLOT_GAP_MINUTES * 60 * 1000;
 
-  // Capacity for today, tomorrow, and the rest of the week is driven by
-  // professionals who are hub-checked-in right now (today's attendance).
-  // Tomorrow/future still use the fixed duration grid from DAY_START (09:00 IST).
-  // Generous busy window up-front so check-in + busy + holds can load in one round-trip.
+  // Capacity = available hub pros assigned to the catalog (not check-in gated).
+  // BOM unavailable (isAvailable/acceptingRequests false) drops a pro until restore or check-in.
   const MIN_EXTRA_REMAINING_MS = 45 * 60 * 1000;
   const lateClose = atLocalTime(params.dateYmd, DAY_END_HOUR + 3); // 22:00 IST
   const busyHorizon = isToday
@@ -282,13 +234,11 @@ export async function generateAvailableSlots(params: {
       categoryId: params.categoryId,
       subCategoryId: params.subCategoryId,
       packageId: params.packageId,
-      requireCheckedIn: true,
+      requireCheckedIn: false,
     }),
   ]);
 
-  const emptyCheckIns = new Map<string, CheckInWindow>();
-  const [checkInWindows, busy, activeHolds, completedEarly] = await Promise.all([
-    isToday ? loadCheckInWindows(eligibleIds) : Promise.resolve(emptyCheckIns),
+  const [busy, activeHolds, completedEarly] = await Promise.all([
     loadBusyIntervals(eligibleIds, dayStart, busyHorizon, params.excludeBookingId),
     prisma.slotHold.findMany({
       where: {
@@ -326,26 +276,10 @@ export async function generateAvailableSlots(params: {
 
   // Duration-based packing: next start = previous end + 15m (e.g. 3h → 6:15 then 9:30).
   let loopEndMs = dayEnd.getTime();
-  if (isToday) {
-    for (const w of checkInWindows.values()) {
-      const remainingAfterReady =
-        w.shiftEndAt.getTime() - Math.max(w.readyAt.getTime(), earliestStartMs);
-      if (remainingAfterReady > 30 * 60 * 1000) {
-        const lastStart = w.shiftEndAt.getTime() - durationMs;
-        if (
-          lastStart + 1 > loopEndMs &&
-          remainingAfterReady >= Math.max(durationMs, MIN_EXTRA_REMAINING_MS)
-        ) {
-          loopEndMs = lastStart + 1;
-        }
-      }
-    }
-  } else {
-    const remainingPastDayEnd = lateClose.getTime() - dayEnd.getTime();
-    if (remainingPastDayEnd >= MIN_EXTRA_REMAINING_MS) {
-      const lastStart = lateClose.getTime() - durationMs;
-      if (lastStart + 1 > loopEndMs) loopEndMs = lastStart + 1;
-    }
+  const remainingPastDayEnd = lateClose.getTime() - dayEnd.getTime();
+  if (remainingPastDayEnd >= MIN_EXTRA_REMAINING_MS) {
+    const lastStart = lateClose.getTime() - durationMs;
+    if (lastStart + 1 > loopEndMs) loopEndMs = lastStart + 1;
   }
 
   const countFreeForWindow = (startAt: Date, endAt: Date): number => {
@@ -356,8 +290,6 @@ export async function generateAvailableSlots(params: {
           intervals: busy.get(id) || [],
           startAt,
           endAt,
-          isToday,
-          checkInWindow: checkInWindows.get(id) || null,
         })
       ) {
         freeCount++;
