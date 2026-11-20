@@ -131,11 +131,11 @@ function isFree(
 type CheckInWindow = {
   /** Earliest start after check-in + 15m. */
   readyAt: Date;
-  /** End of planned 10h shift from check-in (exclusive upper bound for job end). */
+  /** Hub day end 18:00 IST (exclusive upper bound for job end). */
   shiftEndAt: Date;
 };
 
-/** Today: check-in ready time + 10h shift end per pro. */
+/** Today: check-in ready time + fixed 18:00 IST hub-day end per pro. */
 async function loadCheckInWindows(
   employeeIds: string[]
 ): Promise<Map<string, CheckInWindow>> {
@@ -146,13 +146,12 @@ async function loadCheckInWindows(
     select: { id: true, hubCheckedInAt: true },
   });
   const gapMs = SLOT_GAP_MINUTES * 60 * 1000;
-  const shiftMs = SHIFT_HOURS * 60 * 60 * 1000;
   for (const row of rows) {
     if (!row.hubCheckedInAt) continue;
     const checkInMs = row.hubCheckedInAt.getTime();
     map.set(row.id, {
       readyAt: new Date(checkInMs + gapMs),
-      shiftEndAt: new Date(checkInMs + shiftMs),
+      shiftEndAt: atLocalTime(ymdInBookingTz(row.hubCheckedInAt), DAY_END_HOUR, 0),
     });
   }
   return map;
@@ -160,7 +159,7 @@ async function loadCheckInWindows(
 
 /**
  * Pro can cover [start,end] when not busy and — for today — the slot is inside
- * their check-in window: start ≥ check-in+15m and end ≤ check-in+10h.
+ * their check-in window: start ≥ check-in+15m and end ≤ 18:00 IST hub day.
  * Does not mutate bookings; only affects newly offered availability.
  */
 function canCoverSlot(params: {

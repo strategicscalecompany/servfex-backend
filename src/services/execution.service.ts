@@ -28,13 +28,17 @@ import { notifyUsers } from './notify.service';
 const DEFAULT_WORK_RADIUS_METERS = 200;
 /** Checkout allowed anytime after check-in once jobs are done (ops may end early). */
 const MIN_SHIFT_HOURS = 0;
-/** Mandatory online cycle after check-in. */
-export const SHIFT_HOURS = 10;
+/**
+ * Hub day is 09:00–18:00 IST (not “check-in + N hours”).
+ * SHIFT_HOURS is the nominal length for client display / copy.
+ */
+export const CHECK_IN_START_HOUR = 9;
+export const SHIFT_END_HOUR = 18;
+export const SHIFT_HOURS = SHIFT_END_HOUR - CHECK_IN_START_HOUR; // 9
 /** Minutes after shift end (or last job while overdue) to return and check out. */
 export const POST_SHIFT_RETURN_MINUTES = 30;
 /** @deprecated Use POST_SHIFT_RETURN_MINUTES; kept for older clients reading graceHours. */
 export const GRACE_HOURS = POST_SHIFT_RETURN_MINUTES / 60;
-export const CHECK_IN_START_HOUR = 9;
 export const CHECK_IN_GRACE_MINUTES = 30;
 /** Not checked in by this IST hour → Absent for BOM roster (force check-in still allowed). */
 export const ABSENT_CUTOFF_HOUR = 12;
@@ -94,10 +98,12 @@ export function computeShiftTiming(
       canCheckOut: false,
     };
   }
-  const checkInMs = new Date(hubCheckedInAt).getTime();
+  const checkInAt = new Date(hubCheckedInAt);
+  const checkInMs = checkInAt.getTime();
   const workedHours = (now.getTime() - checkInMs) / (1000 * 60 * 60);
-  const shiftEndsAt = new Date(checkInMs + SHIFT_HOURS * 60 * 60 * 1000);
-  const isShiftOverdue = workedHours >= SHIFT_HOURS;
+  // Fixed hub day end 18:00 IST on the check-in calendar day (09:00–18:00).
+  const shiftEndsAt = atLocalTime(ymdInBookingTz(checkInAt), SHIFT_END_HOUR, 0);
+  const isShiftOverdue = now.getTime() >= shiftEndsAt.getTime();
   const deadline = postShiftReturnDeadlineAt
     ? new Date(postShiftReturnDeadlineAt)
     : isShiftOverdue
@@ -131,7 +137,12 @@ export async function findActiveFieldJob(employeeProfileId: string) {
   });
 }
 
-/** Start (or keep) the 30m return-to-hub window once the pro is overdue and idle. */
+/**
+ * Start (or keep) the 30m return-to-hub window once the pro is past 18:00 IST and idle.
+ * - Idle at/after 18:00: grace ends at a fixed 18:30 IST (not a sliding clock).
+ * - Left an active job after 18:30: grace is 30m from now so they can still return.
+ * Applies to self check-in and BOM force check-in alike — no exemption.
+ */
 export async function maybeStartPostShiftReturnGrace(employeeProfileId: string, now: Date = new Date()) {
   const profile = await prisma.employeeProfile.findUnique({
     where: { id: employeeProfileId },
@@ -145,12 +156,20 @@ export async function maybeStartPostShiftReturnGrace(employeeProfileId: string, 
   if (profile.postShiftReturnDeadlineAt) return profile.postShiftReturnDeadlineAt;
 
   const timing = computeShiftTiming(profile.hubCheckedInAt, now);
-  if (!timing.isShiftOverdue) return null;
+  if (!timing.isShiftOverdue || !timing.shiftEndsAt) return null;
 
   const activeJob = await findActiveFieldJob(employeeProfileId);
   if (activeJob) return null;
 
-  const deadline = new Date(now.getTime() + POST_SHIFT_RETURN_MINUTES * 60 * 1000);
+  const fixedGraceEndMs =
+    timing.shiftEndsAt.getTime() + POST_SHIFT_RETURN_MINUTES * 60 * 1000; // 18:30 IST
+  // Still inside 18:00–18:30 → lock to 18:30. Already past 18:30 (e.g. job just finished) → 30m from now.
+  const deadline = new Date(
+    now.getTime() <= fixedGraceEndMs
+      ? fixedGraceEndMs
+      : now.getTime() + POST_SHIFT_RETURN_MINUTES * 60 * 1000
+  );
+
   await prisma.employeeProfile.update({
     where: { id: employeeProfileId },
     data: { postShiftReturnDeadlineAt: deadline },
@@ -160,7 +179,7 @@ export async function maybeStartPostShiftReturnGrace(employeeProfileId: string, 
 
 /**
  * Call when a booking leaves active field statuses for an assigned pro.
- * If they are already past 10h, start the 30m return window.
+ * If they are already past 18:00 IST, start the 30m return window.
  */
 export async function onEmployeeLeftActiveFieldJob(employeeProfileId: string | null | undefined) {
   if (!employeeProfileId) return;
@@ -1302,6 +1321,8 @@ export async function pingHubLocation(userId: string, latitude: number, longitud
  * Discretionary: BOM may check in late/absent pros without requiring fresh GPS at the hub.
  * Still marks lateWorkerFlaggedAt so the profile stays red for the day.
  * Also clears attendance suspension from a prior missed checkout.
+ * Does NOT exempt the pro from hub-day end: after 18:00 IST they still get 30m grace,
+ * then force checkout + suspend + BOM warning if they miss checkout (same as self check-in).
  */
 export async function homForceHubCheckIn(actorUserId: string, employeeProfileId: string) {
   const actor = await prisma.user.findUnique({

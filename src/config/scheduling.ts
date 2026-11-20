@@ -6,8 +6,9 @@ export const BOOKING_TIMEZONE = 'Asia/Kolkata';
 const IST_OFFSET_MS = (5 * 60 + 30) * 60 * 1000;
 
 export const DAY_START_HOUR = 9; // 09:00 IST
-export const DAY_END_HOUR = 19; // 19:00 IST
-export const SHIFT_HOURS = 10;
+/** Hub / bookable day ends at 18:00 IST (09:00–18:00). */
+export const DAY_END_HOUR = 18;
+export const SHIFT_HOURS = DAY_END_HOUR - DAY_START_HOUR; // 9
 export const CHECK_IN_GRACE_MINUTES = 30; // check-in allowed until 09:30 IST
 /** Express-slot start rounding only; normal offers step by duration + SLOT_GAP_MINUTES. */
 export const SLOT_STEP_MINUTES = 15;

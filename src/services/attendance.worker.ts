@@ -2,7 +2,6 @@ import { prisma } from '../config/prisma';
 import { logger } from '../config/logger';
 import { notifyUsers } from './notify.service';
 import {
-  SHIFT_HOURS,
   CHECK_IN_START_HOUR,
   CHECK_IN_GRACE_MINUTES,
   POST_SHIFT_RETURN_MINUTES,
@@ -20,9 +19,10 @@ let attendanceTimer: NodeJS.Timeout | null = null;
 let isSweeping = false;
 
 /**
- * Sweep:
- * - After check-in + 10h with no active job: start 30m return window, then force checkout + suspend.
- * - Active field jobs skip punish until complete.
+ * Sweep (self check-in and BOM force check-in are treated the same):
+ * - After hub day end 18:00 IST with no active job: 30m return grace (until 18:30).
+ * - Miss that grace → force checkout + suspend + BOM warning.
+ * - Active field jobs: wait until job ends, then 30m grace, then same punish.
  * - After 09:30 IST: flag multi-pro bookings where an assigned crew member never checked in.
  */
 export async function sweepHubAttendance(clock: () => Date = () => new Date()): Promise<number> {
@@ -86,14 +86,14 @@ export async function sweepHubAttendance(clock: () => Date = () => new Date()): 
             await notifyUsers(
               [emp.userId],
               'Shift ended — finish current job',
-              `Your ${SHIFT_HOURS}h day ended. Finish booking #${activeJob.bookingNumber}, then return to the hub within ${POST_SHIFT_RETURN_MINUTES} minutes to check out.`,
+              `Your hub day (09:00–18:00 IST) ended. Finish booking #${activeJob.bookingNumber}, then return to the hub within ${POST_SHIFT_RETURN_MINUTES} minutes to check out.`,
               { type: 'attendance:shift_overdue_on_job' }
             );
             if (bomIds.length) {
               await notifyUsers(
                 bomIds,
                 'Professional past shift on active job',
-                `${name} is past ${SHIFT_HOURS}h but still on #${activeJob.bookingNumber} at ${emp.vendor.companyName}.`,
+                `${name} is past 18:00 IST but still on #${activeJob.bookingNumber} at ${emp.vendor.companyName}.`,
                 { type: 'attendance:shift_overdue_on_job', employeeUserId: emp.userId }
               );
             }
@@ -103,9 +103,13 @@ export async function sweepHubAttendance(clock: () => Date = () => new Date()): 
         }
 
         // Idle overdue: ensure 30m return deadline exists.
-        // If already past shift+30m (e.g. overnight stuck session), punish immediately.
-        const alreadyPastReturnWindow =
-          timing.workedHours >= SHIFT_HOURS + POST_SHIFT_RETURN_MINUTES / 60;
+        // If already past 18:00+30m (e.g. overnight stuck session), punish immediately.
+        const alreadyPastReturnWindow = Boolean(
+          timing.shiftEndsAt &&
+            now.getTime() >=
+              timing.shiftEndsAt.getTime() + POST_SHIFT_RETURN_MINUTES * 60 * 1000 &&
+            !emp.postShiftReturnDeadlineAt
+        );
 
         let deadline = emp.postShiftReturnDeadlineAt
           ? new Date(emp.postShiftReturnDeadlineAt)
@@ -120,14 +124,14 @@ export async function sweepHubAttendance(clock: () => Date = () => new Date()): 
             await notifyUsers(
               [emp.userId],
               'Return to hub and check out',
-              `Your ${SHIFT_HOURS}h shift ended. You have ${POST_SHIFT_RETURN_MINUTES} minutes to return to the hub and check out.`,
+              `Your hub day ended at 18:00 IST. You have ${POST_SHIFT_RETURN_MINUTES} minutes to return to the hub and check out.`,
               { type: 'attendance:shift_overdue' }
             );
             if (bomIds.length) {
               await notifyUsers(
                 bomIds,
-                'Professional has not checked out',
-                `${name} is past ${SHIFT_HOURS}h at ${emp.vendor.companyName} and has ${POST_SHIFT_RETURN_MINUTES}m to return.`,
+                'Warning · checkout grace started',
+                `${name} is past 18:00 IST at ${emp.vendor.companyName}. They have until 18:30 IST to return and check out, or they will be force checked out and suspended.`,
                 { type: 'attendance:missing_checkout', employeeUserId: emp.userId }
               );
             }
@@ -140,8 +144,8 @@ export async function sweepHubAttendance(clock: () => Date = () => new Date()): 
           const ok = await forceCheckoutAndSuspend(
             emp.id,
             alreadyPastReturnWindow
-              ? `Stayed checked in past ${SHIFT_HOURS}h + ${POST_SHIFT_RETURN_MINUTES}m return window.`
-              : `Missed ${POST_SHIFT_RETURN_MINUTES}-minute return window after a ${SHIFT_HOURS}h shift.`
+              ? `Stayed checked in past 18:00 IST + ${POST_SHIFT_RETURN_MINUTES}m return window.`
+              : `Missed ${POST_SHIFT_RETURN_MINUTES}-minute return window after hub day (ends 18:00 IST).`
           );
           if (ok) processed++;
         }
@@ -220,7 +224,7 @@ export function startAttendanceWorker() {
   attendanceTimer = setInterval(() => {
     void sweepHubAttendance();
   }, ATTENDANCE_SWEEP_INTERVAL_MS);
-  logger.info('Hub attendance sweeper started (10h + 30m return + force suspend)');
+  logger.info('Hub attendance sweeper started (09:00–18:00 IST + 30m return + force suspend)');
 }
 
 export function stopAttendanceWorker() {
