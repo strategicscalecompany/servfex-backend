@@ -886,6 +886,13 @@ export async function setProfessionalAvailability(userId: string, isAvailable: b
   const profile = await prisma.employeeProfile.findUnique({ where: { userId } });
   if (!profile) throw new DispatchError('FORBIDDEN', 'Only service professionals can update availability', 403);
   const goingOnline = isAvailable || acceptingRequests === true;
+  if (goingOnline && profile.bomUnavailableAt) {
+    throw new DispatchError(
+      'BOM_UNAVAILABLE',
+      'Your manager marked you unavailable. Check in at the hub or ask them to restore availability.',
+      409
+    );
+  }
   if (goingOnline && !profile.hubCheckedInAt) {
     throw new DispatchError(
       'HUB_CHECKIN_REQUIRED',
@@ -1066,6 +1073,7 @@ export async function hubCheckIn(userId: string, latitude: number, longitude: nu
       lateWorkerFlaggedAt: null,
       lateCheckInRequestedAt: null,
       postShiftReturnDeadlineAt: null,
+      bomUnavailableAt: null,
       lastLatitude: latitude,
       lastLongitude: longitude,
       lastLocationAt: now,
@@ -1381,6 +1389,7 @@ export async function homForceHubCheckIn(actorUserId: string, employeeProfileId:
         lateWorkerFlaggedAt: now,
         lateCheckInRequestedAt: null,
         postShiftReturnDeadlineAt: null,
+        bomUnavailableAt: null,
         ...(hasGps
           ? {
               lastLatitude: profile.lastLatitude,
@@ -1399,6 +1408,77 @@ export async function homForceHubCheckIn(actorUserId: string, employeeProfileId:
   ]);
 
   return getHubAttendanceStatus(profile.userId);
+}
+
+/**
+ * BOM marks a Working Professional available/unavailable for slot capacity.
+ * Unavailable pros stay out of eligibility until BOM restores them or they check in.
+ */
+export async function setBomEmployeeAvailability(
+  actorUserId: string,
+  employeeProfileId: string,
+  available: boolean
+) {
+  const actor = await prisma.user.findUnique({
+    where: { id: actorUserId },
+    select: {
+      role: true,
+      managerProfile: { select: { vendorId: true, zone: true } },
+    },
+  });
+  if (!actor || actor.role !== 'OPERATIONS_MANAGER') {
+    throw new DispatchError('FORBIDDEN', 'Only Business Operation Managers can manage pro availability', 403);
+  }
+
+  const profile = await prisma.employeeProfile.findUnique({
+    where: { id: employeeProfileId },
+    select: {
+      id: true,
+      userId: true,
+      vendorId: true,
+      expertKind: true,
+      hubCheckedInAt: true,
+      user: { select: { name: true, status: true } },
+    },
+  });
+  if (!profile) throw new DispatchError('NOT_FOUND', 'Professional not found', 404);
+  if (profile.expertKind === 'SALES_MANAGER') {
+    throw new DispatchError('BAD_REQUEST', 'Availability applies to Working Professionals only', 400);
+  }
+
+  await assertHomOwnsEmployeeHub(actor.managerProfile, profile.vendorId);
+
+  const now = new Date();
+  const updated = await prisma.employeeProfile.update({
+    where: { id: profile.id },
+    data: available
+      ? {
+          isAvailable: true,
+          acceptingRequests: true,
+          bomUnavailableAt: null,
+        }
+      : {
+          isAvailable: false,
+          acceptingRequests: false,
+          bomUnavailableAt: now,
+        },
+    select: {
+      id: true,
+      isAvailable: true,
+      acceptingRequests: true,
+      bomUnavailableAt: true,
+      hubCheckedInAt: true,
+      user: { select: { id: true, name: true } },
+    },
+  });
+
+  return {
+    employeeId: updated.id,
+    name: updated.user.name,
+    available: updated.isAvailable !== false && !updated.bomUnavailableAt,
+    bomUnavailable: Boolean(updated.bomUnavailableAt),
+    checkedIn: Boolean(updated.hubCheckedInAt),
+  };
 }
 
 /** HOM force check-out — professional does not need to be at the hub. */

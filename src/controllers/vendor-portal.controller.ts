@@ -3112,6 +3112,8 @@ export const getVendorEmployees = async (req: Request, res: Response): Promise<v
               lateWorkerFlaggedAt: emp.lateWorkerFlaggedAt,
               isSuspended: suspended,
             }),
+            bomUnavailable: Boolean((emp as { bomUnavailableAt?: Date | null }).bomUnavailableAt),
+            isAvailable: emp.isAvailable !== false,
             lastLatitude: emp.lastLatitude ?? null,
             lastLongitude: emp.lastLongitude ?? null,
             lastLocationAt: emp.lastLocationAt ?? null,

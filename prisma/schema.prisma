@@ -316,6 +316,8 @@ model EmployeeProfile {
   phone          String
   isAvailable    Boolean         @default(true)
   acceptingRequests Boolean      @default(true)
+  /// Set when BOM marks the pro unavailable for slot capacity; cleared on check-in or BOM restore.
+  bomUnavailableAt DateTime?
   /// Geofence for hub check-in / check-out (meters). Hub coverage itself stays on VendorProfile.serviceRadiusKm.
   workRadiusMeters Float         @default(200)
   hubCheckedInAt DateTime?

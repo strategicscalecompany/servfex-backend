@@ -73,6 +73,8 @@ import {
   listEscalations,
   locationPingSchema,
   pingOrderLocation,
+  bomAvailabilitySchema,
+  postBomEmployeeAvailability,
   postHomForceCheckIn,
   postHomForceCheckOut,
   postHubCheckIn,
@@ -194,6 +196,12 @@ router.delete('/employees/:id', deleteVendorEmployee);
 router.get('/employees/:id/day-board', getEmployeeDayBoard);
 router.post('/employees/:id/force-check-in', postHomForceCheckIn);
 router.post('/employees/:id/force-check-out', postHomForceCheckOut);
+router.post(
+  '/employees/:id/bom-availability',
+  requireRole('OPERATIONS_MANAGER'),
+  validate(bomAvailabilitySchema),
+  postBomEmployeeAvailability
+);
 
 // Sales Manager visits (temporary testing workflow)
 router.get('/visits', listSalesVisits);

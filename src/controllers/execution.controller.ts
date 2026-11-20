@@ -16,6 +16,7 @@ import {
   pingProfessionalLocation,
   requestLateHubCheckIn,
   saveProviderUpi,
+  setBomEmployeeAvailability,
   setProfessionalAvailability,
 } from '../services/execution.service';
 import { listBookingMessages, sendBookingMessage } from '../services/chat.service';
@@ -284,6 +285,25 @@ export const postHomForceCheckOut = async (req: Request, res: Response): Promise
   try {
     const attendance = await homForceHubCheckOut(req.user!.userId, paramId(req));
     sendSuccess(res, { attendance });
+  } catch (err: any) {
+    if (handleDispatchError(res, err)) return;
+    sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
+  }
+};
+
+export const bomAvailabilitySchema = z.object({
+  available: z.boolean(),
+});
+
+/** BOM marks a pro available / unavailable for next-week slot capacity. */
+export const postBomEmployeeAvailability = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const result = await setBomEmployeeAvailability(
+      req.user!.userId,
+      paramId(req),
+      Boolean(req.body.available)
+    );
+    sendSuccess(res, { employee: result });
   } catch (err: any) {
     if (handleDispatchError(res, err)) return;
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
