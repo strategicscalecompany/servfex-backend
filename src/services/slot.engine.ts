@@ -200,33 +200,21 @@ const SLOT_TAKEN_MESSAGE =
   'Sorry, this slot was booked by someone else a fraction of a second before. Please select another slot as soon as possible before someone else gets it.';
 
 /**
- * Confirm-time capacity: bookings only (no pre-holds).
- * Free pros minus shortfall from overlapping jobs that still need crew.
+ * Hub capacity still reserved by overlapping jobs that have no (or incomplete) crew yet.
+ * Assigned pros are already excluded via busy intervals — only count the unfilled headcount.
  */
-export async function assertTimedSlotCapacity(params: {
+async function reservedCrewShortfall(params: {
   vendorId: string;
-  categoryId: string;
-  subCategoryId?: string | null;
-  packageId?: string | null;
   startAt: Date;
   endAt: Date;
-  required: number;
-}): Promise<void> {
-  const required = Math.max(1, params.required);
-  const free = await countFreeEligiblePros({
-    vendorId: params.vendorId,
-    categoryId: params.categoryId,
-    subCategoryId: params.subCategoryId,
-    packageId: params.packageId,
-    startAt: params.startAt,
-    endAt: params.endAt,
-    excludeHoldCapacity: true,
-  });
-
+  excludeBookingId?: string | null;
+}): Promise<number> {
+  const excludeId = params.excludeBookingId?.trim() || null;
   const overlapping = await prisma.booking.findMany({
     where: {
       vendorId: params.vendorId,
       status: { in: BUSY_STATUSES },
+      ...(excludeId ? { id: { not: excludeId } } : {}),
       scheduledStartAt: { lt: params.endAt },
       scheduledEndAt: { gt: params.startAt },
     },
@@ -247,10 +235,43 @@ export async function assertTimedSlotCapacity(params: {
     const assigned = new Set<string>();
     if (b.employeeId) assigned.add(b.employeeId);
     if (b.helperEmployeeId) assigned.add(b.helperEmployeeId);
-    // crew rows may duplicate lead/helper — capacity shortfall uses max(need - distinct, 0)
     const assignedCount = Math.max(assigned.size, b.crewMembers.length);
     reservedShortfall += Math.max(0, need - assignedCount);
   }
+  return reservedShortfall;
+}
+
+/**
+ * Confirm-time capacity: bookings only (no pre-holds).
+ * Free pros minus shortfall from overlapping jobs that still need crew.
+ */
+export async function assertTimedSlotCapacity(params: {
+  vendorId: string;
+  categoryId: string;
+  subCategoryId?: string | null;
+  packageId?: string | null;
+  startAt: Date;
+  endAt: Date;
+  required: number;
+  excludeBookingId?: string | null;
+}): Promise<void> {
+  const required = Math.max(1, params.required);
+  const free = await countFreeEligiblePros({
+    vendorId: params.vendorId,
+    categoryId: params.categoryId,
+    subCategoryId: params.subCategoryId,
+    packageId: params.packageId,
+    startAt: params.startAt,
+    endAt: params.endAt,
+    excludeHoldCapacity: true,
+  });
+
+  const reservedShortfall = await reservedCrewShortfall({
+    vendorId: params.vendorId,
+    startAt: params.startAt,
+    endAt: params.endAt,
+    excludeBookingId: params.excludeBookingId,
+  });
 
   if (free - reservedShortfall < required) {
     const err = new Error(SLOT_TAKEN_MESSAGE) as Error & { code: string; httpStatus: number };
@@ -306,7 +327,8 @@ export async function generateAvailableSlots(params: {
   ]);
 
   // Capacity from real bookings only — pre-holds no longer hide slots from other customers.
-  const [busy, completedEarly] = await Promise.all([
+  // Also load under-crewed overlapping jobs so browse matches confirm-time SLOT_TAKEN.
+  const [busy, completedEarly, underCrewed] = await Promise.all([
     loadBusyIntervals(eligibleIds, dayStart, busyHorizon, params.excludeBookingId),
     isToday
       ? prisma.booking.findMany({
@@ -326,6 +348,28 @@ export async function generateAvailableSlots(params: {
       : Promise.resolve(
           [] as Array<{ scheduledEndAt: Date | null; employeeId: string | null }>
         ),
+    prisma.booking.findMany({
+      where: {
+        vendorId: params.vendorId,
+        status: { in: BUSY_STATUSES },
+        ...(params.excludeBookingId?.trim()
+          ? { id: { not: params.excludeBookingId.trim() } }
+          : {}),
+        scheduledStartAt: { lt: busyHorizon },
+        scheduledEndAt: { gt: dayStart },
+      },
+      select: {
+        requiredProfessionals: true,
+        employeeId: true,
+        helperEmployeeId: true,
+        scheduledStartAt: true,
+        scheduledEndAt: true,
+        crewMembers: {
+          where: { status: 'ASSIGNED' },
+          select: { id: true },
+        },
+      },
+    }),
   ]);
 
   // Duration-based packing: next start = previous end + 15m (e.g. 3h → 6:15 then 9:30).
@@ -335,6 +379,21 @@ export async function generateAvailableSlots(params: {
     const lastStart = lateClose.getTime() - durationMs;
     if (lastStart + 1 > loopEndMs) loopEndMs = lastStart + 1;
   }
+
+  const shortfallForWindow = (startAt: Date, endAt: Date): number => {
+    let shortfall = 0;
+    for (const b of underCrewed) {
+      if (!b.scheduledStartAt || !b.scheduledEndAt) continue;
+      if (b.scheduledStartAt >= endAt || b.scheduledEndAt <= startAt) continue;
+      const need = Math.max(1, b.requiredProfessionals || 1);
+      const assigned = new Set<string>();
+      if (b.employeeId) assigned.add(b.employeeId);
+      if (b.helperEmployeeId) assigned.add(b.helperEmployeeId);
+      const assignedCount = Math.max(assigned.size, b.crewMembers.length);
+      shortfall += Math.max(0, need - assignedCount);
+    }
+    return shortfall;
+  };
 
   const countFreeForWindow = (startAt: Date, endAt: Date): number => {
     let freeCount = 0;
@@ -349,7 +408,8 @@ export async function generateAvailableSlots(params: {
         freeCount++;
       }
     }
-    return freeCount;
+    // Match assertTimedSlotCapacity: hide slots that Book would reject as SLOT_TAKEN.
+    return Math.max(0, freeCount - shortfallForWindow(startAt, endAt));
   };
 
   const slots: SlotCandidate[] = [];
