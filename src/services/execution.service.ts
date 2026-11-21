@@ -127,7 +127,9 @@ export function computeShiftTiming(
     isShiftOverdue,
     isInGrace,
     needsReturnToHub: isShiftOverdue,
-    canCheckOut: workedHours >= MIN_SHIFT_HOURS,
+    // Checkout only after hub day ends (18:00 IST). Grace until 18:30 is the return window —
+    // still allowed after 18:30 until force-checkout so the pro can finish if they arrive late.
+    canCheckOut: isShiftOverdue,
   };
 }
 
@@ -1241,9 +1243,17 @@ export async function hubCheckOut(userId: string, latitude: number, longitude: n
       409
     );
   }
+  const now = new Date();
+  const timing = computeShiftTiming(profile.hubCheckedInAt, now, undefined);
+  if (!timing.canCheckOut) {
+    throw new DispatchError(
+      'SHIFT_NOT_ENDED',
+      'Check-out opens at 18:00 IST when your shift ends (grace until 18:30). Stay online until then — even if you are at the hub.',
+      409
+    );
+  }
   void MIN_SHIFT_HOURS;
   await assertInsideHubRadius(profile, latitude, longitude, 'check out');
-  const now = new Date();
   await prisma.employeeProfile.update({
     where: { id: profile.id },
     data: {
