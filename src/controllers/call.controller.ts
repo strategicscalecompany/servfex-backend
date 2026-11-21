@@ -232,6 +232,13 @@ export const generateCallToken = async (req: Request, res: Response): Promise<vo
             },
           },
         },
+        helperEmployee: {
+          include: {
+            user: {
+              select: { id: true, name: true, phone: true, profilePhotoUrl: true },
+            },
+          },
+        },
       },
     });
 
@@ -242,6 +249,7 @@ export const generateCallToken = async (req: Request, res: Response): Promise<vo
 
     const customerUserId = booking.customer?.userId;
     const expertUserId = booking.employee?.userId;
+    const helperUserId = booking.helperEmployee?.userId;
     const deskManaged = isDeskCallBookingSource(booking.bookingSource);
     const deskManager = deskManaged ? await resolveDeskManagerUserId(booking) : null;
 
@@ -249,6 +257,7 @@ export const generateCallToken = async (req: Request, res: Response): Promise<vo
       status: booking.status,
       customerUserId,
       expertUserId,
+      helperUserId,
       deskManagerUserId: deskManager?.userId,
       isDeskManaged: deskManaged,
       userId,

@@ -35,13 +35,31 @@ export const EXACT_LOCATION_STATUSES: BookingStatus[] = [
 ];
 
 /** Statuses in which the customer and the assigned expert may open a private call. */
-export const CALLABLE_STATUSES: BookingStatus[] = ['ACCEPTED', 'ON_THE_WAY', 'ARRIVED', 'IN_PROGRESS'];
+export const CALLABLE_STATUSES: BookingStatus[] = [
+  'ASSIGNED',
+  'ACCEPTED',
+  'ON_THE_WAY',
+  'ARRIVED',
+  'IN_PROGRESS',
+];
 
 /** Same window as calling: in-app chat is order-scoped and revoked after completion/cancel. */
-export const CHATTABLE_STATUSES: BookingStatus[] = ['ACCEPTED', 'ON_THE_WAY', 'ARRIVED', 'IN_PROGRESS'];
+export const CHATTABLE_STATUSES: BookingStatus[] = [
+  'ASSIGNED',
+  'ACCEPTED',
+  'ON_THE_WAY',
+  'ARRIVED',
+  'IN_PROGRESS',
+];
 
 /** Live GPS is only shared while the assigned professional is actively executing. */
-export const TRACKABLE_STATUSES: BookingStatus[] = ['ACCEPTED', 'ON_THE_WAY', 'ARRIVED', 'IN_PROGRESS'];
+export const TRACKABLE_STATUSES: BookingStatus[] = [
+  'ASSIGNED',
+  'ACCEPTED',
+  'ON_THE_WAY',
+  'ARRIVED',
+  'IN_PROGRESS',
+];
 
 /** Start PIN may only be verified after the professional has arrived. */
 export const START_OTP_ELIGIBLE_STATUSES: BookingStatus[] = ['ARRIVED'];
@@ -369,6 +387,8 @@ export interface CallAccessInput {
   status: BookingStatus;
   customerUserId: string | null | undefined;
   expertUserId: string | null | undefined;
+  /** Teammate / helper on the booking — may also call the customer. */
+  helperUserId?: string | null | undefined;
   /** Sales Manager / desk assigner userId for desk-created bookings. */
   deskManagerUserId?: string | null | undefined;
   isDeskManaged?: boolean;
@@ -384,7 +404,15 @@ export type CallAccessDecision =
  * Desk bookings (Sales Manager / Provider / Hub OM created): expert ↔ Sales Manager only.
  */
 export function evaluateCallAccess(input: CallAccessInput): CallAccessDecision {
-  const { status, customerUserId, expertUserId, deskManagerUserId, isDeskManaged, userId } = input;
+  const {
+    status,
+    customerUserId,
+    expertUserId,
+    helperUserId,
+    deskManagerUserId,
+    isDeskManaged,
+    userId,
+  } = input;
 
   if (!CALLABLE_STATUSES.includes(status)) {
     return {
@@ -406,7 +434,7 @@ export function evaluateCallAccess(input: CallAccessInput): CallAccessDecision {
         httpStatus: 409,
       };
     }
-    const isExpert = expertUserId === userId;
+    const isExpert = expertUserId === userId || (!!helperUserId && helperUserId === userId);
     const isDeskManager = deskManagerUserId === userId;
     if (!isExpert && !isDeskManager) {
       return {
@@ -423,8 +451,9 @@ export function evaluateCallAccess(input: CallAccessInput): CallAccessDecision {
 
   const isCustomer = !!customerUserId && customerUserId === userId;
   const isExpert = !!expertUserId && expertUserId === userId;
+  const isHelper = !!helperUserId && helperUserId === userId;
 
-  if (!isCustomer && !isExpert) {
+  if (!isCustomer && !isExpert && !isHelper) {
     return {
       allowed: false,
       code: 'FORBIDDEN',
@@ -433,7 +462,7 @@ export function evaluateCallAccess(input: CallAccessInput): CallAccessDecision {
     };
   }
 
-  if (!expertUserId || !customerUserId) {
+  if ((!expertUserId && !helperUserId) || !customerUserId) {
     return {
       allowed: false,
       code: 'CALL_NOT_AVAILABLE',
@@ -442,9 +471,13 @@ export function evaluateCallAccess(input: CallAccessInput): CallAccessDecision {
     };
   }
 
-  return isCustomer
-    ? { allowed: true, participantRole: 'CUSTOMER', peerUserId: expertUserId }
-    : { allowed: true, participantRole: 'EXPERT', peerUserId: customerUserId };
+  if (isCustomer) {
+    // Prefer lead expert; fall back to helper if lead missing.
+    const peer = expertUserId || helperUserId!;
+    return { allowed: true, participantRole: 'CUSTOMER', peerUserId: peer };
+  }
+
+  return { allowed: true, participantRole: 'EXPERT', peerUserId: customerUserId };
 }
 
 /** Fixed per-role Agora UIDs: a channel has exactly two participants, so no hashing / collisions. */

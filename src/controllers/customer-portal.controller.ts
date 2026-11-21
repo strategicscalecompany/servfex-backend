@@ -178,9 +178,14 @@ export const submitReviewSchema = z.object({
   comment: z.string().optional(),
 });
 
-export const reportIssueSchema = z.object({
-  reason: z.string().min(5, 'Dispute reason must be at least 5 characters'),
-});
+export const reportIssueSchema = z
+  .object({
+    reason: z.string().min(5, 'Dispute reason must be at least 5 characters').optional(),
+    issueReason: z.string().min(5, 'Dispute reason must be at least 5 characters').optional(),
+  })
+  .refine((d) => Boolean((d.reason || d.issueReason || '').trim()), {
+    message: 'Dispute reason must be at least 5 characters',
+  });
 
 function normalizeOptionalContact(raw?: string | null): string | null | undefined {
   if (raw === undefined) return undefined;
@@ -1714,9 +1719,10 @@ export const reportBookingIssue = async (req: Request, res: Response): Promise<v
   try {
     const userId = req.user!.userId;
     const id = req.params.id as string;
-    const { reason } = req.body;
+    const reasonRaw = (req.body?.reason || req.body?.issueReason || '') as string;
+    const reason = String(reasonRaw).trim();
 
-    if (!reason || reason.trim().length < 5) {
+    if (!reason || reason.length < 5) {
       sendError(res, 'BAD_REQUEST', 'Detailed dispute reason required (min 5 characters)', 400);
       return;
     }
@@ -1744,7 +1750,7 @@ export const reportBookingIssue = async (req: Request, res: Response): Promise<v
         where: { id },
         data: {
           status: 'DISPUTED',
-          disputeReason: reason.trim(),
+          disputeReason: reason,
           disputeReportedAt: new Date(),
           statusHistory: {
             create: {

@@ -2060,25 +2060,27 @@ export const getVendorOrderById = async (req: Request, res: Response): Promise<v
     const { loadVisitChain, visitChainDto, sumChainAmount } = await import('../services/booking-visit-chain');
     const chain = await loadVisitChain(order.id);
     const chainMeta = visitChainDto(chain);
-    // BOM / hub partner: same start + completion PINs the customer sees (shared across visit chain).
+    // BOM / hub partner: PINs only for desk-managed bookings (customer-app bookings keep PIN on customer device).
+    const deskPinSources = new Set(['SALES_MANAGER', 'PHONE_HUB']);
     const pinPrimary = chain[0] || {
       qrChallengeToken: order.qrChallengeToken,
       qrVerifiedAt: order.qrVerifiedAt,
       completionOtpToken: order.completionOtpToken,
       completionOtpVerifiedAt: order.completionOtpVerifiedAt,
     };
-    const managerPins =
-      isManager || isVendor
-        ? (() => {
-            const startOtp = customerStartOtpPayload(pinPrimary);
-            const completionOtp = customerCompletionOtpPayload(pinPrimary);
-            return {
-              startOtp,
-              completionOtp,
-              pinType: startOtp ? ('START' as const) : completionOtp ? ('COMPLETION' as const) : null,
-            };
-          })()
-        : { startOtp: null, completionOtp: null, pinType: null };
+    const canShowManagerPins =
+      (isManager || isVendor) && deskPinSources.has(String(order.bookingSource || ''));
+    const managerPins = canShowManagerPins
+      ? (() => {
+          const startOtp = customerStartOtpPayload(pinPrimary);
+          const completionOtp = customerCompletionOtpPayload(pinPrimary);
+          return {
+            startOtp,
+            completionOtp,
+            pinType: startOtp ? ('START' as const) : completionOtp ? ('COMPLETION' as const) : null,
+          };
+        })()
+      : { startOtp: null, completionOtp: null, pinType: null };
 
     sendSuccess(
       res,
@@ -2686,7 +2688,8 @@ export const completeOrder = async (req: Request, res: Response): Promise<void> 
           }
         }
 
-        const nextStatus = deskManaged ? 'COMPLETED' : 'AWAITING_CUSTOMER_CONFIRMATION';
+        // Completion PIN is the customer's authorization — mark COMPLETED instantly (no approval gate).
+        const nextStatus: BookingStatus = 'COMPLETED';
         const now = new Date();
         for (const current of members) {
           if (
@@ -2704,9 +2707,9 @@ export const completeOrder = async (req: Request, res: Response): Promise<void> 
             data: {
               status: nextStatus,
               completionRequestedAt: now,
+              customerConfirmedAt: now,
               ...(deskManaged
                 ? {
-                    customerConfirmedAt: now,
                     paymentStatus: 'PAID',
                     qrVerifiedAt: current.qrVerifiedAt || now,
                   }
@@ -2730,12 +2733,12 @@ export const completeOrder = async (req: Request, res: Response): Promise<void> 
                 (deskManaged
                   ? 'Working Professional completed desk-assigned job and confirmed on-site UPI collection.'
                   : chainIds.length > 1
-                    ? 'Technician completed visit-chain services. Awaiting customer confirmation.'
-                    : 'Technician completed service delivery. Awaiting customer confirmation.'),
+                    ? 'Technician completed visit-chain services with customer completion PIN.'
+                    : 'Technician completed service delivery with customer completion PIN.'),
             },
           });
         }
-        if (deskManaged && (booking.employeeId)) {
+        if (booking.employeeId) {
           await tx.employeeProfile.update({
             where: { id: booking.employeeId },
             data: { completedJobs: { increment: members.length } },
@@ -2778,7 +2781,7 @@ export const completeOrder = async (req: Request, res: Response): Promise<void> 
         siblingBookingIds: chainIds,
         message: deskManaged
           ? 'Job completed. Payment confirmed by the Working Professional.'
-          : 'Completion submitted. Awaiting customer confirmation.',
+          : 'Job completed. Customer completion PIN verified.',
       },
       200
     );
