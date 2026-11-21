@@ -197,30 +197,29 @@ export interface ExpertCandidate {
   excludedForBooking: boolean;
   acceptingRequests?: boolean;
   vendorActive?: boolean;
-  /** Must be checked in at hub before any order can be assigned. */
+  /** Prefer checked-in when ranking; not required for auto-assign. */
   hubCheckedIn?: boolean;
 }
 
+/**
+ * Auto-assign pool: active hub WPs who are not already busy on another job.
+ * Check-in / Online is preferred in ranking but not required — pros get the job,
+ * then check in at the hub and execute.
+ */
 export function isExpertEligible(e: ExpertCandidate, maxActiveJobs = MAX_ACTIVE_JOBS_PER_EXPERT): boolean {
-  if (!e.isAvailable) return false;
-  if (e.acceptingRequests === false) return false;
-  if (e.hubCheckedIn === false) return false;
   if (!e.userActive) return false;
   if (e.vendorActive === false) return false;
   if (e.excludedForBooking) return false;
   return e.activeJobs < maxActiveJobs;
 }
 
-/** True only when the WP is online and currently hub-checked-in. */
+/** True when the WP can receive an assignment (check-in not required). */
 export function isExpertAssignableNow(e: {
   isAvailable?: boolean | null;
   acceptingRequests?: boolean | null;
   hubCheckedInAt?: Date | string | null;
   user?: { status?: string | null; deletedAt?: Date | string | null } | null;
 }): boolean {
-  if (e.isAvailable === false) return false;
-  if (e.acceptingRequests === false) return false;
-  if (!e.hubCheckedInAt) return false;
   if (e.user && (e.user.status !== 'ACTIVE' || e.user.deletedAt)) return false;
   return true;
 }
@@ -255,12 +254,16 @@ export function scoreExpertCandidate(
   const distanceScore =
     candidate.distanceKm == null ? 8 : (1 - Math.min(candidate.distanceKm / maxDistance, 1)) * 40;
   const availabilityScore = candidate.isAvailable && candidate.acceptingRequests !== false ? 25 : 0;
+  const checkedInScore = candidate.hubCheckedIn ? 15 : 0;
   const workloadScore = (1 - Math.min(candidate.activeJobs / Math.max(MAX_ACTIVE_JOBS_PER_EXPERT, 1), 1)) * 15;
   const vendorScore = candidate.vendorActive === false ? 0 : 10;
   const serviceScore = candidate.offersService ? 5 : 0;
   const eta = candidate.etaMinutes ?? estimateEtaMinutes(candidate.distanceKm, options.speedKmh);
   const etaScore = eta == null ? 2 : (1 - Math.min(eta / 90, 1)) * 5;
-  return Math.round((distanceScore + availabilityScore + workloadScore + vendorScore + serviceScore + etaScore) * 10) / 10;
+  return Math.round(
+    (distanceScore + availabilityScore + checkedInScore + workloadScore + vendorScore + serviceScore + etaScore) *
+      10
+  ) / 10;
 }
 
 export function rankExpertsByScore(
@@ -297,6 +300,10 @@ export function rankEligibleExperts(
   return candidates
     .filter((c) => isExpertEligible(c, maxActiveJobs))
     .sort((a, b) => {
+      // Prefer checked-in / online, then fair rotation.
+      const aReady = (a.hubCheckedIn ? 2 : 0) + (a.isAvailable && a.acceptingRequests !== false ? 1 : 0);
+      const bReady = (b.hubCheckedIn ? 2 : 0) + (b.isAvailable && b.acceptingRequests !== false ? 1 : 0);
+      if (aReady !== bReady) return bReady - aReady;
       const at = a.lastAssignedAt ? a.lastAssignedAt.getTime() : Number.NEGATIVE_INFINITY;
       const bt = b.lastAssignedAt ? b.lastAssignedAt.getTime() : Number.NEGATIVE_INFINITY;
       if (at !== bt) return at < bt ? -1 : 1;

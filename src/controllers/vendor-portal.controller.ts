@@ -3784,24 +3784,7 @@ export const createHubBooking = async (req: Request, res: Response): Promise<voi
         sendError(res, 'FORBIDDEN', 'You can only assign this order to a Working Professional in your hub', 403);
         return;
       }
-      if (!technician.hubCheckedInAt) {
-        sendError(
-          res,
-          'EXPERT_OFFLINE',
-          `${technician.user.name} has not checked in at the hub. Orders cannot be assigned until they check in.`,
-          409
-        );
-        return;
-      }
-      if (!technician.isAvailable || !technician.acceptingRequests) {
-        sendError(
-          res,
-          'EXPERT_OFFLINE',
-          `${technician.user.name} is offline. You cannot assign any order until they check in and turn Online.`,
-          409
-        );
-        return;
-      }
+      // Assign even if not checked in / online — pro sees the order, then checks in to work.
       technicianToAssign = { id: technician.id, userId: technician.userId };
     }
 

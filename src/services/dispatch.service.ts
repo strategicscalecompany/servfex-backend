@@ -465,6 +465,7 @@ async function loadExpertCandidates(
       isAvailable: true,
       acceptingRequests: true,
       hubCheckedInAt: true,
+      bomUnavailableAt: true,
       lastAssignedAt: true,
       completedJobs: true,
       expertKind: true,
@@ -473,7 +474,8 @@ async function loadExpertCandidates(
     },
   });
 
-  const expertIds = experts.map((e) => e.id);
+  const assignableExperts = experts.filter((e) => !e.bomUnavailableAt);
+  const expertIds = assignableExperts.map((e) => e.id);
   const [busyByExpert, previous] = await Promise.all([
     loadBusyByExpert(tx, expertIds, booking),
     tx.bookingAssignment.findMany({
@@ -483,7 +485,7 @@ async function loadExpertCandidates(
   ]);
   const excluded = new Set(previous.map((a) => a.employeeId));
 
-  const candidates: ExpertCandidate[] = experts.map((e) => ({
+  const candidates: ExpertCandidate[] = assignableExperts.map((e) => ({
     id: e.id,
     userId: e.userId,
     isAvailable: e.isAvailable,
@@ -517,9 +519,6 @@ async function loadNearbyScoredExperts(
       employees: {
         where: {
           expertKind: 'SERVICE_PROFESSIONAL',
-          isAvailable: true,
-          acceptingRequests: true,
-          hubCheckedInAt: { not: null },
         },
         select: {
           id: true,
@@ -527,6 +526,7 @@ async function loadNearbyScoredExperts(
           isAvailable: true,
           acceptingRequests: true,
           hubCheckedInAt: true,
+          bomUnavailableAt: true,
           lastAssignedAt: true,
           completedJobs: true,
           lastLatitude: true,
@@ -538,7 +538,9 @@ async function loadNearbyScoredExperts(
     },
   });
 
-  const expertIds = vendors.flatMap((v) => v.employees.map((e) => e.id));
+  const expertIds = vendors.flatMap((v) =>
+    v.employees.filter((e) => !e.bomUnavailableAt).map((e) => e.id)
+  );
   const [busyByExpert, previous] = await Promise.all([
     loadBusyByExpert(tx, expertIds, booking),
     tx.bookingAssignment.findMany({
@@ -555,6 +557,7 @@ async function loadNearbyScoredExperts(
       vendor.vendorServices.length === 0 || vendor.vendorServices.some((vs) => vs.serviceId === booking.serviceId);
     if (!offersService) continue;
     for (const expert of vendor.employees) {
+      if (expert.bomUnavailableAt) continue;
       nameById.set(expert.id, expert.user.name);
       const originLat = expert.lastLatitude ?? vendor.latitude;
       const originLng = expert.lastLongitude ?? vendor.longitude;
@@ -894,9 +897,7 @@ export async function assignExpertManually(input: ManualAssignInput) {
     if (!isExpertAssignableNow(employee)) {
       throw new DispatchError(
         'EXPERT_OFFLINE',
-        !employee.hubCheckedInAt
-          ? `${employee.user.name} has not checked in at the hub. Orders cannot be assigned until they check in.`
-          : `${employee.user.name} is offline and cannot be assigned any order. Ask them to check in and turn Online first.`,
+        `${employee.user.name} cannot be assigned this order right now.`,
         409
       );
     }
@@ -1009,9 +1010,7 @@ export async function acceptAssignment(
       if (!expertRow || !isExpertAssignableNow(expertRow)) {
         throw new DispatchError(
           'EXPERT_OFFLINE',
-          !expertRow?.hubCheckedInAt
-            ? 'Check in at the hub before accepting customer orders'
-            : 'Go Online before accepting customer orders',
+          'You cannot accept this order right now.',
           409
         );
       }
@@ -1050,9 +1049,7 @@ export async function acceptAssignment(
       if (!isExpertAssignableNow(teammate)) {
         throw new DispatchError(
           'TEAMMATE_UNAVAILABLE',
-          !teammate.hubCheckedInAt
-            ? `${teammate.user.name} has not checked in at the hub and cannot be tagged yet`
-            : `${teammate.user.name} is currently unavailable`,
+          `${teammate.user.name} is currently unavailable`,
           409
         );
       }

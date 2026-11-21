@@ -798,8 +798,8 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
     const bookingNumber = `SFX-${Date.now().toString().slice(-6)}-${Math.floor(100 + Math.random() * 900)}`;
     const now = new Date();
     const inRadius = Boolean(matchedVendor);
-    // In-radius: hub Provider assigns manually — no 60s auto-assign to a professional.
-    // Out-of-radius: keep immediate nearest-expert search.
+    // In-radius timed slots: claim + auto-assign crew on Book (checked-in or not).
+    // Out-of-radius: immediate nearest-expert search.
     const assignmentStrategy = inRadius ? 'VENDOR_WINDOW' : 'NEAREST_EXPERT';
     const dispatchDueAt = inRadius ? null : now;
     const servicePoint = isValidCoordinate(address.latitude, address.longitude)
@@ -866,11 +866,19 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
           serviceLng: servicePoint?.lng,
           preferCheckedIn: false,
         });
+        // Invariant: a timed slot booking is confirmed only with full crew assigned.
+        if (claimedCrewIds.length < requiredProfessionals) {
+          throw Object.assign(new Error(SLOT_TAKEN_MESSAGE), {
+            code: 'SLOT_TAKEN',
+            httpStatus: 409,
+          });
+        }
       }
 
-      const createStatus = claimedCrewIds.length >= requiredProfessionals && timedHubClaim
-        ? ('ASSIGNED' as const)
-        : initialStatus;
+      const createStatus =
+        timedHubClaim && claimedCrewIds.length >= requiredProfessionals
+          ? ('ASSIGNED' as const)
+          : initialStatus;
 
       const booking = await tx.booking.create({
         data: {

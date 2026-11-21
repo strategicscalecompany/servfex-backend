@@ -6,9 +6,10 @@ import { prisma } from '../config/prisma';
  * A professional is eligible when BOM assigned them the booking's package,
  * subcategory, and/or parent category (Primary or Secondary).
  *
- * Slot capacity = hub service pros with catalog match who are still accepting work.
- * User.status (ACTIVE / SUSPENDED) does NOT gate slots — only BOM unavailable
- * (isAvailable/acceptingRequests false) drops a pro until BOM restores or they check in.
+ * Slot capacity / auto-assign = catalog-matched hub WPs whether checked in or online.
+ * Pros receive the job first; they check in at the hub and then execute.
+ * User.status (ACTIVE / SUSPENDED) does NOT gate slots.
+ * BOM-forced unavailable (bomUnavailableAt) is excluded in pickCrew / capacity filter.
  *
  * Migration fallback: if no professional at the hub has any catalog assignments yet,
  * treat all hub service professionals as eligible (legacy behaviour).
@@ -16,8 +17,6 @@ import { prisma } from '../config/prisma';
 
 type EmployeeWhereBase = {
   vendorId: string;
-  isAvailable: true;
-  acceptingRequests: true;
   expertKind: 'SERVICE_PROFESSIONAL';
   hubCheckedInAt?: { not: null };
 };
@@ -32,13 +31,13 @@ function buildEmployeeWhereBase(params: {
   vendorId: string;
   requireCheckedIn?: boolean;
 }): EmployeeWhereBase {
-  // Capacity gate is BOM availability only (isAvailable + acceptingRequests).
+  // Slot capacity + auto-assign: catalog-matched WPs whether checked in / online or not.
+  // Pros see the assigned order, then check in at the hub and execute.
   // Do not filter user.status / deletedAt:null here — Mongo null filters drop unset fields,
   // and attendance SUSPENDED must not zero customer slots.
+  // BOM-forced unavailable is filtered in pickCrew (bomUnavailableAt), not here.
   return {
     vendorId: params.vendorId,
-    isAvailable: true,
-    acceptingRequests: true,
     expertKind: 'SERVICE_PROFESSIONAL',
     ...(params.requireCheckedIn ? { hubCheckedInAt: { not: null } } : {}),
   };
@@ -170,14 +169,33 @@ export async function findEligibleEmployeesWithPriority(params: {
   }
 
   if (match.size > 0) {
-    return [...match.entries()].map(([employeeId, priority]) => ({ employeeId, priority }));
+    return excludeBomUnavailable(
+      [...match.entries()].map(([employeeId, priority]) => ({ employeeId, priority }))
+    );
   }
 
   if (!(await hubHasAnyCatalogAssignments(vendorId))) {
-    return listAllHubPros(employeeWhereBase);
+    return excludeBomUnavailable(await listAllHubPros(employeeWhereBase));
   }
 
   return [];
+}
+
+/** Drop pros BOM marked unavailable (Mongo-safe: filter after fetch). */
+async function excludeBomUnavailable(
+  matches: EligibleEmployeeMatch[]
+): Promise<EligibleEmployeeMatch[]> {
+  if (matches.length === 0) return matches;
+  const blocked = await prisma.employeeProfile.findMany({
+    where: {
+      id: { in: matches.map((m) => m.employeeId) },
+      bomUnavailableAt: { not: null },
+    },
+    select: { id: true },
+  });
+  if (blocked.length === 0) return matches;
+  const blockedIds = new Set(blocked.map((b) => b.id));
+  return matches.filter((m) => !blockedIds.has(m.employeeId));
 }
 
 export async function findEligibleEmployeeIds(params: {

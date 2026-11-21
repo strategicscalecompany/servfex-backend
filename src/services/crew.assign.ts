@@ -93,6 +93,9 @@ export async function pickCrewForSlot(params: {
       lastAssignedAt: true,
       completedJobs: true,
       hubCheckedInAt: true,
+      isAvailable: true,
+      acceptingRequests: true,
+      bomUnavailableAt: true,
       lastLatitude: true,
       lastLongitude: true,
     },
@@ -100,6 +103,8 @@ export async function pickCrewForSlot(params: {
 
   const scored: Array<{ id: string; score: number; primaryRank: number }> = [];
   for (const p of profiles) {
+    // BOM marked unavailable — never auto-assign.
+    if (p.bomUnavailableAt) continue;
     if (await employeeBusy(db, p.id, params.startAt, params.endAt, params.excludeBookingId)) {
       continue;
     }
@@ -114,8 +119,10 @@ export async function pickCrewForSlot(params: {
           : 2;
     if (catalogPriority === CatalogAssignmentPriority.PRIMARY) score += 100;
     else if (catalogPriority === CatalogAssignmentPriority.SECONDARY) score += 20;
+    // Prefer checked-in / online; still assign when offline (pro checks in later).
     if (p.hubCheckedInAt) score += 40;
     else if (params.preferCheckedIn) score -= 10;
+    if (p.isAvailable && p.acceptingRequests !== false) score += 15;
     if (
       isValidCoordinate(params.serviceLat, params.serviceLng) &&
       isValidCoordinate(p.lastLatitude, p.lastLongitude)

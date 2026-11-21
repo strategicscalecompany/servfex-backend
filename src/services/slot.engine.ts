@@ -200,50 +200,8 @@ const SLOT_TAKEN_MESSAGE =
   'Sorry, this slot was booked by someone else a fraction of a second before. Please select another slot as soon as possible before someone else gets it.';
 
 /**
- * Hub capacity still reserved by overlapping jobs that have no (or incomplete) crew yet.
- * Assigned pros are already excluded via busy intervals — only count the unfilled headcount.
- */
-async function reservedCrewShortfall(params: {
-  vendorId: string;
-  startAt: Date;
-  endAt: Date;
-  excludeBookingId?: string | null;
-}): Promise<number> {
-  const excludeId = params.excludeBookingId?.trim() || null;
-  const overlapping = await prisma.booking.findMany({
-    where: {
-      vendorId: params.vendorId,
-      status: { in: BUSY_STATUSES },
-      ...(excludeId ? { id: { not: excludeId } } : {}),
-      scheduledStartAt: { lt: params.endAt },
-      scheduledEndAt: { gt: params.startAt },
-    },
-    select: {
-      requiredProfessionals: true,
-      employeeId: true,
-      helperEmployeeId: true,
-      crewMembers: {
-        where: { status: 'ASSIGNED' },
-        select: { id: true },
-      },
-    },
-  });
-
-  let reservedShortfall = 0;
-  for (const b of overlapping) {
-    const need = Math.max(1, b.requiredProfessionals || 1);
-    const assigned = new Set<string>();
-    if (b.employeeId) assigned.add(b.employeeId);
-    if (b.helperEmployeeId) assigned.add(b.helperEmployeeId);
-    const assignedCount = Math.max(assigned.size, b.crewMembers.length);
-    reservedShortfall += Math.max(0, need - assignedCount);
-  }
-  return reservedShortfall;
-}
-
-/**
- * Confirm-time capacity: bookings only (no pre-holds).
- * Free pros minus shortfall from overlapping jobs that still need crew.
+ * Confirm-time capacity: free eligible pros only.
+ * Timed bookings must be assigned crew at Book — unassigned ACCEPTED jobs do not hold seats.
  */
 export async function assertTimedSlotCapacity(params: {
   vendorId: string;
@@ -266,14 +224,7 @@ export async function assertTimedSlotCapacity(params: {
     excludeHoldCapacity: true,
   });
 
-  const reservedShortfall = await reservedCrewShortfall({
-    vendorId: params.vendorId,
-    startAt: params.startAt,
-    endAt: params.endAt,
-    excludeBookingId: params.excludeBookingId,
-  });
-
-  if (free - reservedShortfall < required) {
+  if (free < required) {
     const err = new Error(SLOT_TAKEN_MESSAGE) as Error & { code: string; httpStatus: number };
     err.code = 'SLOT_TAKEN';
     err.httpStatus = 409;
@@ -326,9 +277,9 @@ export async function generateAvailableSlots(params: {
     }),
   ]);
 
-  // Capacity from real bookings only — pre-holds no longer hide slots from other customers.
-  // Also load under-crewed overlapping jobs so browse matches confirm-time SLOT_TAKEN.
-  const [busy, completedEarly, underCrewed] = await Promise.all([
+  // Capacity = pros already assigned to timed jobs. No unassigned ACCEPTED seats —
+  // Book auto-assigns a pro (checked-in or not); see createBooking claimFreeCrewOrThrow.
+  const [busy, completedEarly] = await Promise.all([
     loadBusyIntervals(eligibleIds, dayStart, busyHorizon, params.excludeBookingId),
     isToday
       ? prisma.booking.findMany({
@@ -348,28 +299,6 @@ export async function generateAvailableSlots(params: {
       : Promise.resolve(
           [] as Array<{ scheduledEndAt: Date | null; employeeId: string | null }>
         ),
-    prisma.booking.findMany({
-      where: {
-        vendorId: params.vendorId,
-        status: { in: BUSY_STATUSES },
-        ...(params.excludeBookingId?.trim()
-          ? { id: { not: params.excludeBookingId.trim() } }
-          : {}),
-        scheduledStartAt: { lt: busyHorizon },
-        scheduledEndAt: { gt: dayStart },
-      },
-      select: {
-        requiredProfessionals: true,
-        employeeId: true,
-        helperEmployeeId: true,
-        scheduledStartAt: true,
-        scheduledEndAt: true,
-        crewMembers: {
-          where: { status: 'ASSIGNED' },
-          select: { id: true },
-        },
-      },
-    }),
   ]);
 
   // Duration-based packing: next start = previous end + 15m (e.g. 3h → 6:15 then 9:30).
@@ -379,21 +308,6 @@ export async function generateAvailableSlots(params: {
     const lastStart = lateClose.getTime() - durationMs;
     if (lastStart + 1 > loopEndMs) loopEndMs = lastStart + 1;
   }
-
-  const shortfallForWindow = (startAt: Date, endAt: Date): number => {
-    let shortfall = 0;
-    for (const b of underCrewed) {
-      if (!b.scheduledStartAt || !b.scheduledEndAt) continue;
-      if (b.scheduledStartAt >= endAt || b.scheduledEndAt <= startAt) continue;
-      const need = Math.max(1, b.requiredProfessionals || 1);
-      const assigned = new Set<string>();
-      if (b.employeeId) assigned.add(b.employeeId);
-      if (b.helperEmployeeId) assigned.add(b.helperEmployeeId);
-      const assignedCount = Math.max(assigned.size, b.crewMembers.length);
-      shortfall += Math.max(0, need - assignedCount);
-    }
-    return shortfall;
-  };
 
   const countFreeForWindow = (startAt: Date, endAt: Date): number => {
     let freeCount = 0;
@@ -408,8 +322,7 @@ export async function generateAvailableSlots(params: {
         freeCount++;
       }
     }
-    // Match assertTimedSlotCapacity: hide slots that Book would reject as SLOT_TAKEN.
-    return Math.max(0, freeCount - shortfallForWindow(startAt, endAt));
+    return freeCount;
   };
 
   const slots: SlotCandidate[] = [];
