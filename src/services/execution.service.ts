@@ -439,7 +439,17 @@ export async function verifyStartOtpForExpert(userId: string, bookingId: string,
     );
   }
   if (booking.startOtpLockedUntil && booking.startOtpLockedUntil.getTime() > Date.now()) {
-    throw new DispatchError('OTP_LOCKED', 'Too many incorrect PIN attempts. Try again later.', 429);
+    const secs = Math.max(
+      1,
+      Math.ceil((booking.startOtpLockedUntil.getTime() - Date.now()) / 1000)
+    );
+    const mm = Math.floor(secs / 60);
+    const ss = String(secs % 60).padStart(2, '0');
+    throw new DispatchError(
+      'OTP_LOCKED',
+      `Too many incorrect PIN attempts. Cool-down ${mm}:${ss} — try again after that.`,
+      429
+    );
   }
   if (!isValidStartOtp(otp)) {
     throw new DispatchError('INVALID_OTP', 'Enter the 4-digit start OTP shown on the customer app', 400);
@@ -455,19 +465,25 @@ export async function verifyStartOtpForExpert(userId: string, bookingId: string,
   if (expectedToken !== otp) {
     const attempts = (booking.startOtpAttempts || 0) + 1;
     const locked = attempts >= env.START_OTP_MAX_ATTEMPTS;
+    const lockUntil = locked
+      ? addSeconds(new Date(), env.START_OTP_LOCKOUT_MINUTES * 60)
+      : null;
     await prisma.booking.update({
       where: { id: bookingId },
       data: {
         startOtpAttempts: attempts,
-        startOtpLockedUntil: locked ? addSeconds(new Date(), env.START_OTP_LOCKOUT_MINUTES * 60) : null,
+        startOtpLockedUntil: lockUntil,
       },
     });
+    const remaining = Math.max(0, env.START_OTP_MAX_ATTEMPTS - attempts);
+    const lockSecs = env.START_OTP_LOCKOUT_MINUTES * 60;
+    const lockLabel = `${Math.floor(lockSecs / 60)}:${String(lockSecs % 60).padStart(2, '0')}`;
     throw new DispatchError(
-      'INVALID_OTP',
+      locked ? 'OTP_LOCKED' : 'INVALID_OTP',
       locked
-        ? 'Too many incorrect PIN attempts. The PIN is locked temporarily.'
-        : 'Start OTP does not match this booking. Ask the customer for the 4-digit code',
-      400
+        ? `Too many incorrect PIN attempts. Cool-down ${lockLabel} — try again after that.`
+        : `Start OTP does not match. ${remaining} attempt${remaining === 1 ? '' : 's'} left before a ${env.START_OTP_LOCKOUT_MINUTES}-min cool-down.`,
+      locked ? 429 : 400
     );
   }
 

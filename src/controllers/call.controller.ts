@@ -516,6 +516,7 @@ export const endCall = async (req: Request, res: Response): Promise<void> => {
         });
 
     const peerUserId = call.callerUserId === userId ? call.calleeUserId : call.callerUserId;
+    // Notify both sides so the outgoing UI leaves "Connecting…" when the peer declines.
     emitUserEvent(
       isDecline ? 'call:declined' : 'call:ended',
       {
@@ -525,7 +526,7 @@ export const endCall = async (req: Request, res: Response): Promise<void> => {
         status: newStatus,
         endReason: reason,
       },
-      [peerUserId]
+      [peerUserId, userId]
     );
 
     sendSuccess(res, { call: updated }, 200);

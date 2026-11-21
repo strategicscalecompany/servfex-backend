@@ -52,7 +52,7 @@ const envSchema = z.object({
   AVG_TRAVEL_SPEED_KMH: z.string().default('25').transform((val) => parseFloat(val)),
   START_OTP_MAX_ATTEMPTS: z.string().default('5').transform((val) => parseInt(val, 10)),
   START_OTP_EXPIRY_MINUTES: z.string().default('180').transform((val) => parseInt(val, 10)),
-  START_OTP_LOCKOUT_MINUTES: z.string().default('15').transform((val) => parseInt(val, 10)),
+  START_OTP_LOCKOUT_MINUTES: z.string().default('1').transform((val) => parseInt(val, 10)),
   MISSED_CALL_ESCALATION_THRESHOLD: z.string().default('4').transform((val) => parseInt(val, 10)),
   LOCATION_PING_MIN_INTERVAL_MS: z.string().default('8000').transform((val) => parseInt(val, 10)),
 
