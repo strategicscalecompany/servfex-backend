@@ -19,6 +19,11 @@ export const SLOT_HOLD_TTL_SECONDS = 180; // 3 minutes
 export const EXPRESS_LOOKAHEAD_HOURS = 2;
 export const MAX_REQUIRED_PROFESSIONALS = 4;
 
+/**
+ * Parse a human duration label into minutes.
+ * Ranges like "4-5 hours" / "90-120 mins" use the upper bound so slot capacity
+ * never under-books vs the admin-facing label.
+ */
 export function parseDurationMinutes(
   durationMinutes?: number | null,
   durationText?: string | null
@@ -26,13 +31,30 @@ export function parseDurationMinutes(
   if (durationMinutes != null && Number.isFinite(durationMinutes) && durationMinutes > 0) {
     return Math.round(durationMinutes);
   }
-  const text = (durationText || '').toLowerCase();
+  const text = (durationText || '').toLowerCase().trim();
+  if (!text) return 60;
+
+  const hourRange = text.match(/(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*h/);
+  if (hourRange) {
+    const hi = Math.max(parseFloat(hourRange[1]), parseFloat(hourRange[2]));
+    return Math.round(hi * 60);
+  }
+  const minRange = text.match(/(\d+)\s*-\s*(\d+)\s*m/);
+  if (minRange) {
+    return Math.max(parseInt(minRange[1], 10), parseInt(minRange[2], 10));
+  }
+
   const hourMatch = text.match(/(\d+(?:\.\d+)?)\s*h/);
   const minMatch = text.match(/(\d+)\s*m/);
   let mins = 0;
   if (hourMatch) mins += Math.round(parseFloat(hourMatch[1]) * 60);
   if (minMatch) mins += parseInt(minMatch[1], 10);
   return mins > 0 ? mins : 60;
+}
+
+/** Canonical minutes stored beside admin duration text (same source of truth). */
+export function durationMinutesFromLabel(durationText?: string | null): number {
+  return parseDurationMinutes(null, durationText || '60 mins');
 }
 
 /**

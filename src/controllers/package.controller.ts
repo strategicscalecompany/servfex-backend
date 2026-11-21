@@ -7,6 +7,7 @@ import { uploadToCloudinary } from '../utils/cloudinary';
 import { Prisma } from '@prisma/client';
 import { toMoney } from '../utils/money';
 import { invalidateCatalogCache } from './catalog.controller';
+import { durationMinutesFromLabel } from '../config/scheduling';
 
 /** Keep Service.startingPrice = cheapest active package so tiles + hub fallbacks stay current. */
 async function syncServiceStartingPriceFromPackages(
@@ -346,7 +347,8 @@ export const createPackage = async (req: Request, res: Response, next: NextFunct
           title: name,
           description: shortDescription || name,
           price: toMoney(discountedPrice),
-          durationMinutes: 60,
+          // Same source of truth as admin duration label (e.g. "4-5 hours" → 300).
+          durationMinutes: durationMinutesFromLabel(duration || '60 mins'),
           features: highlights || [],
         },
       });
@@ -434,7 +436,12 @@ export const updatePackage = async (req: Request, res: Response, next: NextFunct
           } : {}),
           ...(savingsLabel !== undefined ? { savingsLabel } : {}),
           ...(pricePerUnitLabel !== undefined ? { pricePerUnitLabel } : {}),
-          ...(duration !== undefined ? { duration } : {}),
+          ...(duration !== undefined
+            ? {
+                duration,
+                durationMinutes: durationMinutesFromLabel(duration),
+              }
+            : {}),
           ...(uploadedCardImage !== undefined ? { cardImage: uploadedCardImage } : {}),
           ...(uploadedBanners !== undefined ? { detailBannerImages: uploadedBanners } : {}),
           ...(uploadedBannerVideo !== undefined ? { detailBannerVideo: uploadedBannerVideo } : {}),
