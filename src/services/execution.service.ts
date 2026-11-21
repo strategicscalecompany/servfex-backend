@@ -399,20 +399,23 @@ export async function getTrackingSnapshot(userId: string, bookingId: string) {
 
 export async function issueStartOtp(bookingId: string, forceNew = false) {
   const chain = await loadVisitChain(bookingId);
-  const primary = chain[0] || (await prisma.booking.findUnique({ where: { id: bookingId } }));
-  if (!primary) throw new DispatchError('NOT_FOUND', 'Booking not found', 404);
-  if (primary.qrVerifiedAt) {
+  // Always anchor OTP to the booking being opened (and its contiguous visit only).
+  const focus =
+    chain.find((c) => c.id === bookingId) ||
+    chain[0] ||
+    (await prisma.booking.findUnique({ where: { id: bookingId } }));
+  if (!focus) throw new DispatchError('NOT_FOUND', 'Booking not found', 404);
+  if (focus.qrVerifiedAt) {
     throw new DispatchError('OTP_ALREADY_USED', 'Start OTP has already been used', 400);
   }
-  const existing = primary.qrChallengeToken;
-  const expired = primary.qrChallengeExpiresAt ? primary.qrChallengeExpiresAt.getTime() < Date.now() : false;
+  const existing = focus.qrChallengeToken;
+  const expired = focus.qrChallengeExpiresAt ? focus.qrChallengeExpiresAt.getTime() < Date.now() : false;
   if (!forceNew && existing && !expired) {
     return existing;
   }
   const token = generateStartOtp();
   const expiresAt = addSeconds(new Date(), env.START_OTP_EXPIRY_MINUTES * 60);
-  const primaryId = primary.visitChainPrimaryId || primary.id;
-  await syncSharedStartOtpToChain(primaryId, token, expiresAt);
+  await syncSharedStartOtpToChain(bookingId, token, expiresAt);
   return token;
 }
 
@@ -454,8 +457,13 @@ export async function verifyStartOtpForExpert(userId: string, bookingId: string,
   if (!isValidStartOtp(otp)) {
     throw new DispatchError('INVALID_OTP', 'Enter the 4-digit start OTP shown on the customer app', 400);
   }
-  const expectedToken = primary.qrChallengeToken || booking.qrChallengeToken;
-  const expectedExpires = primary.qrChallengeExpiresAt || booking.qrChallengeExpiresAt;
+  // Prefer this job's token; fall back to contiguous-visit primary only when truly chained.
+  const expectedToken =
+    booking.qrChallengeToken ||
+    (chain.length >= 2 ? primary.qrChallengeToken : null);
+  const expectedExpires =
+    booking.qrChallengeExpiresAt ||
+    (chain.length >= 2 ? primary.qrChallengeExpiresAt : null);
   if (!expectedToken) {
     throw new DispatchError('BAD_REQUEST', 'No start OTP is active. Ask the customer to open the booking.', 400);
   }
@@ -594,10 +602,9 @@ export async function beginWorkAfterBeforePhotos(userId: string, bookingId: stri
     },
   });
 
-  // One shared completion PIN for the visit chain (primary + siblings).
-  const primaryId = booking.visitChainPrimaryId || chain[0]?.id || bookingId;
+  // One shared completion PIN for the contiguous visit only.
   if (chain.length >= 2) {
-    await syncSharedCompletionOtpToChain(primaryId, completionToken, expiresAt);
+    await syncSharedCompletionOtpToChain(bookingId, completionToken, expiresAt);
   }
 
   await notifyUsers(
@@ -638,8 +645,7 @@ export async function issueCompletionOtp(bookingId: string, forceNew = false) {
   }
   const token = generateCompletionOtp();
   const expiresAt = addSeconds(new Date(), env.START_OTP_EXPIRY_MINUTES * 60);
-  const primaryId = booking.visitChainPrimaryId || booking.id;
-  await syncSharedCompletionOtpToChain(primaryId, token, expiresAt);
+  await syncSharedCompletionOtpToChain(bookingId, token, expiresAt);
   return token;
 }
 

@@ -212,7 +212,27 @@ export async function loadVisitChain(bookingId: string): Promise<VisitChainBooki
   }
 
   const segment = contiguousVisitSegmentAround(pool, seed.id);
-  return segment.length >= 1 ? segment : [seed as VisitChainBooking];
+  const resolved = segment.length >= 1 ? segment : [seed as VisitChainBooking];
+
+  // Stale multi-day cart links: clear visitChainPrimaryId so OTP is not written to a sibling job.
+  if (seed.visitChainPrimaryId) {
+    const linkedIds = new Set(pool.map((r) => r.id));
+    const segmentIds = new Set(resolved.map((r) => r.id));
+    const orphanIds = [...linkedIds].filter((id) => !segmentIds.has(id));
+    if (resolved.length < 2 || orphanIds.length > 0) {
+      const clearIds = resolved.length < 2 ? [seed.id, ...orphanIds] : orphanIds;
+      if (clearIds.length > 0) {
+        void prisma.booking
+          .updateMany({
+            where: { id: { in: clearIds }, visitChainPrimaryId: { not: null } },
+            data: { visitChainPrimaryId: null },
+          })
+          .catch(() => undefined);
+      }
+    }
+  }
+
+  return resolved;
 }
 
 export function visitChainDto(chain: VisitChainBooking[]) {
@@ -284,21 +304,16 @@ export async function relinkVisitChainForCartGroup(cartGroupId: string): Promise
   return group.length > 0 ? loadVisitChain(group[0].id) : [];
 }
 
+/** Sync OTP onto the contiguous visit around `bookingId` (never a stale primary sibling). */
 export async function syncSharedStartOtpToChain(
-  primaryId: string,
+  bookingId: string,
   token: string,
   expiresAt: Date
 ): Promise<void> {
-  const chain = await loadVisitChain(primaryId);
-  if (chain.length < 2) {
-    await prisma.booking.update({
-      where: { id: primaryId },
-      data: { qrChallengeToken: token, qrChallengeExpiresAt: expiresAt },
-    });
-    return;
-  }
+  const chain = await loadVisitChain(bookingId);
+  const ids = (chain.length >= 1 ? chain.map((c) => c.id) : [bookingId]).filter(Boolean);
   await prisma.booking.updateMany({
-    where: { id: { in: chain.map((c) => c.id) } },
+    where: { id: { in: ids } },
     data: {
       qrChallengeToken: token,
       qrChallengeExpiresAt: expiresAt,
@@ -309,12 +324,12 @@ export async function syncSharedStartOtpToChain(
 }
 
 export async function syncSharedCompletionOtpToChain(
-  primaryId: string,
+  bookingId: string,
   token: string,
   expiresAt: Date
 ): Promise<void> {
-  const chain = await loadVisitChain(primaryId);
-  const ids = chain.length >= 2 ? chain.map((c) => c.id) : [primaryId];
+  const chain = await loadVisitChain(bookingId);
+  const ids = (chain.length >= 1 ? chain.map((c) => c.id) : [bookingId]).filter(Boolean);
   await prisma.booking.updateMany({
     where: { id: { in: ids } },
     data: {

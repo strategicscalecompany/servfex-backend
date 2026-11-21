@@ -1215,17 +1215,19 @@ export const getCustomerBookings = async (req: Request, res: Response): Promise<
         const chain = await loadVisitChain(b.id);
         const primary =
           chain.find((c) => c.id === (b.visitChainPrimaryId || chain[0]?.id)) || chain[0] || null;
-        const otpSource = primary
-          ? {
-              ...b,
-              qrChallengeToken: primary.qrChallengeToken ?? b.qrChallengeToken,
-              qrChallengeExpiresAt: primary.qrChallengeExpiresAt ?? b.qrChallengeExpiresAt,
-              qrVerifiedAt: primary.qrVerifiedAt ?? b.qrVerifiedAt,
-              completionOtpToken: primary.completionOtpToken ?? b.completionOtpToken,
-              completionOtpExpiresAt: primary.completionOtpExpiresAt ?? b.completionOtpExpiresAt,
-              completionOtpVerifiedAt: primary.completionOtpVerifiedAt ?? b.completionOtpVerifiedAt,
-            }
-          : b;
+        // Only share OTP across a real contiguous visit — never borrow another day's PIN.
+        const otpSource =
+          chain.length >= 2 && primary
+            ? {
+                ...b,
+                qrChallengeToken: primary.qrChallengeToken ?? b.qrChallengeToken,
+                qrChallengeExpiresAt: primary.qrChallengeExpiresAt ?? b.qrChallengeExpiresAt,
+                qrVerifiedAt: primary.qrVerifiedAt ?? b.qrVerifiedAt,
+                completionOtpToken: primary.completionOtpToken ?? b.completionOtpToken,
+                completionOtpExpiresAt: primary.completionOtpExpiresAt ?? b.completionOtpExpiresAt,
+                completionOtpVerifiedAt: primary.completionOtpVerifiedAt ?? b.completionOtpVerifiedAt,
+              }
+            : b;
         const startOtp = customerStartOtpPayload(otpSource);
         const completionOtp = customerCompletionOtpPayload(otpSource);
         return {
@@ -1296,18 +1298,19 @@ export const getCustomerBookingById = async (req: Request, res: Response): Promi
     const chain = await loadVisitChain(booking.id);
     const primary =
       chain.find((c) => c.id === (booking.visitChainPrimaryId || chain[0]?.id)) || chain[0] || null;
-    // Shared PIN lives on primary for visit chains.
-    const otpSource = primary
-      ? {
-          ...booking,
-          qrChallengeToken: primary.qrChallengeToken ?? booking.qrChallengeToken,
-          qrChallengeExpiresAt: primary.qrChallengeExpiresAt ?? booking.qrChallengeExpiresAt,
-          qrVerifiedAt: primary.qrVerifiedAt ?? booking.qrVerifiedAt,
-          completionOtpToken: primary.completionOtpToken ?? booking.completionOtpToken,
-          completionOtpExpiresAt: primary.completionOtpExpiresAt ?? booking.completionOtpExpiresAt,
-          completionOtpVerifiedAt: primary.completionOtpVerifiedAt ?? booking.completionOtpVerifiedAt,
-        }
-      : booking;
+    // Shared PIN only for a real contiguous visit — never another day's booking PIN.
+    const otpSource =
+      chain.length >= 2 && primary
+        ? {
+            ...booking,
+            qrChallengeToken: primary.qrChallengeToken ?? booking.qrChallengeToken,
+            qrChallengeExpiresAt: primary.qrChallengeExpiresAt ?? booking.qrChallengeExpiresAt,
+            qrVerifiedAt: primary.qrVerifiedAt ?? booking.qrVerifiedAt,
+            completionOtpToken: primary.completionOtpToken ?? booking.completionOtpToken,
+            completionOtpExpiresAt: primary.completionOtpExpiresAt ?? booking.completionOtpExpiresAt,
+            completionOtpVerifiedAt: primary.completionOtpVerifiedAt ?? booking.completionOtpVerifiedAt,
+          }
+        : booking;
     const startOtp = customerStartOtpPayload(otpSource);
     const completionOtp = customerCompletionOtpPayload(otpSource);
     sendSuccess(res, {
