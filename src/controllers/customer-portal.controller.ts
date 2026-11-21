@@ -4,7 +4,7 @@ import { prisma } from '../config/prisma';
 import { generateStartOtp, customerStartOtpPayload, customerCompletionOtpPayload } from '../utils/start-otp';
 import { sendSuccess, sendError } from '../utils/response';
 import { emitBookingRefresh } from '../utils/realtime';
-import { Prisma, BookingStatus } from '@prisma/client';
+import { AssignmentMethod, Prisma, BookingStatus } from '@prisma/client';
 import { emitBookingEvent } from '../utils/realtime';
 import { env } from '../config/env';
 import {
@@ -28,8 +28,12 @@ import {
   phonePlaceholderEmail,
 } from '../services/customer-onboarding.service';
 import { consumeSlotHold, SlotHoldError } from '../services/slot.hold';
-import { assignCrewToBooking, pickCrewForSlot } from '../services/crew.assign';
+import {
+  claimFreeCrewOrThrow,
+  writeCrewAssignmentInTx,
+} from '../services/crew.assign';
 import { resolveRequiredProfessionals } from '../services/tag.eligibility';
+import { assertTimedSlotCapacity, SLOT_TAKEN_MESSAGE } from '../services/slot.engine';
 import { formatTimeSlotLabel } from '../config/scheduling';
 import { DispatchError } from '../services/dispatch.errors';
 import {
@@ -812,53 +816,157 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
         })
       : consumedHold?.requiredProfessionals || 1;
 
+    // Confirm-time claim: no pre-hold. Capacity is checked against real bookings only.
+    if (assignedVendorId && timedStart && timedEnd) {
+      try {
+        await assertTimedSlotCapacity({
+          vendorId: assignedVendorId,
+          categoryId: service.categoryId,
+          subCategoryId: service.subCategoryId,
+          packageId: actualPackageId,
+          startAt: timedStart,
+          endAt: timedEnd,
+          required: requiredProfessionals,
+        });
+      } catch (capErr: any) {
+        if (capErr?.code === 'SLOT_TAKEN') {
+          sendError(res, 'SLOT_TAKEN', capErr.message || SLOT_TAKEN_MESSAGE, 409);
+          return;
+        }
+        throw capErr;
+      }
+    }
+
+    const timedHubClaim = Boolean(matchedVendor && timedStart && timedEnd);
+
     const newBooking = await prisma.$transaction(async (tx) => {
-      const [booking] = await Promise.all([
-        tx.booking.create({
-          data: {
-            bookingNumber,
-            customerId: customerProfile.id,
-            vendorId: assignedVendorId,
-            serviceId,
-            packageId: actualPackageId,
-            addressId: address.id,
-            scheduledDate: effectiveDate,
-            scheduledTimeSlot: effectiveSlotLabel,
-            scheduledStartAt: timedStart,
-            scheduledEndAt: timedEnd,
-            slotType: effectiveSlotType,
-            requiredProfessionals,
-            slotHoldId: consumedHold?.id || null,
-            status: initialStatus,
-            dispatchDueAt,
-            dispatchAttempts: 0,
-            assignmentStrategy,
-            outOfRadiusDispatch: !inRadius,
-            providerDeadlineAt: null,
-            serviceLatitude: servicePoint?.lat ?? null,
-            serviceLongitude: servicePoint?.lng ?? null,
-            serviceFormattedAddress: [address.addressLine1, address.landmark, address.city].filter(Boolean).join(', '),
-            serviceLocationConfirmedAt: servicePoint ? now : null,
-            basePrice: toMoney(basePrice),
-            taxes: toMoney(taxes),
-            totalAmount: toMoney(totalAmount),
-            paymentMethod: paymentMethod || 'ONLINE',
-            paymentStatus: 'PENDING',
-            bookingSource: 'CUSTOMER_APP',
-            qrChallengeToken: generateStartOtp(),
-            qrChallengeExpiresAt: addSeconds(now, env.START_OTP_EXPIRY_MINUTES * 60),
-            notes: bookingNotes,
-            statusHistory: {
-              create: {
-                newStatus: initialStatus,
-                changedBy: userId,
-                changedByRole: 'CUSTOMER',
-                reason: matchedVendor
-                  ? `Hub auto-accepted — routed to ${matchedVendor.warehouseName || matchedVendor.companyName}. Slot ${effectiveDate} (${effectiveSlotLabel}).`
-                  : 'Customer is outside vendor service radiuses; nearest eligible professional search armed',
-              },
+      // Confirm-time: claim free pros for this window before the booking is created.
+      // A pro already on an overlapping job cannot be claimed — second Book gets SLOT_TAKEN.
+      let claimedCrewIds: string[] = [];
+      if (timedHubClaim && assignedVendorId && timedStart && timedEnd) {
+        await assertTimedSlotCapacity({
+          vendorId: assignedVendorId,
+          categoryId: service.categoryId,
+          subCategoryId: service.subCategoryId,
+          packageId: actualPackageId,
+          startAt: timedStart,
+          endAt: timedEnd,
+          required: requiredProfessionals,
+        });
+        claimedCrewIds = await claimFreeCrewOrThrow({
+          tx,
+          vendorId: assignedVendorId,
+          categoryId: service.categoryId,
+          subCategoryId: service.subCategoryId,
+          packageId: actualPackageId,
+          startAt: timedStart,
+          endAt: timedEnd,
+          required: requiredProfessionals,
+          serviceLat: servicePoint?.lat,
+          serviceLng: servicePoint?.lng,
+          preferCheckedIn: false,
+        });
+      }
+
+      const createStatus = claimedCrewIds.length >= requiredProfessionals && timedHubClaim
+        ? ('ASSIGNED' as const)
+        : initialStatus;
+
+      const booking = await tx.booking.create({
+        data: {
+          bookingNumber,
+          customerId: customerProfile.id,
+          vendorId: assignedVendorId,
+          serviceId,
+          packageId: actualPackageId,
+          addressId: address.id,
+          scheduledDate: effectiveDate,
+          scheduledTimeSlot: effectiveSlotLabel,
+          scheduledStartAt: timedStart,
+          scheduledEndAt: timedEnd,
+          slotType: effectiveSlotType,
+          requiredProfessionals,
+          slotHoldId: consumedHold?.id || null,
+          status: createStatus,
+          employeeId: claimedCrewIds[0] || null,
+          helperEmployeeId: claimedCrewIds[1] || null,
+          helperTaggedAt: claimedCrewIds[1] ? now : null,
+          assignmentMethod: claimedCrewIds.length
+            ? AssignmentMethod.AUTO
+            : undefined,
+          assignedAt: claimedCrewIds.length ? now : null,
+          dispatchDueAt,
+          dispatchAttempts: 0,
+          assignmentStrategy,
+          outOfRadiusDispatch: !inRadius,
+          providerDeadlineAt: null,
+          serviceLatitude: servicePoint?.lat ?? null,
+          serviceLongitude: servicePoint?.lng ?? null,
+          serviceFormattedAddress: [address.addressLine1, address.landmark, address.city].filter(Boolean).join(', '),
+          serviceLocationConfirmedAt: servicePoint ? now : null,
+          basePrice: toMoney(basePrice),
+          taxes: toMoney(taxes),
+          totalAmount: toMoney(totalAmount),
+          paymentMethod: paymentMethod || 'ONLINE',
+          paymentStatus: 'PENDING',
+          bookingSource: 'CUSTOMER_APP',
+          qrChallengeToken: generateStartOtp(),
+          qrChallengeExpiresAt: addSeconds(now, env.START_OTP_EXPIRY_MINUTES * 60),
+          notes: bookingNotes,
+          statusHistory: {
+            create: {
+              newStatus: createStatus === 'ASSIGNED' ? 'ACCEPTED' : createStatus,
+              changedBy: userId,
+              changedByRole: 'CUSTOMER',
+              reason: matchedVendor
+                ? `Hub auto-accepted — routed to ${matchedVendor.warehouseName || matchedVendor.companyName}. Slot ${effectiveDate} (${effectiveSlotLabel}).`
+                : 'Customer is outside vendor service radiuses; nearest eligible professional search armed',
             },
           },
+        },
+        include: {
+          customer: {
+            include: {
+              user: { select: { name: true, phone: true, email: true } },
+            },
+          },
+          service: {
+            select: { id: true, name: true, slug: true, startingPrice: true, durationText: true, iconUrl: true, imageUrl: true },
+          },
+          package: true,
+          address: true,
+          vendor: true,
+          employee: {
+            include: {
+              user: { select: { name: true, phone: true } },
+            },
+          },
+          statusHistory: true,
+        },
+      });
+
+      if (claimedCrewIds.length > 0) {
+        await writeCrewAssignmentInTx(tx, {
+          bookingId: booking.id,
+          employeeIds: claimedCrewIds,
+          assignedBy: 'SYSTEM',
+          method: AssignmentMethod.AUTO,
+          oldStatus: 'ACCEPTED',
+          createStatusHistory: true,
+        });
+      }
+
+      await tx.customerProfile.update({
+        where: { id: customerProfile.id },
+        data: {
+          totalBookings: { increment: 1 },
+          totalSpent: toMoney(asDecimal(customerProfile.totalSpent).plus(totalAmount)),
+        },
+      });
+
+      if (claimedCrewIds.length > 0) {
+        return tx.booking.findUniqueOrThrow({
+          where: { id: booking.id },
           include: {
             customer: {
               include: {
@@ -878,15 +986,8 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
             },
             statusHistory: true,
           },
-        }),
-        tx.customerProfile.update({
-          where: { id: customerProfile.id },
-          data: {
-            totalBookings: { increment: 1 },
-            totalSpent: toMoney(asDecimal(customerProfile.totalSpent).plus(totalAmount)),
-          },
-        }),
-      ]);
+        });
+      }
 
       return booking;
     }, { maxWait: 8000, timeout: 15000 });
@@ -897,57 +998,30 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
       void syncDispatchTimer(newBooking.id);
     }
 
-    let bookingResult = newBooking;
+    const bookingResult = newBooking;
 
-    // Timed in-radius bookings: auto-assign N catalog-eligible professionals.
-    if (matchedVendor && timedStart && timedEnd) {
-      try {
-        const crewIds = await pickCrewForSlot({
-          vendorId: matchedVendor.id,
-          categoryId: service.categoryId,
-          subCategoryId: service.subCategoryId,
-          packageId: actualPackageId,
-          startAt: timedStart,
-          endAt: timedEnd,
-          required: requiredProfessionals,
-          serviceLat: servicePoint?.lat,
-          serviceLng: servicePoint?.lng,
-          preferCheckedIn: false,
-        });
-        if (crewIds.length >= requiredProfessionals) {
-          const assigned = await assignCrewToBooking({
-            bookingId: newBooking.id,
-            employeeIds: crewIds,
-            assignedBy: 'SYSTEM',
-            method: 'AUTO',
-          });
-          if (assigned) bookingResult = assigned as typeof newBooking;
-        } else if (matchedVendor.user) {
-          void notifyUsers(
-            [matchedVendor.user.id],
-            `Needs assignment #${bookingNumber}`,
-            `${service.name} for ${effectiveDate} (${effectiveSlotLabel}) — not enough eligible professionals. Assign manually.`,
-            { bookingId: newBooking.id, type: 'booking:assignment_failed' }
-          );
-        }
-      } catch (assignErr) {
-        console.error('Timed auto-assign failed:', assignErr);
-        if (matchedVendor.user) {
-          void notifyUsers(
-            [matchedVendor.user.id],
-            `Needs assignment #${bookingNumber}`,
-            `${service.name} for ${effectiveDate} (${effectiveSlotLabel}). Auto-assign failed — assign manually.`,
-            { bookingId: newBooking.id, type: 'booking:assignment_failed' }
-          );
-        }
-      }
-    } else if (matchedVendor?.user) {
+    // Timed hub bookings already claimed crew inside the transaction.
+    // Untimed hub bookings still need manual assignment.
+    if (matchedVendor?.user && !timedHubClaim) {
       void notifyUsers(
         [matchedVendor.user.id],
         `New booking #${bookingNumber}`,
         `Hub auto-accepted ${service.name} for ${effectiveDate} (${effectiveSlotLabel}). Assign a checked-in Working Professional.`,
         { bookingId: newBooking.id, type: 'booking:new' }
       );
+    } else if (matchedVendor && timedHubClaim && newBooking.employeeId) {
+      const pros = await prisma.employeeProfile.findMany({
+        where: { id: { in: [newBooking.employeeId, newBooking.helperEmployeeId].filter(Boolean) as string[] } },
+        select: { userId: true },
+      });
+      if (pros.length > 0) {
+        void notifyUsers(
+          pros.map((p) => p.userId),
+          `New timed job #${bookingNumber}`,
+          `${service.name} assigned for ${effectiveDate} (${effectiveSlotLabel}).`,
+          { bookingId: newBooking.id, type: 'booking:assignment' }
+        );
+      }
     }
 
     const assignedAlready = Boolean(bookingResult.employeeId);
@@ -999,6 +1073,24 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
 
     sendSuccess(res, { booking: bookingResult }, 201);
   } catch (err: any) {
+    if (err?.code === 'SLOT_TAKEN') {
+      sendError(res, 'SLOT_TAKEN', err.message || SLOT_TAKEN_MESSAGE, 409);
+      return;
+    }
+    // Concurrent Book claims on the same pro can abort the Mongo transaction — treat as race loss.
+    const msg = String(err?.message || '');
+    if (
+      err?.code === 112 ||
+      err?.errorLabels?.includes?.('TransientTransactionError') ||
+      /write conflict|transaction.*aborted|TransientTransactionError/i.test(msg)
+    ) {
+      sendError(res, 'SLOT_TAKEN', SLOT_TAKEN_MESSAGE, 409);
+      return;
+    }
+    if (err instanceof SlotHoldError) {
+      sendError(res, err.code, err.message, err.httpStatus);
+      return;
+    }
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
   }
 };

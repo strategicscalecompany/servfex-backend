@@ -10,8 +10,19 @@ import { TRAVEL_BUFFER_MINUTES, intervalsOverlap } from '../config/scheduling';
 import { findEligibleEmployeeIds, findEligibleEmployeesWithPriority } from './tag.eligibility';
 import { ACTIVE_JOB_STATUSES, haversineKm, isValidCoordinate } from './dispatch.rules';
 import { notifyUsers } from './notify.service';
+import { SLOT_TAKEN_MESSAGE } from './slot.engine';
 
 type Tx = Prisma.TransactionClient;
+
+/** One pro cannot take two overlapping jobs — loser gets SLOT_TAKEN. */
+export function slotTakenError(
+  message: string = SLOT_TAKEN_MESSAGE
+): Error & { code: string; httpStatus: number } {
+  const err = new Error(message) as Error & { code: string; httpStatus: number };
+  err.code = 'SLOT_TAKEN';
+  err.httpStatus = 409;
+  return err;
+}
 
 async function employeeBusy(
   tx: Tx,
@@ -130,75 +141,135 @@ export async function pickCrewForSlot(params: {
   return scored.slice(0, params.required).map((s) => s.id);
 }
 
-export async function assignCrewToBooking(params: {
-  bookingId: string;
-  employeeIds: string[];
-  assignedBy: string;
-  method?: AssignmentMethod;
-}) {
-  if (params.employeeIds.length === 0) return null;
+/**
+ * Confirm-time claim: pick free pros for the window or throw SLOT_TAKEN.
+ * Re-checks busy so a pro already on another job cannot be double-booked.
+ */
+export async function claimFreeCrewOrThrow(
+  params: Parameters<typeof pickCrewForSlot>[0] & { required: number }
+): Promise<string[]> {
+  const required = Math.max(1, params.required);
+  const ids = await pickCrewForSlot({ ...params, required });
+  if (ids.length < required) {
+    throw slotTakenError();
+  }
+  const db = params.tx || prisma;
+  for (const id of ids) {
+    if (await employeeBusy(db, id, params.startAt, params.endAt, params.excludeBookingId)) {
+      throw slotTakenError();
+    }
+  }
+  return ids;
+}
 
+/** Persist crew on a booking inside an open transaction (also bumps lastAssignedAt as a soft lock). */
+export async function writeCrewAssignmentInTx(
+  tx: Tx,
+  params: {
+    bookingId: string;
+    employeeIds: string[];
+    assignedBy: string;
+    method?: AssignmentMethod;
+    oldStatus?: string;
+    createStatusHistory?: boolean;
+  }
+): Promise<void> {
+  if (params.employeeIds.length === 0) return;
   const [leadId, ...rest] = params.employeeIds;
   const now = new Date();
+  const method = params.method || AssignmentMethod.AUTO;
 
-  const booking = await prisma.$transaction(async (tx) => {
-    const updated = await tx.booking.update({
-      where: { id: params.bookingId },
+  await tx.booking.update({
+    where: { id: params.bookingId },
+    data: {
+      employeeId: leadId,
+      status: 'ASSIGNED',
+      assignmentMethod: method,
+      assignedAt: now,
+      helperEmployeeId: rest[0] || null,
+      helperTaggedAt: rest[0] ? now : null,
+    },
+  });
+
+  await tx.bookingCrewMember.deleteMany({ where: { bookingId: params.bookingId } });
+  await tx.bookingCrewMember.createMany({
+    data: params.employeeIds.map((employeeId, idx) => ({
+      bookingId: params.bookingId,
+      employeeId,
+      role: idx === 0 ? CrewMemberRole.LEAD : CrewMemberRole.MEMBER,
+      status: CrewMemberStatus.ASSIGNED,
+    })),
+  });
+
+  for (const employeeId of params.employeeIds) {
+    await tx.bookingAssignment.create({
       data: {
-        employeeId: leadId,
-        status: 'ASSIGNED',
-        assignmentMethod: params.method || AssignmentMethod.AUTO,
-        assignedAt: now,
-        helperEmployeeId: rest[0] || null,
-        helperTaggedAt: rest[0] ? now : null,
-      },
-      include: {
-        service: { select: { name: true } },
-        employee: { include: { user: { select: { id: true, name: true } } } },
-        vendor: { select: { userId: true } },
-      },
-    });
-
-    await tx.bookingCrewMember.deleteMany({ where: { bookingId: params.bookingId } });
-    await tx.bookingCrewMember.createMany({
-      data: params.employeeIds.map((employeeId, idx) => ({
         bookingId: params.bookingId,
         employeeId,
-        role: idx === 0 ? CrewMemberRole.LEAD : CrewMemberRole.MEMBER,
-        status: CrewMemberStatus.ASSIGNED,
-      })),
+        method,
+        status: 'OFFERED',
+        assignedBy: params.assignedBy,
+        reason: 'Timed slot auto-assign',
+        offeredAt: now,
+      },
     });
+    // Same-doc write serializes concurrent claims for this pro on Mongo.
+    await tx.employeeProfile.update({
+      where: { id: employeeId },
+      data: { lastAssignedAt: now },
+    });
+  }
 
-    for (const employeeId of params.employeeIds) {
-      await tx.bookingAssignment.create({
-        data: {
-          bookingId: params.bookingId,
-          employeeId,
-          method: params.method || AssignmentMethod.AUTO,
-          status: 'OFFERED',
-          assignedBy: params.assignedBy,
-          reason: 'Timed slot auto-assign',
-          offeredAt: now,
-        },
-      });
-      await tx.employeeProfile.update({
-        where: { id: employeeId },
-        data: { lastAssignedAt: now },
-      });
-    }
-
+  if (params.createStatusHistory !== false) {
     await tx.bookingStatusHistory.create({
       data: {
         bookingId: params.bookingId,
-        oldStatus: 'ACCEPTED',
+        oldStatus: (params.oldStatus as any) || 'ACCEPTED',
         newStatus: 'ASSIGNED',
         changedBy: params.assignedBy,
         changedByRole: 'SUPER_ADMIN',
         reason: `Auto-assigned ${params.employeeIds.length} professional(s) for timed slot`,
       },
     });
+  }
+}
 
-    return updated;
+export async function assignCrewToBooking(params: {
+  bookingId: string;
+  employeeIds: string[];
+  assignedBy: string;
+  method?: AssignmentMethod;
+  /** Timed window — reject if any selected pro is already busy. */
+  startAt?: Date | null;
+  endAt?: Date | null;
+}) {
+  if (params.employeeIds.length === 0) return null;
+
+  const booking = await prisma.$transaction(async (tx) => {
+    if (params.startAt && params.endAt) {
+      for (const employeeId of params.employeeIds) {
+        if (await employeeBusy(tx, employeeId, params.startAt, params.endAt, params.bookingId)) {
+          throw slotTakenError();
+        }
+      }
+    }
+
+    await writeCrewAssignmentInTx(tx, {
+      bookingId: params.bookingId,
+      employeeIds: params.employeeIds,
+      assignedBy: params.assignedBy,
+      method: params.method,
+      oldStatus: 'ACCEPTED',
+    });
+
+    return tx.booking.findUniqueOrThrow({
+      where: { id: params.bookingId },
+      include: {
+        service: { select: { name: true } },
+        employee: { include: { user: { select: { id: true, name: true } } } },
+        vendor: { select: { userId: true } },
+      },
+    });
   });
 
   const pros = await prisma.employeeProfile.findMany({
