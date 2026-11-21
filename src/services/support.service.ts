@@ -199,6 +199,8 @@ function isSupportEligibleBooking(b: {
   now?: Date;
 }): boolean {
   if (PENDING_STATUSES.includes(b.status)) return true;
+  // Customer dispute / report must always be able to open a BOM ticket.
+  if (b.status === 'DISPUTED') return true;
   if (b.status !== 'COMPLETED') return false;
   const completedAt = b.customerConfirmedAt || b.updatedAt;
   const now = b.now || new Date();
@@ -219,6 +221,7 @@ export async function listCustomerSupportEligibleBookings(userId: string) {
       customerId: customer.id,
       OR: [
         { status: { in: PENDING_STATUSES } },
+        { status: 'DISPUTED' },
         {
           status: 'COMPLETED',
           OR: [{ customerConfirmedAt: { gte: since } }, { updatedAt: { gte: since } }],

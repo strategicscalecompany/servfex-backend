@@ -234,10 +234,66 @@ export async function sendBookingMessage(
   return message;
 }
 
+/** Older report-issue path marked DISPUTED without opening a CUSTOMER_SUPPORT ticket. */
+async function backfillMissingDisputeTickets(hubIds: string[]) {
+  const disputed = await prisma.booking.findMany({
+    where: {
+      vendorId: { in: hubIds },
+      status: 'DISPUTED',
+      escalations: {
+        none: {
+          reason: 'CUSTOMER_SUPPORT',
+          status: { in: ['OPEN', 'ACKNOWLEDGED', 'IN_PROGRESS'] },
+        },
+      },
+    },
+    take: 20,
+    select: {
+      id: true,
+      status: true,
+      disputeReason: true,
+      customer: { select: { user: { select: { id: true, name: true, phone: true } } } },
+      employee: { select: { id: true, user: { select: { name: true, phone: true } } } },
+      serviceFormattedAddress: true,
+      address: { select: { addressLine1: true, city: true } },
+    },
+  });
+
+  for (const b of disputed) {
+    const note = (b.disputeReason || 'Customer reported an issue on this booking').slice(0, 500);
+    await prisma.escalationTicket.create({
+      data: {
+        bookingId: b.id,
+        reason: 'CUSTOMER_SUPPORT',
+        status: 'OPEN',
+        customerName: b.customer?.user?.name || 'Customer',
+        customerPhone: b.customer?.user?.phone || '',
+        professionalName: b.employee?.user?.name || null,
+        professionalPhone: b.employee?.user?.phone || null,
+        professionalId: b.employee?.id || null,
+        orderLocation:
+          b.serviceFormattedAddress ||
+          [b.address?.addressLine1, b.address?.city].filter(Boolean).join(', ') ||
+          null,
+        orderStatusSnapshot: b.status,
+        createdBy: b.customer?.user?.id || 'SYSTEM',
+        actions: {
+          create: {
+            actorUserId: b.customer?.user?.id || 'SYSTEM',
+            action: 'CUSTOMER_OPENED_SUPPORT',
+            note,
+          },
+        },
+      },
+    });
+  }
+}
+
 /** Recent hub conversations for BOM inbox. */
 export async function listHubChatInbox(userId: string, hubIds: string[], limit = 40) {
   if (hubIds.length === 0) return [];
   const take = Math.min(Math.max(limit, 1), 80);
+  await backfillMissingDisputeTickets(hubIds);
   const bookings = await prisma.booking.findMany({
     where: {
       vendorId: { in: hubIds },
@@ -254,6 +310,7 @@ export async function listHubChatInbox(userId: string, hubIds: string[], limit =
               'IN_PROGRESS',
               'AWAITING_CUSTOMER_CONFIRMATION',
               'AWAITING_PAYMENT',
+              'DISPUTED',
             ],
           },
         },

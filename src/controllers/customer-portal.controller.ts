@@ -1745,28 +1745,66 @@ export const reportBookingIssue = async (req: Request, res: Response): Promise<v
       return;
     }
 
-    const updated = await prisma.$transaction(async (tx) => {
-      return tx.booking.update({
-        where: { id },
-        data: {
-          status: 'DISPUTED',
-          disputeReason: reason,
-          disputeReportedAt: new Date(),
-          statusHistory: {
-            create: {
-              oldStatus: booking.status,
-              newStatus: 'DISPUTED',
-              changedBy: userId,
-              changedByRole: 'CUSTOMER',
-              reason: `Dispute reported by customer: ${reason.trim()}`,
-            },
+    // Open BOM Tickets inbox entry BEFORE flipping status (support eligibility
+    // allows COMPLETED within 24h; DISPUTED alone used to skip ticket creation).
+    let supportTicket: Awaited<ReturnType<typeof createCustomerSupportTicket>> | null = null;
+    try {
+      supportTicket = await createCustomerSupportTicket(userId, id, reason);
+    } catch (ticketErr: any) {
+      // Dispute must still land even if ticket create fails for other reasons.
+      if (!(ticketErr instanceof DispatchError)) {
+        throw ticketErr;
+      }
+    }
+
+    const alreadyDisputed = booking.status === 'DISPUTED';
+    const updated = alreadyDisputed
+      ? await prisma.booking.update({
+          where: { id },
+          data: {
+            disputeReason: reason,
+            disputeReportedAt: booking.disputeReportedAt || new Date(),
           },
-        },
-      });
-    });
+        })
+      : await prisma.$transaction(async (tx) => {
+          return tx.booking.update({
+            where: { id },
+            data: {
+              status: 'DISPUTED',
+              disputeReason: reason,
+              disputeReportedAt: new Date(),
+              statusHistory: {
+                create: {
+                  oldStatus: booking.status,
+                  newStatus: 'DISPUTED',
+                  changedBy: userId,
+                  changedByRole: 'CUSTOMER',
+                  reason: `Dispute reported by customer: ${reason.trim()}`,
+                },
+              },
+            },
+          });
+        });
+
+    // After status is DISPUTED, eligibility always allows ticket create (backfill).
+    if (!supportTicket) {
+      try {
+        supportTicket = await createCustomerSupportTicket(userId, id, reason);
+      } catch {
+        // Non-fatal: booking is already marked DISPUTED for Super Admin desk.
+      }
+    }
 
     void emitBookingRefresh(id);
-    sendSuccess(res, { booking: updated, status: 'DISPUTED' }, 200);
+    sendSuccess(
+      res,
+      {
+        booking: updated,
+        status: 'DISPUTED',
+        ticketId: supportTicket?.ticketId ?? null,
+      },
+      200
+    );
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
   }
