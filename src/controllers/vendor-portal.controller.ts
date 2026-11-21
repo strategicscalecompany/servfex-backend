@@ -2058,36 +2058,48 @@ export const getVendorOrderById = async (req: Request, res: Response): Promise<v
     };
     const sanitizedOrder = sanitizeOrderForViewer(order, viewer);
     const { loadVisitChain, visitChainDto, sumChainAmount } = await import('../services/booking-visit-chain');
-    const chain = await loadVisitChain(order.id);
-    const chainMeta = visitChainDto(chain);
-    // BOM / hub partner: PINs only for desk-managed bookings (customer-app bookings keep PIN on customer device).
-    const deskPinSources = new Set(['SALES_MANAGER', 'PHONE_HUB']);
-    const pinPrimary = chain[0] || {
-      qrChallengeToken: order.qrChallengeToken,
-      qrVerifiedAt: order.qrVerifiedAt,
-      completionOtpToken: order.completionOtpToken,
-      completionOtpVerifiedAt: order.completionOtpVerifiedAt,
-    };
-    const canShowManagerPins =
-      (isManager || isVendor) && deskPinSources.has(String(order.bookingSource || ''));
-    const managerPins = canShowManagerPins
-      ? (() => {
-          const startOtp = customerStartOtpPayload(pinPrimary);
-          const completionOtp = customerCompletionOtpPayload(pinPrimary);
-          return {
-            startOtp,
-            completionOtp,
-            pinType: startOtp ? ('START' as const) : completionOtp ? ('COMPLETION' as const) : null,
-          };
-        })()
-      : { startOtp: null, completionOtp: null, pinType: null };
+    let chain = await loadVisitChain(order.id);
+
+    // BOM / hub partner: ensure PINs exist so detail always shows start / completion codes.
+    let managerPins: {
+      startOtp: string | null;
+      completionOtp: string | null;
+      pinType: 'START' | 'COMPLETION' | null;
+    } = { startOtp: null, completionOtp: null, pinType: null };
+    if (isManager || isVendor) {
+      const pinPrimary = chain[0] || order;
+      try {
+        const { issueStartOtp, issueCompletionOtp } = await import('../services/execution.service');
+        if (!pinPrimary.qrVerifiedAt && !customerStartOtpPayload(pinPrimary)) {
+          await issueStartOtp(order.id, false);
+          chain = await loadVisitChain(order.id);
+        } else if (
+          pinPrimary.qrVerifiedAt &&
+          !pinPrimary.completionOtpVerifiedAt &&
+          !customerCompletionOtpPayload(pinPrimary)
+        ) {
+          await issueCompletionOtp(order.id, false);
+          chain = await loadVisitChain(order.id);
+        }
+      } catch {
+        // Keep returning whatever tokens already exist if issue fails.
+      }
+      const refreshed = chain[0] || pinPrimary;
+      const startOtp = customerStartOtpPayload(refreshed);
+      const completionOtp = customerCompletionOtpPayload(refreshed);
+      managerPins = {
+        startOtp,
+        completionOtp,
+        pinType: startOtp ? ('START' as const) : completionOtp ? ('COMPLETION' as const) : null,
+      };
+    }
 
     sendSuccess(
       res,
       {
         order: {
           ...sanitizedOrder,
-          ...chainMeta,
+          ...visitChainDto(chain),
           visitChainTotalAmount: chain.length >= 2 ? sumChainAmount(chain) : sanitizedOrder.totalAmount,
           ...managerPins,
         },
