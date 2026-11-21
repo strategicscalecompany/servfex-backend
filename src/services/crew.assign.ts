@@ -72,6 +72,8 @@ export async function pickCrewForSlot(params: {
   serviceLng?: number | null;
   excludeBookingId?: string;
   preferCheckedIn?: boolean;
+  /** Cart visit chain: reuse the same lead/helper when free for this window. */
+  preferEmployeeIds?: string[];
 }): Promise<string[]> {
   const db = params.tx || prisma;
   const eligibleMatches = await findEligibleEmployeesWithPriority({
@@ -85,6 +87,33 @@ export async function pickCrewForSlot(params: {
     eligibleMatches.map((m) => [m.employeeId, m.priority] as const)
   );
   const eligible = eligibleMatches.map((m) => m.employeeId);
+  const preferSet = new Set((params.preferEmployeeIds || []).filter(Boolean));
+
+  // Prefer earlier cart-group crew when they remain eligible and free.
+  if (preferSet.size > 0) {
+    const preferredFree: string[] = [];
+    for (const id of params.preferEmployeeIds || []) {
+      if (!eligible.includes(id)) continue;
+      if (await employeeBusy(db, id, params.startAt, params.endAt, params.excludeBookingId)) {
+        continue;
+      }
+      preferredFree.push(id);
+      if (preferredFree.length >= params.required) {
+        return preferredFree.slice(0, params.required);
+      }
+    }
+    // Partial prefer: keep them and fill the rest from scored pool below.
+    if (preferredFree.length > 0 && preferredFree.length < params.required) {
+      // fall through with boosted scores
+    } else if (preferredFree.length === 0 && preferSet.size > 0) {
+      const preferredEligible = (params.preferEmployeeIds || []).filter((id) => eligible.includes(id));
+      // Eligible preferred crew are busy → SLOT_TAKEN for visit-chain continuity.
+      // If preferred aren't catalog-eligible for this package, fall through to normal scoring.
+      if (preferredEligible.length > 0) {
+        return [];
+      }
+    }
+  }
 
   const profiles = await db.employeeProfile.findMany({
     where: { id: { in: eligible } },
@@ -117,6 +146,7 @@ export async function pickCrewForSlot(params: {
         : catalogPriority === CatalogAssignmentPriority.SECONDARY
           ? 1
           : 2;
+    if (preferSet.has(p.id)) score += 500;
     if (catalogPriority === CatalogAssignmentPriority.PRIMARY) score += 100;
     else if (catalogPriority === CatalogAssignmentPriority.SECONDARY) score += 20;
     // Prefer checked-in / online; still assign when offline (pro checks in later).

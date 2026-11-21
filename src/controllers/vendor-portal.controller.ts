@@ -26,7 +26,12 @@ import {
   approximateCoordinate,
   LocationViewerRole,
 } from '../services/dispatch.rules';
-import { generateStartOtp, stripStartOtp } from '../utils/start-otp';
+import {
+  customerCompletionOtpPayload,
+  customerStartOtpPayload,
+  generateStartOtp,
+  stripStartOtp,
+} from '../utils/start-otp';
 import {
   beginWorkAfterBeforePhotos,
   computeShiftTiming,
@@ -40,6 +45,8 @@ import { isValidUpiId, normalizeUpiId } from '../utils/upi';
 import { asDecimal, sumMoney, toMoney, toMoneyOrNull } from '../utils/money';
 import { sendPushToUserIds } from '../services/push.service';
 import { env } from '../config/env';
+import { normalizeIndianMobile } from '../utils/otp.util';
+import { phonePlaceholderEmail } from '../services/customer-onboarding.service';
 import { estimatePayloadBytes, MAX_DOCUMENT_BYTES, resolveHostedUrl } from '../utils/cloudinary';
 import { invalidateCatalogCache } from './catalog.controller';
 import {
@@ -179,7 +186,8 @@ export const verifyOrderQrSchema = z
 export const createHubBookingSchema = z
   .object({
     customerName: z.string().min(2),
-    customerPhone: z.string().min(10),
+    /** At least one of phone or email is required (both OK). */
+    customerPhone: z.union([z.string(), z.literal('')]).optional(),
     customerEmail: z.union([z.string().email(), z.literal('')]).optional(),
     serviceId: z.union([z.string().uuid(), z.literal('')]).optional(),
     serviceName: z.string().min(2).optional(),
@@ -200,7 +208,18 @@ export const createHubBookingSchema = z
   .refine((data) => Boolean(data.serviceId || data.serviceName), {
     message: 'Select a matching service or type a new service name to publish',
     path: ['serviceName'],
-  });
+  })
+  .refine(
+    (data) => {
+      const phoneDigits = String(data.customerPhone || '').replace(/\D/g, '');
+      const email = String(data.customerEmail || '').trim();
+      return phoneDigits.length >= 10 || /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+    },
+    {
+      message: 'Enter customer mobile number or email (at least one is required)',
+      path: ['customerPhone'],
+    }
+  );
 
 export const hubRescheduleBookingSchema = z.object({
   scheduledDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Scheduled date must be YYYY-MM-DD'),
@@ -1920,7 +1939,28 @@ export const getVendorOrders = async (req: Request, res: Response): Promise<void
       isManager,
       employeeId,
     };
-    const sanitizedOrders = orders.map((o) => sanitizeOrderForViewer(o, viewer));
+    const sanitizedOrders = await Promise.all(
+      orders.map(async (o) => {
+        const base = sanitizeOrderForViewer(o, viewer);
+        const primaryId = (o as { visitChainPrimaryId?: string | null }).visitChainPrimaryId || null;
+        const cartGroupId = (o as { cartGroupId?: string | null }).cartGroupId || null;
+        return {
+          ...base,
+          cartGroupId,
+          cartGroupIndex: (o as { cartGroupIndex?: number | null }).cartGroupIndex ?? null,
+          visitChainPrimaryId: primaryId,
+          isVisitChain: Boolean(primaryId),
+          siblingBookingIds: primaryId
+            ? orders
+                .filter(
+                  (x) =>
+                    (x as { visitChainPrimaryId?: string | null }).visitChainPrimaryId === primaryId
+                )
+                .map((x) => x.id)
+            : [],
+        };
+      })
+    );
 
     sendSuccess(
       res,
@@ -1986,8 +2026,41 @@ export const getVendorOrderById = async (req: Request, res: Response): Promise<v
       employeeId,
     };
     const sanitizedOrder = sanitizeOrderForViewer(order, viewer);
+    const { loadVisitChain, visitChainDto, sumChainAmount } = await import('../services/booking-visit-chain');
+    const chain = await loadVisitChain(order.id);
+    const chainMeta = visitChainDto(chain);
+    // BOM / hub partner: same start + completion PINs the customer sees (shared across visit chain).
+    const pinPrimary = chain[0] || {
+      qrChallengeToken: order.qrChallengeToken,
+      qrVerifiedAt: order.qrVerifiedAt,
+      completionOtpToken: order.completionOtpToken,
+      completionOtpVerifiedAt: order.completionOtpVerifiedAt,
+    };
+    const managerPins =
+      isManager || isVendor
+        ? (() => {
+            const startOtp = customerStartOtpPayload(pinPrimary);
+            const completionOtp = customerCompletionOtpPayload(pinPrimary);
+            return {
+              startOtp,
+              completionOtp,
+              pinType: startOtp ? ('START' as const) : completionOtp ? ('COMPLETION' as const) : null,
+            };
+          })()
+        : { startOtp: null, completionOtp: null, pinType: null };
 
-    sendSuccess(res, { order: sanitizedOrder }, 200);
+    sendSuccess(
+      res,
+      {
+        order: {
+          ...sanitizedOrder,
+          ...chainMeta,
+          visitChainTotalAmount: chain.length >= 2 ? sumChainAmount(chain) : sanitizedOrder.totalAmount,
+          ...managerPins,
+        },
+      },
+      200
+    );
   } catch (err: any) {
     sendError(res, 'INTERNAL_SERVER_ERROR', err.message, 500);
   }
@@ -2043,64 +2116,14 @@ export const updateOrderStatus = async (req: Request, res: Response): Promise<vo
         return;
       }
       if (status === 'IN_PROGRESS') {
-        const bookingForStart = await prisma.booking.findFirst({
-          where: { id, employeeId: user.employeeProfile.id },
-          select: {
-            id: true,
-            status: true,
-            bookingSource: true,
-            bookingNumber: true,
-            beforePhotoUrls: true,
-            qrVerifiedAt: true,
-          },
-        });
-        if (!bookingForStart) {
-          sendError(res, 'NOT_FOUND', 'Order not found or unauthorized', 404);
-          return;
-        }
-        const deskManaged =
-          bookingForStart.bookingSource === 'SALES_MANAGER' || bookingForStart.bookingSource === 'PHONE_HUB';
-        if (!deskManaged) {
-          sendError(
-            res,
-            'INVALID_TRANSITION',
-            'Verify the start OTP, then upload 4 before photographs to begin work',
-            400
-          );
-          return;
-        }
-        if (bookingForStart.status !== 'ARRIVED') {
-          sendError(
-            res,
-            'INVALID_TRANSITION',
-            `Cannot start work from ${bookingForStart.status}. Mark arrived first, then upload 4 before photographs.`,
-            409
-          );
-          return;
-        }
-        if (!hasRequiredBeforePhotos(bookingForStart.beforePhotoUrls)) {
-          sendError(
-            res,
-            'PHOTOS_REQUIRED',
-            `Upload at least ${MIN_BEFORE_PHOTOS} before photographs showing site condition before starting work. Currently ${countValidBeforePhotos(bookingForStart.beforePhotoUrls)} valid photograph(s) are stored.`,
-            400
-          );
-          return;
-        }
-        try {
-          await beginWorkAfterBeforePhotos(userId, id);
-        } catch (err: any) {
-          if (err instanceof DispatchError) {
-            sendError(res, err.code, err.message, err.httpStatus);
-            return;
-          }
-          throw err;
-        }
-        const started = await prisma.booking.findUnique({
-          where: { id },
-          include: ORDER_LIST_INCLUDE,
-        });
-        sendSuccess(res, { order: started ? stripStartOtp(started) : started }, 200);
+        // All sources (including desk SALES_MANAGER / PHONE_HUB) must verify start PIN
+        // then upload before photos — beginWorkAfterBeforePhotos runs from the photo upload path.
+        sendError(
+          res,
+          'INVALID_TRANSITION',
+          'Verify the start OTP, then upload 4 before photographs to begin work',
+          400
+        );
         return;
       }
       if (status === 'ACCEPTED') {
@@ -2134,6 +2157,29 @@ export const updateOrderStatus = async (req: Request, res: Response): Promise<vo
       }
       if (status === 'ON_THE_WAY' || status === 'ARRIVED') {
         await advanceTravelStatus(userId, id, status, { latitude, longitude });
+        // Mirror journey status across same-pro back-to-back visit chain.
+        try {
+          const { loadVisitChain } = await import('../services/booking-visit-chain');
+          const chain = await loadVisitChain(id);
+          if (chain.length >= 2) {
+            for (const sibling of chain) {
+              if (sibling.id === id) continue;
+              if (sibling.status === status) continue;
+              if (
+                (status === 'ON_THE_WAY' && ['ASSIGNED', 'ACCEPTED', 'PENDING'].includes(sibling.status)) ||
+                (status === 'ARRIVED' && ['ON_THE_WAY', 'ASSIGNED', 'ACCEPTED'].includes(sibling.status))
+              ) {
+                try {
+                  await advanceTravelStatus(userId, sibling.id, status, { latitude, longitude });
+                } catch {
+                  // Sibling may already be ahead; ignore.
+                }
+              }
+            }
+          }
+        } catch {
+          // Non-fatal — primary travel update already succeeded.
+        }
         const order = await prisma.booking.findUnique({
           where: { id },
           include: ORDER_LIST_INCLUDE,
@@ -2311,9 +2357,7 @@ export const uploadOrderBeforePhotos = async (req: Request, res: Response): Prom
       return;
     }
 
-    const deskManaged =
-      booking.bookingSource === 'SALES_MANAGER' || booking.bookingSource === 'PHONE_HUB';
-    if (!booking.qrVerifiedAt && !deskManaged) {
+    if (!booking.qrVerifiedAt) {
       sendError(res, 'BAD_REQUEST', 'Verify the customer start PIN before uploading before photographs', 400);
       return;
     }
@@ -2529,106 +2573,141 @@ export const completeOrder = async (req: Request, res: Response): Promise<void> 
       sendError(res, 'BAD_REQUEST', `Cannot complete order in ${booking.status} status. Job must be IN_PROGRESS.`, 400);
       return;
     }
-    const deskManaged =
-      booking.bookingSource === 'SALES_MANAGER' || booking.bookingSource === 'PHONE_HUB';
-    if (!booking.qrVerifiedAt && !deskManaged) {
+    if (!booking.qrVerifiedAt) {
       sendError(res, 'BAD_REQUEST', 'Cannot complete order without verified start OTP', 400);
       return;
     }
 
-    // Customer-app jobs require the professional to enter the customer's completion PIN.
-    if (!deskManaged) {
-      try {
-        const { assertCompletionOtpForExpert } = await import('../services/execution.service');
-        await assertCompletionOtpForExpert(userId, id, completionPinRaw);
-      } catch (pinErr: any) {
-        const code = pinErr?.code || 'INVALID_OTP';
-        const status = pinErr?.httpStatus || 400;
-        sendError(res, code, pinErr?.message || 'Invalid completion PIN', status);
-        return;
-      }
+    const deskManaged =
+      booking.bookingSource === 'SALES_MANAGER' || booking.bookingSource === 'PHONE_HUB';
+
+    const {
+      assertChainBeforePhotosReady,
+      assertChainCompletionPhotosReady,
+      loadVisitChain,
+    } = await import('../services/booking-visit-chain');
+    const visitChain = await loadVisitChain(id);
+    const chainIds = visitChain.length >= 2 ? visitChain.map((c) => c.id) : [id];
+
+    // All jobs (including desk) require the customer's completion PIN (app or BOM fallback).
+    try {
+      const { assertCompletionOtpForExpert } = await import('../services/execution.service');
+      await assertCompletionOtpForExpert(userId, id, completionPinRaw);
+    } catch (pinErr: any) {
+      const code = pinErr?.code || 'INVALID_OTP';
+      const status = pinErr?.httpStatus || 400;
+      sendError(res, code, pinErr?.message || 'Invalid completion PIN', status);
+      return;
     }
 
-    if (!hasRequiredCompletionPhotos(booking.completionPhotoUrls)) {
+    try {
+      assertChainBeforePhotosReady(visitChain);
+      assertChainCompletionPhotosReady(visitChain);
+    } catch (photoErr: any) {
       sendError(
         res,
-        'COMPLETION_PHOTOS_REQUIRED',
-        `Upload at least ${MIN_COMPLETION_PHOTOS} completion photographs before finishing this job. Currently ${countValidCompletionPhotos(booking.completionPhotoUrls)} valid photograph(s) are stored.`,
-        400
+        photoErr?.code || 'COMPLETION_PHOTOS_REQUIRED',
+        photoErr?.message ||
+          `Upload at least ${MIN_COMPLETION_PHOTOS} completion photographs before finishing this job.`,
+        photoErr?.httpStatus || 400
       );
       return;
     }
 
     try {
       await prisma.$transaction(async (tx) => {
-        const current = await tx.booking.findUnique({ where: { id } });
-        if (!current) throw Object.assign(new Error('Order not found'), { code: 'NOT_FOUND' });
-        if (
-          current.status === 'AWAITING_CUSTOMER_CONFIRMATION' ||
-          current.status === 'AWAITING_PAYMENT' ||
-          current.status === 'COMPLETED'
-        ) {
-          return;
-        }
-        if (!(COMPLETABLE_JOB_STATUSES as readonly string[]).includes(current.status)) {
-          throw Object.assign(new Error(`Cannot complete order in ${current.status} status.`), { code: 'BAD_REQUEST' });
-        }
-        if (current.status !== 'IN_PROGRESS') {
-          throw Object.assign(new Error(`Cannot complete order in ${current.status} status.`), { code: 'BAD_REQUEST' });
-        }
-        const currentDeskManaged =
-          current.bookingSource === 'SALES_MANAGER' || current.bookingSource === 'PHONE_HUB';
-        if (!current.qrVerifiedAt && !currentDeskManaged) {
-          throw Object.assign(new Error('Cannot complete order without verified start OTP'), { code: 'BAD_REQUEST' });
-        }
-        if (!hasRequiredCompletionPhotos(current.completionPhotoUrls)) {
-          throw Object.assign(
-            new Error(`Upload at least ${MIN_COMPLETION_PHOTOS} completion photographs before finishing this job.`),
-            { code: 'COMPLETION_PHOTOS_REQUIRED' }
-          );
-        }
-
-        // Desk-managed jobs (Sales Manager / Hub OM) close immediately — no customer-app confirmation.
-        const nextStatus = currentDeskManaged ? 'COMPLETED' : 'AWAITING_CUSTOMER_CONFIRMATION';
-        const flipped = await tx.booking.updateMany({
-          where: {
-            id,
-            status: { in: [...COMPLETABLE_JOB_STATUSES] as BookingStatus[] },
-          },
-          data: {
-            status: nextStatus,
-            completionRequestedAt: new Date(),
-            ...(currentDeskManaged
-              ? {
-                  customerConfirmedAt: new Date(),
-                  paymentStatus: 'PAID',
-                  qrVerifiedAt: current.qrVerifiedAt || new Date(),
-                }
-              : {}),
-          },
-        });
-        if (flipped.count !== 1) {
-          throw Object.assign(new Error('Completion changed while submitting. Please refresh.'), { code: 'ASSIGNMENT_CONFLICT' });
+        const members = await tx.booking.findMany({ where: { id: { in: chainIds } } });
+        if (members.length === 0) throw Object.assign(new Error('Order not found'), { code: 'NOT_FOUND' });
+        for (const current of members) {
+          if (
+            current.status === 'AWAITING_CUSTOMER_CONFIRMATION' ||
+            current.status === 'AWAITING_PAYMENT' ||
+            current.status === 'COMPLETED'
+          ) {
+            continue;
+          }
+          if (!(COMPLETABLE_JOB_STATUSES as readonly string[]).includes(current.status)) {
+            throw Object.assign(new Error(`Cannot complete order in ${current.status} status.`), { code: 'BAD_REQUEST' });
+          }
+          if (current.status !== 'IN_PROGRESS' && chainIds.length === 1) {
+            throw Object.assign(new Error(`Cannot complete order in ${current.status} status.`), { code: 'BAD_REQUEST' });
+          }
+          // Visit chain: later packages may still be ARRIVED after before photos for package 1 only —
+          // require every member IN_PROGRESS before shared close.
+          if (chainIds.length > 1 && current.status !== 'IN_PROGRESS') {
+            throw Object.assign(
+              new Error(
+                `Complete before photos and start work on #${current.bookingNumber} before closing this visit.`
+              ),
+              { code: 'BAD_REQUEST' }
+            );
+          }
+          if (!current.qrVerifiedAt) {
+            throw Object.assign(new Error('Cannot complete order without verified start OTP'), { code: 'BAD_REQUEST' });
+          }
+          if (!hasRequiredCompletionPhotos(current.completionPhotoUrls)) {
+            throw Object.assign(
+              new Error(
+                `Upload at least ${MIN_COMPLETION_PHOTOS} completion photographs for #${current.bookingNumber} before finishing.`
+              ),
+              { code: 'COMPLETION_PHOTOS_REQUIRED' }
+            );
+          }
         }
 
-        await tx.bookingStatusHistory.create({
-          data: {
-            bookingId: id,
-            oldStatus: current.status,
-            newStatus: nextStatus,
-            changedBy: userId,
-            changedByRole: (user?.role as any) || 'EMPLOYEE',
-            reason:
-              completionReason ||
-              (currentDeskManaged
-                ? 'Working Professional completed desk-assigned job and confirmed on-site UPI collection.'
-                : 'Technician completed service delivery. Awaiting customer confirmation.'),
-          },
-        });
-        if (currentDeskManaged && (current.employeeId || booking.employeeId)) {
+        const nextStatus = deskManaged ? 'COMPLETED' : 'AWAITING_CUSTOMER_CONFIRMATION';
+        const now = new Date();
+        for (const current of members) {
+          if (
+            current.status === 'AWAITING_CUSTOMER_CONFIRMATION' ||
+            current.status === 'AWAITING_PAYMENT' ||
+            current.status === 'COMPLETED'
+          ) {
+            continue;
+          }
+          const flipped = await tx.booking.updateMany({
+            where: {
+              id: current.id,
+              status: { in: [...COMPLETABLE_JOB_STATUSES] as BookingStatus[] },
+            },
+            data: {
+              status: nextStatus,
+              completionRequestedAt: now,
+              ...(deskManaged
+                ? {
+                    customerConfirmedAt: now,
+                    paymentStatus: 'PAID',
+                    qrVerifiedAt: current.qrVerifiedAt || now,
+                  }
+                : {}),
+            },
+          });
+          if (flipped.count !== 1) {
+            throw Object.assign(new Error('Completion changed while submitting. Please refresh.'), {
+              code: 'ASSIGNMENT_CONFLICT',
+            });
+          }
+          await tx.bookingStatusHistory.create({
+            data: {
+              bookingId: current.id,
+              oldStatus: current.status,
+              newStatus: nextStatus,
+              changedBy: userId,
+              changedByRole: (user?.role as any) || 'EMPLOYEE',
+              reason:
+                completionReason ||
+                (deskManaged
+                  ? 'Working Professional completed desk-assigned job and confirmed on-site UPI collection.'
+                  : chainIds.length > 1
+                    ? 'Technician completed visit-chain services. Awaiting customer confirmation.'
+                    : 'Technician completed service delivery. Awaiting customer confirmation.'),
+            },
+          });
+        }
+        if (deskManaged && (booking.employeeId)) {
           await tx.employeeProfile.update({
-            where: { id: (current.employeeId || booking.employeeId)! },
-            data: { completedJobs: { increment: 1 } },
+            where: { id: booking.employeeId },
+            data: { completedJobs: { increment: members.length } },
           });
         }
       }, { maxWait: 20_000, timeout: 45_000 });
@@ -2658,11 +2737,14 @@ export const completeOrder = async (req: Request, res: Response): Promise<void> 
     await setLocationSharing(id, false);
     void onEmployeeLeftActiveFieldJob(updated?.employeeId);
     void onEmployeeLeftActiveFieldJob(updated?.helperEmployeeId);
-    void emitBookingRefresh(id, { reason: 'SERVICE_COMPLETED' });
+    for (const memberId of chainIds) {
+      void emitBookingRefresh(memberId, { reason: 'SERVICE_COMPLETED' });
+    }
     sendSuccess(
       res,
       {
         order: updated,
+        siblingBookingIds: chainIds,
         message: deskManaged
           ? 'Job completed. Payment confirmed by the Working Professional.'
           : 'Completion submitted. Awaiting customer confirmation.',
@@ -2720,30 +2802,42 @@ export const recordCashCollection = async (req: Request, res: Response): Promise
       return;
     }
 
-    const collectedAmount = toMoney(amount ?? booking.totalAmount);
+    const { loadVisitChain, sumChainAmount } = await import('../services/booking-visit-chain');
+    const visitChain = await loadVisitChain(id);
+    const chainIds = visitChain.length >= 2 ? visitChain.map((c) => c.id) : [id];
+    const expectedAmount = visitChain.length >= 2 ? sumChainAmount(visitChain) : booking.totalAmount;
+    const collectedAmount = toMoney(amount ?? expectedAmount);
     const isConfirmedByCustomer = booking.customerConfirmedAt != null;
     const nextStatus: BookingStatus = isConfirmedByCustomer ? 'COMPLETED' : booking.status;
+    const now = new Date();
 
     const updated = await prisma.$transaction(async (tx) => {
-      const b = await tx.booking.update({
-        where: { id },
+      await tx.booking.updateMany({
+        where: { id: { in: chainIds } },
         data: {
           cashCollectedAmount: collectedAmount,
-          cashCollectedAt: new Date(),
+          cashCollectedAt: now,
           paymentStatus: 'PAID',
           paymentMethod: 'CASH',
-          status: nextStatus,
-          statusHistory: {
-            create: {
-              oldStatus: booking.status,
-              newStatus: nextStatus,
-              changedBy: userId,
-              changedByRole: (user?.role as any) || 'EMPLOYEE',
-              reason: `Cash collected on site: ₹${collectedAmount}`,
-            },
-          },
+          ...(isConfirmedByCustomer ? { status: nextStatus } : {}),
         },
       });
+      for (const memberId of chainIds) {
+        const member = visitChain.find((c) => c.id === memberId) || booking;
+        await tx.bookingStatusHistory.create({
+          data: {
+            bookingId: memberId,
+            oldStatus: member.status as BookingStatus,
+            newStatus: nextStatus,
+            changedBy: userId,
+            changedByRole: (user?.role as any) || 'EMPLOYEE',
+            reason: `Cash collected on site: ₹${collectedAmount}${
+              chainIds.length > 1 ? ` (visit chain ${chainIds.length} services)` : ''
+            }`,
+          },
+        });
+      }
+      const b = await tx.booking.findUniqueOrThrow({ where: { id } });
 
       await tx.payment.create({
         data: {
@@ -3793,16 +3887,39 @@ export const createHubBooking = async (req: Request, res: Response): Promise<voi
     const slotDate = scheduledDate || today;
     const slotTime = scheduledTimeSlot || '10:00 AM - 12:00 PM';
 
-    const cleanPhone = String(customerPhone).replace(/\s+/g, '');
-    const digits = cleanPhone.replace(/\D/g, '');
-    const cleanEmail = (customerEmail || `${digits || Date.now()}@hub.servfex.local`).toLowerCase().trim();
+    // At least one of phone / email (schema refine). Provision a real customer account
+    // so they can install the app, log in with the same contact, and see order + PINs.
+    const phoneRaw = String(customerPhone || '').trim();
+    const emailRaw = String(customerEmail || '').trim().toLowerCase();
+    const phoneNorm = phoneRaw ? normalizeIndianMobile(phoneRaw) : null;
+    // Customer-app login stores / matches the 10-digit local mobile (not 91…).
+    const clean10 = phoneNorm?.valid ? phoneNorm.clean10Digit! : '';
+    const cleanPhone = clean10 || null;
+    const realEmail =
+      emailRaw && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailRaw) && !emailRaw.endsWith('@hub.servfex.local')
+        ? emailRaw
+        : null;
+    if (!cleanPhone && !realEmail) {
+      sendError(res, 'BAD_REQUEST', 'Enter customer mobile number or email (at least one is required)', 400);
+      return;
+    }
+    const accountEmail = realEmail || phonePlaceholderEmail(clean10 || String(Date.now()).slice(-10));
 
     const customerUser = await prisma.$transaction(async (tx) => {
+      const orClauses: Array<{ phone?: string; email?: string }> = [];
+      if (cleanPhone) {
+        orClauses.push({ phone: cleanPhone });
+        orClauses.push({ phone: `91${cleanPhone}` });
+        orClauses.push({ phone: `+91${cleanPhone}` });
+      }
+      if (realEmail) orClauses.push({ email: realEmail });
+      orClauses.push({ email: accountEmail });
+
       const existing = await tx.user.findFirst({
         where: {
           deletedAt: null,
           role: 'CUSTOMER',
-          OR: [{ phone: cleanPhone }, { email: cleanEmail }],
+          OR: orClauses,
         },
         include: { customerProfile: true, addresses: true },
       });
@@ -3811,6 +3928,20 @@ export const createHubBooking = async (req: Request, res: Response): Promise<voi
         if (!existing.customerProfile) {
           await tx.customerProfile.create({ data: { userId: existing.id } });
         }
+        // Backfill missing contact so app login with either channel works.
+        const placeholderEmail =
+          !existing.email ||
+          existing.email.endsWith('@hub.servfex.local') ||
+          existing.email.endsWith('@phone.servfex.com') ||
+          existing.email.includes('@servfex.phone');
+        await tx.user.update({
+          where: { id: existing.id },
+          data: {
+            name: existing.name?.trim() ? existing.name : customerName,
+            ...(cleanPhone && !existing.phone ? { phone: cleanPhone } : {}),
+            ...(realEmail && placeholderEmail ? { email: realEmail } : {}),
+          },
+        });
         return tx.user.findUniqueOrThrow({
           where: { id: existing.id },
           include: { customerProfile: true, addresses: true },
@@ -3820,11 +3951,11 @@ export const createHubBooking = async (req: Request, res: Response): Promise<voi
       return tx.user.create({
         data: {
           name: customerName,
-          email: cleanEmail,
+          email: accountEmail,
           phone: cleanPhone,
           role: 'CUSTOMER',
           status: 'ACTIVE',
-          isVerified: true,
+          isVerified: false,
           customerProfile: { create: {} },
         },
         include: { customerProfile: true, addresses: true },

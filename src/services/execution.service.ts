@@ -24,6 +24,14 @@ import { buildUpiPaymentUri, formatRupeeAmount, isValidUpiId, isValidUtr, normal
 import { getDrivingDirections } from './directions.service';
 import { emitBookingRefresh, emitToBookingRoom, emitUserEvent } from '../utils/realtime';
 import { notifyUsers } from './notify.service';
+import {
+  assertChainBeforePhotosReady,
+  assertChainCompletionPhotosReady,
+  loadVisitChain,
+  sumChainAmount,
+  syncSharedCompletionOtpToChain,
+  syncSharedStartOtpToChain,
+} from './booking-visit-chain';
 
 const DEFAULT_WORK_RADIUS_METERS = 200;
 /** Checkout allowed anytime after check-in once jobs are done (ops may end early). */
@@ -388,31 +396,27 @@ export async function getTrackingSnapshot(userId: string, bookingId: string) {
 }
 
 export async function issueStartOtp(bookingId: string, forceNew = false) {
-  const booking = await prisma.booking.findUnique({ where: { id: bookingId } });
-  if (!booking) throw new DispatchError('NOT_FOUND', 'Booking not found', 404);
-  if (booking.qrVerifiedAt) {
+  const chain = await loadVisitChain(bookingId);
+  const primary = chain[0] || (await prisma.booking.findUnique({ where: { id: bookingId } }));
+  if (!primary) throw new DispatchError('NOT_FOUND', 'Booking not found', 404);
+  if (primary.qrVerifiedAt) {
     throw new DispatchError('OTP_ALREADY_USED', 'Start OTP has already been used', 400);
   }
-  const existing = booking.qrChallengeToken;
-  const expired = booking.qrChallengeExpiresAt ? booking.qrChallengeExpiresAt.getTime() < Date.now() : false;
+  const existing = primary.qrChallengeToken;
+  const expired = primary.qrChallengeExpiresAt ? primary.qrChallengeExpiresAt.getTime() < Date.now() : false;
   if (!forceNew && existing && !expired) {
     return existing;
   }
   const token = generateStartOtp();
-  await prisma.booking.update({
-    where: { id: bookingId },
-    data: {
-      qrChallengeToken: token,
-      qrChallengeExpiresAt: addSeconds(new Date(), env.START_OTP_EXPIRY_MINUTES * 60),
-      startOtpAttempts: 0,
-      startOtpLockedUntil: null,
-    },
-  });
+  const expiresAt = addSeconds(new Date(), env.START_OTP_EXPIRY_MINUTES * 60);
+  const primaryId = primary.visitChainPrimaryId || primary.id;
+  await syncSharedStartOtpToChain(primaryId, token, expiresAt);
   return token;
 }
 
 export async function verifyStartOtpForExpert(userId: string, bookingId: string, rawOtp: unknown) {
   const otp = normalizeStartOtp(rawOtp);
+  const chain = await loadVisitChain(bookingId);
   const booking = await prisma.booking.findUnique({
     where: { id: bookingId },
     include: { employee: { select: { userId: true } }, customer: { select: { userId: true } } },
@@ -421,7 +425,8 @@ export async function verifyStartOtpForExpert(userId: string, bookingId: string,
   if (booking.employee?.userId !== userId) {
     throw new DispatchError('FORBIDDEN', 'Only the assigned professional can verify the start PIN', 403);
   }
-  if (booking.qrVerifiedAt) {
+  const primary = chain[0] || booking;
+  if (primary.qrVerifiedAt || booking.qrVerifiedAt) {
     throw new DispatchError('OTP_ALREADY_USED', 'This service has already been OTP-verified and started', 400);
   }
   if (!START_OTP_ELIGIBLE_STATUSES.includes(booking.status)) {
@@ -437,13 +442,15 @@ export async function verifyStartOtpForExpert(userId: string, bookingId: string,
   if (!isValidStartOtp(otp)) {
     throw new DispatchError('INVALID_OTP', 'Enter the 4-digit start OTP shown on the customer app', 400);
   }
-  if (!booking.qrChallengeToken) {
+  const expectedToken = primary.qrChallengeToken || booking.qrChallengeToken;
+  const expectedExpires = primary.qrChallengeExpiresAt || booking.qrChallengeExpiresAt;
+  if (!expectedToken) {
     throw new DispatchError('BAD_REQUEST', 'No start OTP is active. Ask the customer to open the booking.', 400);
   }
-  if (booking.qrChallengeExpiresAt && booking.qrChallengeExpiresAt.getTime() < Date.now()) {
+  if (expectedExpires && expectedExpires.getTime() < Date.now()) {
     throw new DispatchError('OTP_EXPIRED', 'Start PIN expired. Ask the customer to refresh it.', 400);
   }
-  if (booking.qrChallengeToken !== otp) {
+  if (expectedToken !== otp) {
     const attempts = (booking.startOtpAttempts || 0) + 1;
     const locked = attempts >= env.START_OTP_MAX_ATTEMPTS;
     await prisma.booking.update({
@@ -462,33 +469,42 @@ export async function verifyStartOtpForExpert(userId: string, bookingId: string,
     );
   }
 
-  // PIN verified — stay ARRIVED until at least 4 before photos are uploaded, then IN_PROGRESS.
-  const updated = await prisma.booking.update({
-    where: { id: bookingId },
+  // PIN verified on the whole visit chain — stay ARRIVED until before photos per package.
+  const now = new Date();
+  const chainIds = chain.length >= 2 ? chain.map((c) => c.id) : [bookingId];
+  await prisma.booking.updateMany({
+    where: { id: { in: chainIds } },
     data: {
-      qrVerifiedAt: new Date(),
+      qrVerifiedAt: now,
       qrChallengeToken: null,
       startOtpAttempts: 0,
       startOtpLockedUntil: null,
-      statusHistory: {
-        create: {
-          oldStatus: booking.status,
-          newStatus: booking.status,
-          changedBy: userId,
-          changedByRole: 'EMPLOYEE',
-          reason: 'Customer start OTP verified on site. Upload 4 before photos to begin work.',
-        },
-      },
     },
   });
+  for (const id of chainIds) {
+    await prisma.bookingStatusHistory.create({
+      data: {
+        bookingId: id,
+        oldStatus: booking.status,
+        newStatus: booking.status,
+        changedBy: userId,
+        changedByRole: 'EMPLOYEE',
+        reason:
+          chainIds.length > 1
+            ? 'Shared visit start OTP verified. Upload before photos for each package to begin work.'
+            : 'Customer start OTP verified on site. Upload 4 before photos to begin work.',
+      },
+    });
+    void emitBookingRefresh(id, { reason: 'START_PIN_VERIFIED' });
+  }
 
+  const updated = await prisma.booking.findUniqueOrThrow({ where: { id: bookingId } });
   await notifyUsers(
     [booking.customer.userId],
     `Professional on site #${booking.bookingNumber}`,
     'Your service professional verified the start PIN and is capturing before photos. Work begins shortly.',
     { bookingId, type: 'booking:pin_verified' }
   );
-  void emitBookingRefresh(bookingId, { reason: 'START_PIN_VERIFIED' });
   return updated;
 }
 
@@ -520,9 +536,7 @@ export async function beginWorkAfterBeforePhotos(userId: string, bookingId: stri
     );
   }
 
-  const deskManaged =
-    booking.bookingSource === 'SALES_MANAGER' || booking.bookingSource === 'PHONE_HUB';
-  if (!booking.qrVerifiedAt && !deskManaged) {
+  if (!booking.qrVerifiedAt) {
     throw new DispatchError(
       'BAD_REQUEST',
       'Verify the customer start PIN before uploading before photos and starting work',
@@ -537,7 +551,9 @@ export async function beginWorkAfterBeforePhotos(userId: string, bookingId: stri
     );
   }
 
+  const chain = await loadVisitChain(bookingId);
   const completionToken = generateCompletionOtp();
+  const expiresAt = addSeconds(new Date(), env.START_OTP_EXPIRY_MINUTES * 60);
   const updated = await prisma.booking.update({
     where: { id: bookingId },
     data: {
@@ -545,7 +561,7 @@ export async function beginWorkAfterBeforePhotos(userId: string, bookingId: stri
       qrVerifiedAt: booking.qrVerifiedAt || new Date(),
       qrChallengeToken: null,
       completionOtpToken: completionToken,
-      completionOtpExpiresAt: addSeconds(new Date(), env.START_OTP_EXPIRY_MINUTES * 60),
+      completionOtpExpiresAt: expiresAt,
       completionOtpVerifiedAt: null,
       completionOtpAttempts: 0,
       statusHistory: {
@@ -560,6 +576,12 @@ export async function beginWorkAfterBeforePhotos(userId: string, bookingId: stri
     },
   });
 
+  // One shared completion PIN for the visit chain (primary + siblings).
+  const primaryId = booking.visitChainPrimaryId || chain[0]?.id || bookingId;
+  if (chain.length >= 2) {
+    await syncSharedCompletionOtpToChain(primaryId, completionToken, expiresAt);
+  }
+
   await notifyUsers(
     [booking.customer.userId],
     `Service started #${booking.bookingNumber}`,
@@ -567,11 +589,15 @@ export async function beginWorkAfterBeforePhotos(userId: string, bookingId: stri
     { bookingId, type: 'booking:started' }
   );
   void emitBookingRefresh(bookingId, { reason: 'SERVICE_STARTED' });
+  for (const sibling of chain) {
+    if (sibling.id !== bookingId) void emitBookingRefresh(sibling.id, { reason: 'SERVICE_STARTED' });
+  }
   return updated;
 }
 
 export async function issueCompletionOtp(bookingId: string, forceNew = false) {
-  const booking = await prisma.booking.findUnique({ where: { id: bookingId } });
+  const chain = await loadVisitChain(bookingId);
+  const booking = chain[0] || (await prisma.booking.findUnique({ where: { id: bookingId } }));
   if (!booking) throw new DispatchError('NOT_FOUND', 'Booking not found', 404);
   if (!booking.qrVerifiedAt) {
     throw new DispatchError('BAD_REQUEST', 'Start PIN must be verified before a completion PIN is issued', 400);
@@ -579,7 +605,10 @@ export async function issueCompletionOtp(bookingId: string, forceNew = false) {
   if (booking.completionOtpVerifiedAt) {
     throw new DispatchError('OTP_ALREADY_USED', 'Completion PIN has already been used', 400);
   }
-  if (!['IN_PROGRESS', 'AWAITING_CUSTOMER_CONFIRMATION'].includes(booking.status)) {
+  const anyInProgress = chain.some((c) =>
+    ['IN_PROGRESS', 'AWAITING_CUSTOMER_CONFIRMATION'].includes(c.status)
+  );
+  if (!anyInProgress && !['IN_PROGRESS', 'AWAITING_CUSTOMER_CONFIRMATION'].includes(booking.status)) {
     throw new DispatchError('BAD_REQUEST', `Cannot issue a completion PIN while booking is ${booking.status}`, 400);
   }
   const existing = booking.completionOtpToken;
@@ -590,14 +619,9 @@ export async function issueCompletionOtp(bookingId: string, forceNew = false) {
     return existing;
   }
   const token = generateCompletionOtp();
-  await prisma.booking.update({
-    where: { id: bookingId },
-    data: {
-      completionOtpToken: token,
-      completionOtpExpiresAt: addSeconds(new Date(), env.START_OTP_EXPIRY_MINUTES * 60),
-      completionOtpAttempts: 0,
-    },
-  });
+  const expiresAt = addSeconds(new Date(), env.START_OTP_EXPIRY_MINUTES * 60);
+  const primaryId = booking.visitChainPrimaryId || booking.id;
+  await syncSharedCompletionOtpToChain(primaryId, token, expiresAt);
   return token;
 }
 
@@ -611,6 +635,7 @@ export async function assertCompletionOtpForExpert(
   rawOtp: unknown
 ): Promise<void> {
   const otp = normalizeCompletionOtp(rawOtp);
+  const chain = await loadVisitChain(bookingId);
   const booking = await prisma.booking.findUnique({
     where: { id: bookingId },
     include: { employee: { select: { userId: true } } },
@@ -619,13 +644,16 @@ export async function assertCompletionOtpForExpert(
   if (booking.employee?.userId !== userId) {
     throw new DispatchError('FORBIDDEN', 'Only the assigned professional can verify the completion PIN', 403);
   }
-  if (booking.completionOtpVerifiedAt) {
+  const primary = chain[0] || booking;
+  if (primary.completionOtpVerifiedAt || booking.completionOtpVerifiedAt) {
     return; // already verified in a prior attempt that didn't finish status flip
   }
   if (!isValidCompletionOtp(otp)) {
     throw new DispatchError('INVALID_OTP', 'Enter the 4-digit completion PIN shown on the customer app', 400);
   }
-  if (!booking.completionOtpToken) {
+  let expected = primary.completionOtpToken || booking.completionOtpToken;
+  const expectedExpires = primary.completionOtpExpiresAt || booking.completionOtpExpiresAt;
+  if (!expected) {
     // Lazy-issue if start was verified but token missing (older bookings).
     const issued = await issueCompletionOtp(bookingId, true);
     if (issued !== otp) {
@@ -635,9 +663,10 @@ export async function assertCompletionOtpForExpert(
         400
       );
     }
-  } else if (booking.completionOtpExpiresAt && booking.completionOtpExpiresAt.getTime() < Date.now()) {
+    expected = issued;
+  } else if (expectedExpires && expectedExpires.getTime() < Date.now()) {
     throw new DispatchError('OTP_EXPIRED', 'Completion PIN expired. Ask the customer to refresh it.', 400);
-  } else if (booking.completionOtpToken !== otp) {
+  } else if (expected !== otp) {
     const attempts = (booking.completionOtpAttempts || 0) + 1;
     await prisma.booking.update({
       where: { id: bookingId },
@@ -650,8 +679,9 @@ export async function assertCompletionOtpForExpert(
     );
   }
 
-  await prisma.booking.update({
-    where: { id: bookingId },
+  const chainIds = chain.length >= 2 ? chain.map((c) => c.id) : [bookingId];
+  await prisma.booking.updateMany({
+    where: { id: { in: chainIds } },
     data: {
       completionOtpVerifiedAt: new Date(),
       completionOtpToken: null,
@@ -691,13 +721,17 @@ export async function buildPaymentQr(userId: string, bookingId: string) {
     );
   }
   const payeeName = hub?.warehouseName || hub?.companyName || 'ServFex Partner';
-  const amount = booking.totalAmount;
+  const chain = await loadVisitChain(bookingId);
+  const amount = chain.length >= 2 ? sumChainAmount(chain) : booking.totalAmount;
   const uri = buildUpiPaymentUri({
     upiId,
     payeeName,
     amount,
     transactionRef: booking.bookingNumber.replace(/[^a-zA-Z0-9]/g, '').slice(0, 35),
-    note: `ServFex ${booking.service.name} ${booking.bookingNumber}`,
+    note:
+      chain.length >= 2
+        ? `ServFex visit ${booking.bookingNumber} (${chain.length} services)`
+        : `ServFex ${booking.service.name} ${booking.bookingNumber}`,
   });
   return {
     bookingId: booking.id,
@@ -708,6 +742,8 @@ export async function buildPaymentQr(userId: string, bookingId: string) {
     payeeName,
     uri,
     paymentStatus: booking.paymentStatus,
+    isVisitChain: chain.length >= 2,
+    siblingBookingIds: chain.length >= 2 ? chain.map((c) => c.id) : [],
     note: 'QR display is not payment confirmation. Mark paid only after verified collection or reconciliation.',
   };
 }
@@ -813,7 +849,8 @@ export async function confirmUpiCollection(userId: string, bookingId: string, ut
     throw new DispatchError('BAD_REQUEST', 'UPI can be confirmed after the service has started', 400);
   }
 
-  const amount = formatRupeeAmount(booking.totalAmount);
+  const chain = await loadVisitChain(bookingId);
+  const amount = formatRupeeAmount(chain.length >= 2 ? sumChainAmount(chain) : booking.totalAmount);
   const existing = booking.payments.find(
     (p) => p.status === 'PAID' && (p.transactionRef === utr || p.method === 'UPI' || p.method === 'CASH')
   );
@@ -827,6 +864,7 @@ export async function confirmUpiCollection(userId: string, bookingId: string, ut
     };
   }
 
+  const chainIds = chain.length >= 2 ? chain.map((c) => c.id) : [bookingId];
   try {
     await prisma.$transaction(async (tx) => {
       await tx.payment.create({
@@ -840,25 +878,31 @@ export async function confirmUpiCollection(userId: string, bookingId: string, ut
             collectorUserId: userId,
             collectionType: 'UPI_UTR',
             confirmedAt: new Date().toISOString(),
+            visitChainIds: chainIds,
           },
         },
       });
-      await tx.booking.update({
-        where: { id: bookingId },
+      await tx.booking.updateMany({
+        where: { id: { in: chainIds } },
         data: {
           paymentStatus: 'PAID',
           paymentMethod: 'UPI',
-          statusHistory: {
-            create: {
-              oldStatus: booking.status,
-              newStatus: booking.status,
-              changedBy: userId,
-              changedByRole: 'EMPLOYEE',
-              reason: `UPI collected and reconciled with UTR ${utr} for ₹${amount}`,
-            },
-          },
         },
       });
+      for (const id of chainIds) {
+        await tx.bookingStatusHistory.create({
+          data: {
+            bookingId: id,
+            oldStatus: booking.status,
+            newStatus: booking.status,
+            changedBy: userId,
+            changedByRole: 'EMPLOYEE',
+            reason: `UPI collected and reconciled with UTR ${utr} for ₹${amount}${
+              chainIds.length > 1 ? ` (visit chain ${chainIds.length} services)` : ''
+            }`,
+          },
+        });
+      }
     });
   } catch (err: any) {
     if (err?.code === 'P2002') {

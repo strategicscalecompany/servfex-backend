@@ -676,6 +676,13 @@ model Booking {
   beforePhotoUrls        String[]             @default([])
   completionPhotoUrls    String[]             @default([])
 
+  /// Multi-package checkout group (same cart). Optional; single-package bookings leave null.
+  cartGroupId            String?
+  cartGroupIndex         Int?
+  /// Earliest sibling id when this booking is part of a same-pro back-to-back visit chain.
+  /// Primary rows point at themselves. Null = not in an active visit chain.
+  visitChainPrimaryId    String?
+
   createdAt          DateTime             @default(now())
   updatedAt          DateTime             @updatedAt
 
@@ -714,6 +721,8 @@ model Booking {
   @@index([assignmentStrategy, status])
   @@index([outOfRadiusDispatch, status])
   @@index([slotHoldId])
+  @@index([cartGroupId])
+  @@index([visitChainPrimaryId])
 }
 
 /// Lead-generation visit captured by a Sales Manager at a warehouse, hub, or business location.

@@ -40,6 +40,12 @@ import {
   createCustomerSupportTicket,
   getCustomerSupportBootstrap,
 } from '../services/support.service';
+import {
+  findPreferredCrewForCartGroup,
+  loadVisitChain,
+  relinkVisitChainForCartGroup,
+  visitChainDto,
+} from '../services/booking-visit-chain';
 
 // -------------------------------------------------------------
 // Validation Schemas
@@ -144,6 +150,9 @@ export const createBookingSchema = z.object({
   paymentMethod: z.enum(['ONLINE', 'CASH', 'UPI', 'CARD', 'WALLET']).default('ONLINE'),
   notes: z.string().optional(),
   alternateContact: z.string().optional(),
+  /** Multi-package checkout: same UUID on every createBooking in one cart submit. */
+  cartGroupId: z.string().uuid().optional().nullable(),
+  cartGroupIndex: z.number().int().min(0).optional().nullable(),
   vendorId: z
     .string()
     .optional()
@@ -628,7 +637,15 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
       notes,
       vendorId,
       alternateContact,
+      cartGroupId: cartGroupIdRaw,
+      cartGroupIndex: cartGroupIndexRaw,
     } = req.body;
+    const cartGroupId =
+      typeof cartGroupIdRaw === 'string' && cartGroupIdRaw.trim() ? cartGroupIdRaw.trim() : null;
+    const cartGroupIndex =
+      typeof cartGroupIndexRaw === 'number' && Number.isFinite(cartGroupIndexRaw)
+        ? Math.max(0, Math.floor(cartGroupIndexRaw))
+        : null;
 
     let consumedHold: Awaited<ReturnType<typeof consumeSlotHold>> | null = null;
     if (slotHoldId) {
@@ -853,6 +870,7 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
           endAt: timedEnd,
           required: requiredProfessionals,
         });
+        const preferEmployeeIds = await findPreferredCrewForCartGroup(cartGroupId);
         claimedCrewIds = await claimFreeCrewOrThrow({
           tx,
           vendorId: assignedVendorId,
@@ -865,6 +883,7 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
           serviceLat: servicePoint?.lat,
           serviceLng: servicePoint?.lng,
           preferCheckedIn: false,
+          preferEmployeeIds,
         });
         // Invariant: a timed slot booking is confirmed only with full crew assigned.
         if (claimedCrewIds.length < requiredProfessionals) {
@@ -921,6 +940,8 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
           qrChallengeToken: generateStartOtp(),
           qrChallengeExpiresAt: addSeconds(now, env.START_OTP_EXPIRY_MINUTES * 60),
           notes: bookingNotes,
+          cartGroupId: cartGroupId || undefined,
+          cartGroupIndex: cartGroupIndex ?? undefined,
           statusHistory: {
             create: {
               newStatus: createStatus === 'ASSIGNED' ? 'ACCEPTED' : createStatus,
@@ -1079,7 +1100,46 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
 
     void emitBookingRefresh(bookingResult.id);
 
-    sendSuccess(res, { booking: bookingResult }, 201);
+    let bookingPayload: Record<string, unknown> = { ...bookingResult };
+    if (cartGroupId) {
+      const chain = await relinkVisitChainForCartGroup(cartGroupId);
+      const chainMeta = visitChainDto(chain);
+      const refreshed = await prisma.booking.findUnique({
+        where: { id: bookingResult.id },
+        include: {
+          customer: {
+            include: {
+              user: { select: { name: true, phone: true, email: true } },
+            },
+          },
+          service: {
+            select: { id: true, name: true, slug: true, startingPrice: true, durationText: true, iconUrl: true, imageUrl: true },
+          },
+          package: true,
+          address: true,
+          vendor: true,
+          employee: {
+            include: {
+              user: { select: { name: true, phone: true } },
+            },
+          },
+          statusHistory: true,
+        },
+      });
+      bookingPayload = { ...(refreshed || bookingResult), ...chainMeta };
+    } else {
+      bookingPayload = {
+        ...bookingResult,
+        cartGroupId: null,
+        cartGroupIndex: null,
+        visitChainPrimaryId: null,
+        isVisitChain: false,
+        siblingBookingIds: [],
+        visitChain: [],
+      };
+    }
+
+    sendSuccess(res, { booking: bookingPayload }, 201);
   } catch (err: any) {
     if (err?.code === 'SLOT_TAKEN') {
       sendError(res, 'SLOT_TAKEN', err.message || SLOT_TAKEN_MESSAGE, 409);
@@ -1145,9 +1205,39 @@ export const getCustomerBookings = async (req: Request, res: Response): Promise<
       prisma.booking.count({ where }),
     ]);
 
+    const enriched = await Promise.all(
+      bookings.map(async (b) => {
+        const chain = await loadVisitChain(b.id);
+        const primary =
+          chain.find((c) => c.id === (b.visitChainPrimaryId || chain[0]?.id)) || chain[0] || null;
+        const otpSource = primary
+          ? {
+              ...b,
+              qrChallengeToken: primary.qrChallengeToken ?? b.qrChallengeToken,
+              qrChallengeExpiresAt: primary.qrChallengeExpiresAt ?? b.qrChallengeExpiresAt,
+              qrVerifiedAt: primary.qrVerifiedAt ?? b.qrVerifiedAt,
+              completionOtpToken: primary.completionOtpToken ?? b.completionOtpToken,
+              completionOtpExpiresAt: primary.completionOtpExpiresAt ?? b.completionOtpExpiresAt,
+              completionOtpVerifiedAt: primary.completionOtpVerifiedAt ?? b.completionOtpVerifiedAt,
+            }
+          : b;
+        const startOtp = customerStartOtpPayload(otpSource);
+        const completionOtp = customerCompletionOtpPayload(otpSource);
+        return {
+          ...b,
+          employee: publicProfessional(b.employee),
+          startOtp,
+          completionOtp,
+          qrChallengeToken: startOtp || completionOtp,
+          pinType: startOtp ? ('START' as const) : completionOtp ? ('COMPLETION' as const) : null,
+          ...visitChainDto(chain),
+        };
+      })
+    );
+
     sendSuccess(
       res,
-      { bookings: bookings.map((b) => ({ ...b, employee: publicProfessional(b.employee) })) },
+      { bookings: enriched },
       200,
       {
         total,
@@ -1198,8 +1288,23 @@ export const getCustomerBookingById = async (req: Request, res: Response): Promi
       return;
     }
 
-    const startOtp = customerStartOtpPayload(booking);
-    const completionOtp = customerCompletionOtpPayload(booking);
+    const chain = await loadVisitChain(booking.id);
+    const primary =
+      chain.find((c) => c.id === (booking.visitChainPrimaryId || chain[0]?.id)) || chain[0] || null;
+    // Shared PIN lives on primary for visit chains.
+    const otpSource = primary
+      ? {
+          ...booking,
+          qrChallengeToken: primary.qrChallengeToken ?? booking.qrChallengeToken,
+          qrChallengeExpiresAt: primary.qrChallengeExpiresAt ?? booking.qrChallengeExpiresAt,
+          qrVerifiedAt: primary.qrVerifiedAt ?? booking.qrVerifiedAt,
+          completionOtpToken: primary.completionOtpToken ?? booking.completionOtpToken,
+          completionOtpExpiresAt: primary.completionOtpExpiresAt ?? booking.completionOtpExpiresAt,
+          completionOtpVerifiedAt: primary.completionOtpVerifiedAt ?? booking.completionOtpVerifiedAt,
+        }
+      : booking;
+    const startOtp = customerStartOtpPayload(otpSource);
+    const completionOtp = customerCompletionOtpPayload(otpSource);
     sendSuccess(res, {
       booking: {
         ...booking,
@@ -1208,6 +1313,7 @@ export const getCustomerBookingById = async (req: Request, res: Response): Promi
         completionOtp,
         qrChallengeToken: startOtp || completionOtp,
         pinType: startOtp ? 'START' : completionOtp ? 'COMPLETION' : null,
+        ...visitChainDto(chain),
       },
     }, 200);
   } catch (err: any) {
