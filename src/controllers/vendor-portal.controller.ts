@@ -1958,10 +1958,32 @@ export const getVendorOrders = async (req: Request, res: Response): Promise<void
                 .filter((x) => (x as { cartGroupId?: string | null }).cartGroupId === cartGroupId)
                 .map((x) => x.id)
             : [];
+        // Soft continuous visit: same customer + doorstep + day + same pro (or both unassigned).
+        const siblingsByDoorstep =
+          siblingsByPrimary.length < 2 && siblingsByCart.length < 2
+            ? orders
+                .filter(
+                  (x) =>
+                    x.customerId === o.customerId &&
+                    x.addressId === o.addressId &&
+                    x.scheduledDate === o.scheduledDate &&
+                    ((x.employeeId && o.employeeId && x.employeeId === o.employeeId) ||
+                      (!x.employeeId && !o.employeeId))
+                )
+                .map((x) => x.id)
+            : [];
         const siblingBookingIds =
-          siblingsByPrimary.length >= 2 ? siblingsByPrimary : siblingsByCart.length >= 2 ? siblingsByCart : [];
+          siblingsByPrimary.length >= 2
+            ? siblingsByPrimary
+            : siblingsByCart.length >= 2
+              ? siblingsByCart
+              : siblingsByDoorstep.length >= 2
+                ? siblingsByDoorstep
+                : [];
         return {
           ...base,
+          customerId: o.customerId,
+          addressId: o.addressId,
           cartGroupId,
           cartGroupIndex: (o as { cartGroupIndex?: number | null }).cartGroupIndex ?? null,
           visitChainPrimaryId: primaryId,
