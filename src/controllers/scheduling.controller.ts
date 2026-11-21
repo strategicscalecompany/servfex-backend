@@ -234,6 +234,7 @@ export const getAvailableSlots = async (req: Request, res: Response): Promise<vo
       else if (eligiblePros.length < requiredProfessionals) emptyReason = 'INSUFFICIENT_PROS';
       else emptyReason = 'NO_CAPACITY';
     }
+    const durationLabel = (pkg?.duration || resolved.service.durationText || '').trim() || null;
     sendSuccess(res, {
       slots: slots.map((s) => ({
         scheduledDate: s.scheduledDate,
@@ -246,6 +247,8 @@ export const getAvailableSlots = async (req: Request, res: Response): Promise<vo
       })),
       vendorId: resolved.vendorId,
       durationMinutes: duration,
+      /** Same admin package label the Super Admin UI shows (e.g. "4-5 hours"). */
+      durationLabel,
       requiredProfessionals,
       eligiblePros: eligiblePros.length,
       ...(emptyReason ? { emptyReason } : {}),
