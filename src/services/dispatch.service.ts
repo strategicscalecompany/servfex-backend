@@ -1463,10 +1463,46 @@ export async function advanceTravelStatus(
       }
     }
 
-    return { changed: true };
+    return {
+      changed: true,
+      customerUserId: booking.customer.userId,
+      bookingNumber: booking.bookingNumber,
+      expertName: expert.user.name,
+      isDeskBooking,
+    };
   }, TX_OPTIONS);
 
   if (!result.changed) return result;
+
+  // Customer must open THIS booking's PIN — push deep-link + mint start OTP on this id only.
+  if (!result.isDeskBooking && result.customerUserId) {
+    effects.pushNotices = [
+      {
+        userIds: [result.customerUserId],
+        title:
+          target === 'ON_THE_WAY'
+            ? `Expert is on the way #${result.bookingNumber}`
+            : `Expert has arrived #${result.bookingNumber}`,
+        message:
+          target === 'ON_THE_WAY'
+            ? `${result.expertName} is heading to your location. Open this booking for live tracking.`
+            : 'Your professional has arrived. Open this booking and share the 4-digit start PIN.',
+        data: {
+          bookingId,
+          type: target === 'ON_THE_WAY' ? 'booking:on_the_way' : 'booking:arrived',
+        },
+      },
+    ];
+  }
+  if (target === 'ON_THE_WAY' || target === 'ARRIVED') {
+    try {
+      const { issueStartOtp } = await import('./execution.service');
+      await issueStartOtp(bookingId, false);
+    } catch {
+      // Non-fatal — customer refresh can still issue the PIN for this booking.
+    }
+  }
+
   void runEffects(effects);
   return result;
 }
