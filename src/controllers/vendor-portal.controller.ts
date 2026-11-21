@@ -48,6 +48,7 @@ import { env } from '../config/env';
 import { normalizeIndianMobile } from '../utils/otp.util';
 import { phonePlaceholderEmail } from '../services/customer-onboarding.service';
 import { estimatePayloadBytes, MAX_DOCUMENT_BYTES, resolveHostedUrl } from '../utils/cloudinary';
+import { contiguousVisitSegmentAround } from '../services/booking-visit-chain';
 import { invalidateCatalogCache } from './catalog.controller';
 import {
   BEFORE_PHOTO_ELIGIBLE_STATUSES,
@@ -1944,33 +1945,57 @@ export const getVendorOrders = async (req: Request, res: Response): Promise<void
         const base = sanitizeOrderForViewer(o, viewer);
         const primaryId = (o as { visitChainPrimaryId?: string | null }).visitChainPrimaryId || null;
         const cartGroupId = (o as { cartGroupId?: string | null }).cartGroupId || null;
+        type ChainRow = {
+          id: string;
+          addressId: string;
+          employeeId: string | null;
+          scheduledStartAt: Date | null;
+          scheduledEndAt: Date | null;
+          cartGroupIndex: number | null;
+        };
+        const asChainRow = (x: (typeof orders)[number]): ChainRow => ({
+          id: x.id,
+          addressId: x.addressId,
+          employeeId: x.employeeId,
+          scheduledStartAt: x.scheduledStartAt,
+          scheduledEndAt: x.scheduledEndAt,
+          cartGroupIndex: (x as { cartGroupIndex?: number | null }).cartGroupIndex ?? null,
+        });
+        // Contiguous back-to-back only (e.g. 3pm+4pm). Same cart / same day ≠ one visit.
         const siblingsByPrimary = primaryId
-          ? orders
-              .filter(
-                (x) =>
-                  (x as { visitChainPrimaryId?: string | null }).visitChainPrimaryId === primaryId
-              )
-              .map((x) => x.id)
+          ? contiguousVisitSegmentAround(
+              orders
+                .filter(
+                  (x) =>
+                    (x as { visitChainPrimaryId?: string | null }).visitChainPrimaryId === primaryId
+                )
+                .map(asChainRow),
+              o.id
+            ).map((x) => x.id)
           : [];
         const siblingsByCart =
           cartGroupId && siblingsByPrimary.length < 2
-            ? orders
-                .filter((x) => (x as { cartGroupId?: string | null }).cartGroupId === cartGroupId)
-                .map((x) => x.id)
+            ? contiguousVisitSegmentAround(
+                orders
+                  .filter((x) => (x as { cartGroupId?: string | null }).cartGroupId === cartGroupId)
+                  .map(asChainRow),
+                o.id
+              ).map((x) => x.id)
             : [];
-        // Soft continuous visit: same customer + doorstep + day + same pro (or both unassigned).
         const siblingsByDoorstep =
           siblingsByPrimary.length < 2 && siblingsByCart.length < 2
-            ? orders
-                .filter(
-                  (x) =>
-                    x.customerId === o.customerId &&
-                    x.addressId === o.addressId &&
-                    x.scheduledDate === o.scheduledDate &&
-                    ((x.employeeId && o.employeeId && x.employeeId === o.employeeId) ||
-                      (!x.employeeId && !o.employeeId))
-                )
-                .map((x) => x.id)
+            ? contiguousVisitSegmentAround(
+                orders
+                  .filter(
+                    (x) =>
+                      x.customerId === o.customerId &&
+                      x.addressId === o.addressId &&
+                      ((x.employeeId && o.employeeId && x.employeeId === o.employeeId) ||
+                        (!x.employeeId && !o.employeeId))
+                  )
+                  .map(asChainRow),
+                o.id
+              ).map((x) => x.id)
             : [];
         const siblingBookingIds =
           siblingsByPrimary.length >= 2
@@ -1987,7 +2012,7 @@ export const getVendorOrders = async (req: Request, res: Response): Promise<void
           cartGroupId,
           cartGroupIndex: (o as { cartGroupIndex?: number | null }).cartGroupIndex ?? null,
           visitChainPrimaryId: primaryId,
-          isVisitChain: siblingBookingIds.length >= 2 || Boolean(primaryId),
+          isVisitChain: siblingBookingIds.length >= 2,
           siblingBookingIds,
         };
       })

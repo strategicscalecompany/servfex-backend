@@ -90,6 +90,85 @@ export function sortChainBySchedule<T extends { scheduledStartAt: Date | null; c
   });
 }
 
+/** Same doorstep; if both sides are assigned, require the same lead pro. */
+export function canChainTogether(
+  a: Pick<VisitChainBooking, 'addressId' | 'employeeId'>,
+  b: Pick<VisitChainBooking, 'addressId' | 'employeeId'>
+): boolean {
+  if (!a.addressId || !b.addressId || a.addressId !== b.addressId) return false;
+  if (a.employeeId && b.employeeId && a.employeeId !== b.employeeId) return false;
+  return true;
+}
+
+/**
+ * Expand around `seedId` to the contiguous back-to-back visit only
+ * (e.g. 3–4pm same day). Non-adjacent / next-day cart siblings stay out.
+ */
+export function contiguousVisitSegmentAround<
+  T extends {
+    id: string;
+    addressId: string;
+    employeeId: string | null;
+    scheduledStartAt: Date | null;
+    scheduledEndAt: Date | null;
+    cartGroupIndex: number | null;
+  },
+>(rows: T[], seedId: string): T[] {
+  if (rows.length === 0) return [];
+  const sorted = sortChainBySchedule(rows);
+  const seedIdx = sorted.findIndex((r) => r.id === seedId);
+  if (seedIdx < 0) return sorted.filter((r) => r.id === seedId);
+
+  let left = seedIdx;
+  let right = seedIdx;
+  while (left > 0) {
+    const prev = sorted[left - 1];
+    const cur = sorted[left];
+    if (!canChainTogether(prev, cur) || !isContiguousSlots(prev.scheduledEndAt, cur.scheduledStartAt)) {
+      break;
+    }
+    left -= 1;
+  }
+  while (right < sorted.length - 1) {
+    const cur = sorted[right];
+    const next = sorted[right + 1];
+    if (!canChainTogether(cur, next) || !isContiguousSlots(cur.scheduledEndAt, next.scheduledStartAt)) {
+      break;
+    }
+    right += 1;
+  }
+  return sorted.slice(left, right + 1);
+}
+
+/** Split a cart into contiguous same-doorstep visit segments. */
+export function splitContiguousVisitSegments<
+  T extends {
+    id: string;
+    addressId: string;
+    employeeId: string | null;
+    scheduledStartAt: Date | null;
+    scheduledEndAt: Date | null;
+    cartGroupIndex: number | null;
+  },
+>(rows: T[]): T[][] {
+  if (rows.length === 0) return [];
+  const sorted = sortChainBySchedule(rows);
+  const segments: T[][] = [];
+  let current: T[] = [sorted[0]];
+  for (let i = 1; i < sorted.length; i++) {
+    const prev = current[current.length - 1];
+    const next = sorted[i];
+    if (canChainTogether(prev, next) && isContiguousSlots(prev.scheduledEndAt, next.scheduledStartAt)) {
+      current.push(next);
+    } else {
+      segments.push(current);
+      current = [next];
+    }
+  }
+  segments.push(current);
+  return segments;
+}
+
 export function isVisitChainActive(rows: VisitChainBooking[]): boolean {
   if (rows.length < 2) return false;
   const sorted = sortChainBySchedule(rows);
@@ -119,29 +198,28 @@ export async function loadVisitChain(bookingId: string): Promise<VisitChainBooki
     select: CHAIN_SELECT,
   });
   if (!seed) return [];
+
+  // Prefer the contiguous segment around this booking — never the whole multi-day cart.
+  let pool: VisitChainBooking[] = [seed as VisitChainBooking];
   if (seed.visitChainPrimaryId) {
     const rows = await prisma.booking.findMany({
       where: { visitChainPrimaryId: seed.visitChainPrimaryId },
       select: CHAIN_SELECT,
     });
-    if (rows.length >= 2) return sortChainBySchedule(rows as VisitChainBooking[]);
+    if (rows.length >= 2) pool = rows as VisitChainBooking[];
+  } else if (seed.cartGroupId) {
+    pool = await loadCartGroupBookings(seed.cartGroupId);
   }
-  if (seed.cartGroupId) {
-    const group = await loadCartGroupBookings(seed.cartGroupId);
-    // Return the full cart for UI (one visit card) even before OTP-link qualifies.
-    // Shared OTP still requires isVisitChainActive via relinkVisitChainForCartGroup.
-    if (group.length >= 2) return group;
-  }
-  return [seed as VisitChainBooking];
+
+  const segment = contiguousVisitSegmentAround(pool, seed.id);
+  return segment.length >= 1 ? segment : [seed as VisitChainBooking];
 }
 
 export function visitChainDto(chain: VisitChainBooking[]) {
   const sorted = sortChainBySchedule(chain);
   const primary = sorted[0];
-  // Display chain: linked visit OR same multi-package cart checkout.
-  const isChain =
-    sorted.length >= 2 &&
-    (Boolean(primary.visitChainPrimaryId) || Boolean(primary.cartGroupId));
+  // One visit card only for contiguous back-to-back packages (same doorstep).
+  const isChain = sorted.length >= 2;
   return {
     cartGroupId: primary.cartGroupId,
     cartGroupIndex: primary.cartGroupIndex,
@@ -166,42 +244,44 @@ export function visitChainDto(chain: VisitChainBooking[]) {
   };
 }
 
-/** After cart creates, link contiguous same-pro siblings and sync start OTP from primary. */
+/** After cart creates, link each contiguous same-pro segment separately (not the whole cart). */
 export async function relinkVisitChainForCartGroup(cartGroupId: string): Promise<VisitChainBooking[]> {
   const group = await loadCartGroupBookings(cartGroupId);
-  if (!isVisitChainActive(group)) {
-    // Clear stale chain markers if group no longer qualifies.
-    const stale = group.filter((g) => g.visitChainPrimaryId);
-    if (stale.length > 0) {
-      await prisma.booking.updateMany({
-        where: { id: { in: stale.map((s) => s.id) } },
-        data: { visitChainPrimaryId: null },
+  const segments = splitContiguousVisitSegments(group);
+
+  const keepLinkedIds = new Set<string>();
+  for (const segment of segments) {
+    if (!isVisitChainActive(segment)) continue;
+    const sorted = sortChainBySchedule(segment);
+    const primaryId = sorted[0].id;
+    const startToken = sorted[0].qrChallengeToken;
+    const startExpires = sorted[0].qrChallengeExpiresAt;
+    for (const row of sorted) {
+      keepLinkedIds.add(row.id);
+      await prisma.booking.update({
+        where: { id: row.id },
+        data: {
+          visitChainPrimaryId: primaryId,
+          ...(startToken
+            ? {
+                qrChallengeToken: startToken,
+                qrChallengeExpiresAt: startExpires,
+              }
+            : {}),
+        },
       });
     }
-    return group;
   }
 
-  const sorted = sortChainBySchedule(group);
-  const primaryId = sorted[0].id;
-  const startToken = sorted[0].qrChallengeToken;
-  const startExpires = sorted[0].qrChallengeExpiresAt;
-
-  for (const row of sorted) {
-    await prisma.booking.update({
-      where: { id: row.id },
-      data: {
-        visitChainPrimaryId: primaryId,
-        ...(startToken
-          ? {
-              qrChallengeToken: startToken,
-              qrChallengeExpiresAt: startExpires,
-            }
-          : {}),
-      },
+  const stale = group.filter((g) => g.visitChainPrimaryId && !keepLinkedIds.has(g.id));
+  if (stale.length > 0) {
+    await prisma.booking.updateMany({
+      where: { id: { in: stale.map((s) => s.id) } },
+      data: { visitChainPrimaryId: null },
     });
   }
 
-  return loadVisitChain(primaryId);
+  return group.length > 0 ? loadVisitChain(group[0].id) : [];
 }
 
 export async function syncSharedStartOtpToChain(
