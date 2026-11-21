@@ -128,7 +128,9 @@ export async function loadVisitChain(bookingId: string): Promise<VisitChainBooki
   }
   if (seed.cartGroupId) {
     const group = await loadCartGroupBookings(seed.cartGroupId);
-    if (isVisitChainActive(group)) return group;
+    // Return the full cart for UI (one visit card) even before OTP-link qualifies.
+    // Shared OTP still requires isVisitChainActive via relinkVisitChainForCartGroup.
+    if (group.length >= 2) return group;
   }
   return [seed as VisitChainBooking];
 }
@@ -136,7 +138,10 @@ export async function loadVisitChain(bookingId: string): Promise<VisitChainBooki
 export function visitChainDto(chain: VisitChainBooking[]) {
   const sorted = sortChainBySchedule(chain);
   const primary = sorted[0];
-  const isChain = sorted.length >= 2 && Boolean(primary.visitChainPrimaryId);
+  // Display chain: linked visit OR same multi-package cart checkout.
+  const isChain =
+    sorted.length >= 2 &&
+    (Boolean(primary.visitChainPrimaryId) || Boolean(primary.cartGroupId));
   return {
     cartGroupId: primary.cartGroupId,
     cartGroupIndex: primary.cartGroupIndex,

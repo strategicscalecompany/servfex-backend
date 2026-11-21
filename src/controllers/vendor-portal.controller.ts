@@ -1944,20 +1944,29 @@ export const getVendorOrders = async (req: Request, res: Response): Promise<void
         const base = sanitizeOrderForViewer(o, viewer);
         const primaryId = (o as { visitChainPrimaryId?: string | null }).visitChainPrimaryId || null;
         const cartGroupId = (o as { cartGroupId?: string | null }).cartGroupId || null;
+        const siblingsByPrimary = primaryId
+          ? orders
+              .filter(
+                (x) =>
+                  (x as { visitChainPrimaryId?: string | null }).visitChainPrimaryId === primaryId
+              )
+              .map((x) => x.id)
+          : [];
+        const siblingsByCart =
+          cartGroupId && siblingsByPrimary.length < 2
+            ? orders
+                .filter((x) => (x as { cartGroupId?: string | null }).cartGroupId === cartGroupId)
+                .map((x) => x.id)
+            : [];
+        const siblingBookingIds =
+          siblingsByPrimary.length >= 2 ? siblingsByPrimary : siblingsByCart.length >= 2 ? siblingsByCart : [];
         return {
           ...base,
           cartGroupId,
           cartGroupIndex: (o as { cartGroupIndex?: number | null }).cartGroupIndex ?? null,
           visitChainPrimaryId: primaryId,
-          isVisitChain: Boolean(primaryId),
-          siblingBookingIds: primaryId
-            ? orders
-                .filter(
-                  (x) =>
-                    (x as { visitChainPrimaryId?: string | null }).visitChainPrimaryId === primaryId
-                )
-                .map((x) => x.id)
-            : [],
+          isVisitChain: siblingBookingIds.length >= 2 || Boolean(primaryId),
+          siblingBookingIds,
         };
       })
     );
